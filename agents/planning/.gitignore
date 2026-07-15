@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+pytest-cache-files-*/
+.env
+.venv/
+.tmp/
+
+# Local test and run artifacts
+samples/test-artifacts/
+samples/output/planning_response*.json
+samples/cli-test-output.json
+samples/cli-test-output-*.json
+samples/planning_response.json
+samples/最终输出-*.json

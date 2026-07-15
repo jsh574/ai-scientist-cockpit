@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "evidence_map.schema.json",
+  "title": "EvidenceMapPayload",
+  "type": "object",
+  "required": ["evidence_map"],
+  "properties": {
+    "evidence_map": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "hypothesis_id",
+          "supporting_evidence_ids",
+          "opposing_evidence_ids",
+          "uncertain_evidence_ids",
+          "evidence_summary",
+          "evidence_strength_score",
+          "main_limitations",
+          "needs_more_evidence",
+          "detailed_review"
+        ],
+        "properties": {
+          "hypothesis_id": { "type": "string" },
+          "supporting_evidence_ids": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "opposing_evidence_ids": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "uncertain_evidence_ids": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "evidence_summary": {
+            "type": "object",
+            "required": ["support", "oppose", "uncertain"],
+            "properties": {
+              "support": { "type": "string" },
+              "oppose": { "type": "string" },
+              "uncertain": { "type": "string" }
+            }
+          },
+          "evidence_strength_score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "main_limitations": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "needs_more_evidence": { "type": "boolean" },
+          "detailed_review": {
+            "type": "object",
+            "required": ["review_id", "threshold", "evidence_bindings", "verdict"],
+            "properties": {
+              "review_id": { "type": "string" },
+              "threshold": { "type": "number" },
+              "evidence_bindings": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "evidence_id",
+                    "binding_type",
+                    "support_direction",
+                    "evidence_quality"
+                  ],
+                  "properties": {
+                    "evidence_id": { "type": "string" },
+                    "binding_type": {
+                      "type": "string",
+                      "enum": [
+                        "direct_support",
+                        "indirect_support",
+                        "direct_oppose",
+                        "indirect_oppose",
+                        "uncertain",
+                        "irrelevant"
+                      ]
+                    },
+                    "support_direction": {
+                      "type": "string",
+                      "enum": ["support", "oppose", "uncertain", "irrelevant"]
+                    },
+                    "prediction_index": { "type": ["integer", "null"] },
+                    "prediction_text": { "type": ["string", "null"] },
+                    "evidence_quality": {
+                      "type": "object",
+                      "required": [
+                        "directness",
+                        "reliability",
+                        "sufficiency",
+                        "applicability",
+                        "total_score"
+                      ],
+                      "properties": {
+                        "directness": { "type": "number", "minimum": 0, "maximum": 1 },
+                        "reliability": { "type": "number", "minimum": 0, "maximum": 1 },
+                        "sufficiency": { "type": "number", "minimum": 0, "maximum": 1 },
+                        "applicability": { "type": "number", "minimum": 0, "maximum": 1 },
+                        "total_score": { "type": "number", "minimum": 0, "maximum": 10 }
+                      }
+                    },
+                    "supporting_quotes": {
+                      "type": "array",
+                      "items": { "type": "string" }
+                    },
+                    "contradictory_quotes": {
+                      "type": "array",
+                      "items": { "type": "string" }
+                    },
+                    "limitations": {
+                      "type": "array",
+                      "items": { "type": "string" }
+                    },
+                    "recheck_note": { "type": ["string", "null"] }
+                  }
+                }
+              },
+              "conflict_pairs": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["evidence_id_a", "evidence_id_b", "conflict_reason"],
+                  "properties": {
+                    "evidence_id_a": { "type": "string" },
+                    "evidence_id_b": { "type": "string" },
+                    "conflict_reason": { "type": "string" }
+                  }
+                }
+              },
+              "gaps": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["gap_code", "description"],
+                  "properties": {
+                    "gap_code": { "type": "string" },
+                    "prediction_index": { "type": ["integer", "null"] },
+                    "description": { "type": "string" },
+                    "suggested_evidence_type": { "type": ["string", "null"] }
+                  }
+                }
+              },
+              "recheck_delta": {
+                "type": "array",
+                "items": { "type": "object" }
+              },
+              "verdict": {
+                "type": "object",
+                "required": ["score", "passed", "reason", "rollback_target"],
+                "properties": {
+                  "score": { "type": "number" },
+                  "passed": { "type": "boolean" },
+                  "reason": { "type": "string" },
+                  "reason_codes": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                  },
+                  "rollback_target": {
+                    "type": "string",
+                    "enum": [
+                      "knowledge_integration",
+                      "hypothesis_generation",
+                      "none"
+                    ]
+                  },
+                  "rollback_suggestion": { "type": ["string", "null"] }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
