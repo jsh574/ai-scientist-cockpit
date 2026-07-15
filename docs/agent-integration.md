@@ -19,7 +19,9 @@
     "agent_id": "question_understanding_agent",
     "stage": "question_understanding",
     "iteration": 1,
-    "status": "success"
+    "status": "success",
+    "trace_id": "trace_001",
+    "duration_ms": 1200
   },
   "payload": {},
   "self_review": {
@@ -58,6 +60,8 @@ npm run dev
 ## 适配规则
 
 - `task_context` 是总控唯一状态源；Agent 只能获得本阶段需要的字段。
+- `agents/registry.json` 是机器可读注册表，`backend/app/agent_protocol.py` 是运行时契约；两者变更必须同步并补测试。
+- Agent 只能返回本阶段声明的 payload 字段，Review Gate 会拒绝越权写入。
 - 五个 Agent 源码随主仓库提交；默认配置不包含机器相关的绝对路径。
 - 需要模型的 Agent 共享 `ProjectLLMClient`，统一使用 `backend/.env` 中的模型、兼容地址、密钥、超时和 JSON 模式。
 - 问题理解模块原有 `{status, meta, data}` 会被转换成标准信封。
@@ -65,4 +69,13 @@ npm run dev
 - 任何异常都返回 `metadata.status=failed`，前端停止后续调度并展示 `self_review.issues`。
 - Planning Agent 保留原有输入校验、假设排序、多方案聚合和引用 ID 护栏；总控用 `qwen3.7-max` 替代其原 Dify 工作流调用。
 - Evidence Mapping Agent 保留原有规则引擎，通过字段适配兼容总控的 `source_literature_id`、`support_direction` 和 `strength_score`。
-- 问题理解、知识整合、候选假设生成、证据梳理和研究计划调用真实 Agent；最终审核暂时沿用前端 mock。
+- 问题理解、知识整合、候选假设生成、证据梳理和研究计划调用真实 Agent；最终审核由后端 Orchestrator Review Gate 根据完整上下文生成。
+
+## 新增 Agent 检查表
+
+1. 在 `agents/registry.json` 和 `AGENT_SPECS` 声明 stage、reads、writes。
+2. 入口接受 `task_context` 切片和可选 feedback，不直接修改全局上下文。
+3. 返回统一响应并完成 self-review。
+4. 所有引用使用上游真实 ID，不生成不存在的 evidence/literature ID。
+5. 异常转换为 `metadata.status=failed`，不得吞掉异常后返回成功。
+6. 增加适配、追溯和失败路径测试。

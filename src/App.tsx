@@ -42,13 +42,25 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { executeStage } from "./agentApi";
+import {
+  createTask,
+  executeStage,
+  exportTaskBundle,
+  fetchArtifacts,
+  fetchVersionDiff,
+  fetchVersions,
+  recordFeedback,
+  submitHumanReview,
+  type RemoteArtifact,
+  type VersionDiffResult,
+} from "./agentApi";
 import {
   createInitialContext,
   createInitialStages,
   createReviewRecord,
   createStageInput,
   createVersion,
+  apiSpecs,
   manualGateStages,
   mergeStagePayload,
   seedEvents,
@@ -58,7 +70,7 @@ import {
 import type { AgentResponse, EventLog, ReviewRecord, RunMode, StageId, StageRun, TaskContext, VersionRecord } from "./types";
 
 type Language = "zh" | "en";
-type PageId = "workbench" | "docs";
+type PageId = "workbench" | "system" | "docs";
 type ReasoningLevel = "low" | "medium" | "high" | "ultra";
 type ApprovalMode = "ask" | "assist" | "auto";
 type MemoryLevel = "low" | "medium" | "high";
@@ -403,6 +415,9 @@ function App() {
   const [hasSubmittedQuestion, setHasSubmittedQuestion] = useState(() => projects[0].hasSubmittedQuestion);
   const [files, setFiles] = useState<string[]>(() => projects[0].files);
   const [feedbackDrafts, setFeedbackDrafts] = useState<Record<string, string>>(() => projects[0].feedbackDrafts);
+  const [remoteArtifacts, setRemoteArtifacts] = useState<RemoteArtifact[]>([]);
+  const [runtimeError, setRuntimeError] = useState("");
+  const [versionDiff, setVersionDiff] = useState<VersionDiffResult | null>(null);
   const threadEndRef = useRef<HTMLDivElement | null>(null);
 
   const t = copy[language];
@@ -424,6 +439,32 @@ function App() {
     }
     return list;
   }, [projectGroupMode, projectSortMode, projects]);
+
+  const refreshRuntimeData = useCallback(async () => {
+    if (!hasSubmittedQuestion) return;
+    setRuntimeError("");
+    try {
+      const [artifactList, versionList] = await Promise.all([
+        fetchArtifacts(context.task_id),
+        fetchVersions(context.task_id),
+      ]);
+      setRemoteArtifacts(artifactList);
+      setVersions(versionList);
+      if (versionList.length >= 2) {
+        const left = versionList[versionList.length - 2].version_id;
+        const right = versionList[versionList.length - 1].version_id;
+        setVersionDiff(await fetchVersionDiff(context.task_id, left, right));
+      } else {
+        setVersionDiff(null);
+      }
+    } catch (error) {
+      setRuntimeError(error instanceof Error ? error.message : String(error));
+    }
+  }, [context.task_id, hasSubmittedQuestion]);
+
+  useEffect(() => {
+    if (page === "system") void refreshRuntimeData();
+  }, [page, refreshRuntimeData]);
 
   useEffect(() => {
     threadEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -602,7 +643,8 @@ function App() {
         appendEvent("stage_started", `${stageLabel.zh[stage]}开始执行。`, `${stageLabel.en[stage]} started.`, stage);
         await delay(430);
 
-        const response = await executeStage(stage, workingContext, index === startIndex ? revisionNote : undefined);
+        const execution = await executeStage(stage, workingContext, index === startIndex ? revisionNote : undefined);
+        const response = execution.response;
         updateStage(stage, {
           status: "validating",
           output: response,
@@ -617,8 +659,8 @@ function App() {
         );
         await delay(360);
 
-        if (response.metadata.status === "failed") {
-          const failedReview = createReviewRecord(stage, "fail");
+        if (response.metadata.status === "failed" || execution.status === "failed" || execution.status === "retry") {
+          const failedReview = execution.review ?? createReviewRecord(stage, execution.status === "retry" ? "retry" : "fail");
           updateStage(stage, { status: "failed", review: failedReview });
           patchMessage(messageId, { status: "failed", review: failedReview, needsApproval: false });
           appendEvent(
@@ -632,8 +674,10 @@ function App() {
           return;
         }
 
-        const needsHuman = runMode === "manual" || (runMode === "hybrid" && manualGateStages.includes(stage));
-        const review = createReviewRecord(stage, needsHuman ? "human_review" : "accept");
+        const needsHuman =
+          execution.status === "human_review" ||
+          (!execution.review && (runMode === "manual" || (runMode === "hybrid" && manualGateStages.includes(stage))));
+        const review = execution.review ?? createReviewRecord(stage, needsHuman ? "human_review" : "accept");
         updateStage(stage, { status: needsHuman ? "human_review" : "passed", review });
         patchMessage(messageId, {
           status: needsHuman ? "human_review" : "passed",
@@ -681,8 +725,21 @@ function App() {
     const question = questionDraft.trim();
     if (running || !question) return;
 
-    const fresh = buildFreshTask(question);
+    const localTask = buildFreshTask(question);
     setRunning(true);
+    let fresh: TaskContext;
+    try {
+      fresh = await createTask(localTask);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setRunning(false);
+      pushMessage({
+        kind: "controller",
+        body: language === "zh" ? `任务创建失败：${message}` : `Task creation failed: ${message}`,
+        status: "failed",
+      });
+      return;
+    }
     setContext(fresh);
     setStages(createInitialStages(fresh));
     setVersions([]);
@@ -690,7 +747,7 @@ function App() {
     setEvents([
       {
         event_id: "evt_seed_001",
-        task_id: "task_001",
+        task_id: fresh.task_id,
         type: "task_created",
         message: language === "zh" ? "任务已创建，等待启动总控。" : "Task created. Controller is ready.",
         created_at: new Date().toISOString(),
@@ -718,10 +775,19 @@ function App() {
     const stageRun = stages.find((item) => item.id === stage);
     if (!stageRun?.output) return;
 
-    const approvedReview: ReviewRecord = {
+    const comment = language === "zh" ? "人工审批通过，继续进入下一阶段。" : "Human approval granted. Continue.";
+    let remoteResult: Awaited<ReturnType<typeof submitHumanReview>>;
+    try {
+      remoteResult = await submitHumanReview(context.task_id, stage, "accept", comment);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      appendEvent("human_review_failed", `审批提交失败：${detail}`, `Review submission failed: ${detail}`, stage);
+      return;
+    }
+    const approvedReview: ReviewRecord = remoteResult.review ?? {
       ...createReviewRecord(stage, "accept"),
       operator: "human",
-      comment: language === "zh" ? "人工审批通过，继续进入下一阶段。" : "Human approval granted. Continue.",
+      comment,
     };
 
     updateStage(stage, { status: "passed", review: approvedReview });
@@ -736,10 +802,11 @@ function App() {
     setPendingIndex(null);
     appendEvent("human_review_approved", `${stageLabel.zh[stage]}已批准。`, `${stageLabel.en[stage]} approved.`, stage);
 
-    let nextContext = mergeStagePayload(context, stage, stageRun.output);
-    nextContext = { ...nextContext, reviews: [...nextContext.reviews, approvedReview] };
-    const nextVersion = createVersion(stage, versions.length);
-    const nextVersions = [...versions, nextVersion];
+    let nextContext = remoteResult.task_context ?? mergeStagePayload(context, stage, stageRun.output);
+    if (!remoteResult.task_context) {
+      nextContext = { ...nextContext, reviews: [...nextContext.reviews, approvedReview] };
+    }
+    const nextVersions = remoteResult.task_context?.versions ?? [...versions, createVersion(stage, versions.length)];
     nextContext = { ...nextContext, versions: nextVersions };
     setContext(nextContext);
     setVersions(nextVersions);
@@ -770,9 +837,25 @@ function App() {
       updateStage(stage, { status: "retrying", review: createReviewRecord(stage, "retry") });
       appendEvent("stage_retry_requested", `${stageLabel.zh[stage]}收到修改意见，准备重跑。`, `${stageLabel.en[stage]} received feedback and will rerun.`, stage);
 
+      let rerunContext = context;
+      let rerunVersions = versions;
+      try {
+        const recorded = await recordFeedback(context.task_id, stage, note);
+        if (recorded) {
+          rerunContext = recorded;
+          rerunVersions = recorded.versions;
+          setContext(recorded);
+          setVersions(recorded.versions);
+        }
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        appendEvent("feedback_record_failed", `反馈保存失败：${detail}`, `Feedback persistence failed: ${detail}`, stage);
+        return;
+      }
+
       setRunning(true);
       await delay(320);
-      await continueFrom(index, context, versions, note);
+      await continueFrom(index, rerunContext, rerunVersions, note);
     },
     [appendEvent, context, continueFrom, feedbackDrafts, language, pushMessage, running, updateStage, versions],
   );
@@ -820,6 +903,10 @@ function App() {
           <button className={page === "workbench" ? "active" : ""} type="button" onClick={() => setPage("workbench")}>
             <MessageSquareText size={16} />
             {t.workbench}
+          </button>
+          <button className={page === "system" ? "active" : ""} type="button" onClick={() => setPage("system")}>
+            <FileJson size={16} />
+            {language === "zh" ? "系统" : "System"}
           </button>
           <button className={page === "docs" ? "active" : ""} type="button" onClick={() => setPage("docs")}>
             <HelpCircle size={16} />
@@ -972,6 +1059,19 @@ function App() {
               </div>
             </section>
           </>
+        ) : page === "system" ? (
+          <SystemPage
+            artifacts={remoteArtifacts}
+            context={context}
+            events={events}
+            language={language}
+            onExport={() => void exportTaskBundle(context.task_id).catch((error) => setRuntimeError(String(error)))}
+            onRefresh={() => void refreshRuntimeData()}
+            runtimeError={runtimeError}
+            stages={stages}
+            versions={versions}
+            versionDiff={versionDiff}
+          />
         ) : (
           <DocsPage language={language} t={t} />
         )}
@@ -993,6 +1093,139 @@ function App() {
       ) : null}
     </div>
   );
+}
+
+function SystemPage({
+  artifacts,
+  context,
+  events,
+  language,
+  onExport,
+  onRefresh,
+  runtimeError,
+  stages,
+  versions,
+  versionDiff,
+}: {
+  artifacts: RemoteArtifact[];
+  context: TaskContext;
+  events: EventLog[];
+  language: Language;
+  onExport: () => void;
+  onRefresh: () => void;
+  runtimeError: string;
+  stages: StageRun[];
+  versions: VersionRecord[];
+  versionDiff: VersionDiffResult | null;
+}) {
+  const zh = language === "zh";
+  return (
+    <section className="system-page">
+      <header className="system-header">
+        <div>
+          <p>{zh ? "运行状态" : "Runtime"}</p>
+          <h2>{context.task_id}</h2>
+        </div>
+        <div className="system-actions">
+          <button className="ghost-button" type="button" onClick={onRefresh}>
+            <RotateCcw size={15} />
+            {zh ? "刷新" : "Refresh"}
+          </button>
+          <button className="main-action" disabled={context.current_stage === "created"} type="button" onClick={onExport}>
+            <Archive size={15} />
+            {zh ? "导出任务" : "Export task"}
+          </button>
+        </div>
+      </header>
+
+      {runtimeError ? <p className="runtime-error">{runtimeError}</p> : null}
+
+      <div className="runtime-metrics">
+        <StatusMetric label={zh ? "当前阶段" : "Current stage"} value={context.current_stage} />
+        <StatusMetric label={zh ? "迭代" : "Iteration"} value={`R${context.iteration}`} />
+        <StatusMetric label={zh ? "版本" : "Versions"} value={String(versions.length)} />
+        <StatusMetric label={zh ? "事件" : "Events"} value={String(events.length)} />
+      </div>
+
+      <section className="runtime-section">
+        <div className="runtime-title">
+          <h3>{zh ? "阶段与审核" : "Stages and reviews"}</h3>
+          <span>Review Gate</span>
+        </div>
+        <div className="runtime-table stage-runtime-table">
+          {stages.map((stage) => (
+            <div className="runtime-row" key={stage.id}>
+              <strong>{stageLabel[language][stage.id]}</strong>
+              <span>{stageMeta[stage.id].agent}</span>
+              <code>{stage.status}</code>
+              <em>{stage.review ? `${Math.round(stage.review.overall_score * 100)}%` : "--"}</em>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="runtime-section">
+        <div className="runtime-title">
+          <h3>{zh ? "最近版本差异" : "Latest version diff"}</h3>
+          <span>{versionDiff ? `${versionDiff.left} → ${versionDiff.right}` : "--"}</span>
+        </div>
+        <div className="runtime-table diff-runtime-table">
+          {versionDiff?.changes.length ? versionDiff.changes.slice(0, 20).map((change) => (
+            <div className="runtime-row" key={change.path}>
+              <code>{change.path}</code>
+              <span>{previewValue(change.before)}</span>
+              <strong>→</strong>
+              <span>{previewValue(change.after)}</span>
+            </div>
+          )) : <p className="runtime-empty">{zh ? "至少保存两个版本后显示字段差异。" : "Field changes appear after two snapshots."}</p>}
+        </div>
+      </section>
+
+      <section className="runtime-section">
+        <div className="runtime-title">
+          <h3>Artifacts</h3>
+          <span>{artifacts.length}</span>
+        </div>
+        <div className="runtime-table artifact-runtime-table">
+          {artifacts.length ? artifacts.slice(0, 40).map((artifact) => (
+            <div className="runtime-row" key={artifact.path}>
+              <FileJson size={15} />
+              <code>{artifact.path}</code>
+              <span>{formatBytes(artifact.size)}</span>
+            </div>
+          )) : <p className="runtime-empty">{zh ? "任务运行后显示服务器产物。" : "Server artifacts appear after a task runs."}</p>}
+        </div>
+      </section>
+
+      <section className="runtime-section">
+        <div className="runtime-title">
+          <h3>API</h3>
+          <span>{apiSpecs.length}</span>
+        </div>
+        <div className="runtime-table api-runtime-table">
+          {apiSpecs.map((api) => (
+            <div className="runtime-row" key={`${api.method}-${api.path}`}>
+              <b>{api.method}</b>
+              <code>{api.path}</code>
+              <span className={`api-state ${api.status}`}>{api.status}</span>
+            </div>
+          ))}
+        </div>
+      </section>
+    </section>
+  );
+}
+
+function formatBytes(size: number) {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function previewValue(value: unknown) {
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  if (!text) return "∅";
+  return text.length > 90 ? `${text.slice(0, 87)}...` : text;
 }
 
 function MessageIndexRail({ language, messages }: { language: Language; messages: ThreadMessage[] }) {

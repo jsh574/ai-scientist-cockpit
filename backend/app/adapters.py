@@ -6,13 +6,16 @@ import json
 import os
 import re
 import sys
+import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Iterator
+from typing import Any
+from uuid import uuid4
 
+from .agent_protocol import AGENT_SPECS, get_agent_spec
 from .settings import Settings
-
 
 REAL_AGENT_STAGES = {
     "question_understanding",
@@ -36,7 +39,9 @@ class ProjectLLMClient:
         try:
             from openai import OpenAI
         except ImportError as exc:
-            raise AgentIntegrationError("缺少 openai 依赖，请安装 backend/requirements.txt") from exc
+            raise AgentIntegrationError(
+                "缺少 openai 依赖，请安装 backend/requirements.txt"
+            ) from exc
 
         self.api_key = (
             os.getenv("DASHSCOPE_API_KEY")
@@ -61,9 +66,7 @@ class ProjectLLMClient:
             max_retries=1,
         )
 
-    def _complete(
-        self, system_prompt: str, user_prompt: str, temperature: float
-    ) -> str:
+    def _complete(self, system_prompt: str, user_prompt: str, temperature: float) -> str:
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
@@ -123,7 +126,9 @@ class ProjectPlanningWorkflowClient:
 
     configured = True
 
-    def __init__(self, llm: Any | None = None, workflow_error: type[Exception] = AgentIntegrationError) -> None:
+    def __init__(
+        self, llm: Any | None = None, workflow_error: type[Exception] = AgentIntegrationError
+    ) -> None:
         self.llm = llm or ProjectLLMClient()
         self.workflow_error = workflow_error
 
@@ -279,7 +284,10 @@ def canonical_question_card(card: dict[str, Any], language: str = "zh") -> dict[
         }
     else:
         values = _string_items(raw_keywords)
-        keywords = {"zh": values if language.startswith("zh") else [], "en": values if not language.startswith("zh") else []}
+        keywords = {
+            "zh": values if language.startswith("zh") else [],
+            "en": values if not language.startswith("zh") else [],
+        }
 
     scope = card.get("research_scope") if isinstance(card.get("research_scope"), dict) else {}
     return {
@@ -317,9 +325,7 @@ def hypothesis_request(task_context: dict[str, Any]) -> dict[str, Any]:
         "question_card": task_context.get("question_card"),
         "evidence_cards": task_context.get("evidence_cards") or [],
         "knowledge_gaps": task_context.get("knowledge_gaps") or [],
-        "user_constraints": (task_context.get("user_input") or {}).get(
-            "user_constraints", {}
-        ),
+        "user_constraints": (task_context.get("user_input") or {}).get("user_constraints", {}),
     }
 
 
@@ -331,8 +337,7 @@ def evidence_mapping_request(task_context: dict[str, Any]) -> dict[str, Any]:
         evidence_cards.append(
             {
                 **source,
-                "literature_id": source.get("literature_id")
-                or source.get("source_literature_id"),
+                "literature_id": source.get("literature_id") or source.get("source_literature_id"),
                 "source_type": source.get("source_type") or source.get("evidence_type"),
                 "support_direction_hint": source.get("support_direction_hint")
                 or source.get("support_direction"),
@@ -358,9 +363,7 @@ def evidence_mapping_request(task_context: dict[str, Any]) -> dict[str, Any]:
 def planning_request(task_context: dict[str, Any]) -> dict[str, Any]:
     user_constraints = task_context.get("user_constraints")
     if not isinstance(user_constraints, dict):
-        user_constraints = (task_context.get("user_input") or {}).get(
-            "user_constraints", {}
-        )
+        user_constraints = (task_context.get("user_input") or {}).get("user_constraints", {})
     planning_constraints = task_context.get("planning_constraints")
     if not isinstance(planning_constraints, dict):
         planning_constraints = {
@@ -430,9 +433,7 @@ def _normalize_project_plan_result(
     }
     literature = _dict_items(package.get("source_literature"))
     literature_by_id = {
-        str(item.get("literature_id")): item
-        for item in literature
-        if item.get("literature_id")
+        str(item.get("literature_id")): item for item in literature if item.get("literature_id")
     }
     valid_source_ids = set(literature_by_id)
 
@@ -444,28 +445,42 @@ def _normalize_project_plan_result(
                 "step": int(item.get("step") or index),
                 "claim": str(item.get("claim") or hypothesis),
                 "evidence_ids": [
-                    value for value in _string_items(item.get("evidence_ids"))
+                    value
+                    for value in _string_items(item.get("evidence_ids"))
                     if value in valid_evidence_ids
                 ],
                 "source_ids": [
-                    value for value in _string_items(item.get("source_ids"))
+                    value
+                    for value in _string_items(item.get("source_ids"))
                     if value in valid_source_ids
                 ],
             }
         )
     if not logic_chain:
-        logic_chain = [{
-            "step": 1,
-            "claim": hypothesis,
-            "evidence_ids": sorted(valid_evidence_ids),
-            "source_ids": sorted(valid_source_ids),
-        }]
+        logic_chain = [
+            {
+                "step": 1,
+                "claim": hypothesis,
+                "evidence_ids": sorted(valid_evidence_ids),
+                "source_ids": sorted(valid_source_ids),
+            }
+        ]
 
-    technical = raw_plan.get("technical_details") if isinstance(raw_plan.get("technical_details"), dict) else {}
+    technical = (
+        raw_plan.get("technical_details")
+        if isinstance(raw_plan.get("technical_details"), dict)
+        else {}
+    )
     datasets = raw_plan.get("datasets") if isinstance(raw_plan.get("datasets"), dict) else {}
     methods = raw_plan.get("methods") if isinstance(raw_plan.get("methods"), dict) else {}
-    experiments = raw_plan.get("experiments") if isinstance(raw_plan.get("experiments"), dict) else {}
-    main_experiment = experiments.get("main_experiment") if isinstance(experiments.get("main_experiment"), dict) else {}
+    experiments = (
+        raw_plan.get("experiments") if isinstance(raw_plan.get("experiments"), dict) else {}
+    )
+    main_experiment = (
+        experiments.get("main_experiment")
+        if isinstance(experiments.get("main_experiment"), dict)
+        else {}
+    )
     results = raw_plan.get("results") if isinstance(raw_plan.get("results"), dict) else {}
 
     method_steps = _dict_items(methods.get("steps"))
@@ -524,14 +539,16 @@ def _normalize_project_plan_result(
     ]
     feedback_tasks = _dict_items(raw_plan.get("feedback_tasks"))
     if package.get("needs_more_evidence") and not feedback_tasks:
-        feedback_tasks = [{
-            "task_id": f"fb_{hypothesis_id}",
-            "task_type": "literature_supplement",
-            "priority": "high",
-            "objective": "补充当前假设缺失或不确定的证据。",
-            "input_requirements": [hypothesis_id],
-            "expected_output": "新增可追溯 evidence_cards 并重新评估证据强度。",
-        }]
+        feedback_tasks = [
+            {
+                "task_id": f"fb_{hypothesis_id}",
+                "task_type": "literature_supplement",
+                "priority": "high",
+                "objective": "补充当前假设缺失或不确定的证据。",
+                "input_requirements": [hypothesis_id],
+                "expected_output": "新增可追溯 evidence_cards 并重新评估证据强度。",
+            }
+        ]
     for item in feedback_tasks:
         if item.get("priority") not in {"high", "medium", "low"}:
             item["priority"] = "medium"
@@ -544,49 +561,78 @@ def _normalize_project_plan_result(
             "logic_chain": logic_chain,
         },
         "technical_details": {
-            "required_methods": _string_items(technical.get("required_methods")) or ["公开数据分析"],
-            "candidate_models_or_algorithms": _string_items(technical.get("candidate_models_or_algorithms")),
-            "statistical_tests": _string_items(technical.get("statistical_tests")) or ["效应量与置信区间估计"],
+            "required_methods": _string_items(technical.get("required_methods"))
+            or ["公开数据分析"],
+            "candidate_models_or_algorithms": _string_items(
+                technical.get("candidate_models_or_algorithms")
+            ),
+            "statistical_tests": _string_items(technical.get("statistical_tests"))
+            or ["效应量与置信区间估计"],
             "software_stack": _string_items(technical.get("software_stack")) or ["Python"],
         },
         "datasets": {
             "source": _dict_items(datasets.get("source")),
-            "target": _dict_items(datasets.get("target")) or [{
-                "name": "待确认的研究数据集",
-                "description": "根据公开数据可用性确定，不虚构数据来源。",
-                "fields": target_variables,
-            }],
+            "target": _dict_items(datasets.get("target"))
+            or [
+                {
+                    "name": "待确认的研究数据集",
+                    "description": "根据公开数据可用性确定，不虚构数据来源。",
+                    "fields": target_variables,
+                }
+            ],
         },
         "paper_title": str(raw_plan.get("paper_title") or hypothesis),
         "paper_abstract": str(raw_plan.get("paper_abstract") or f"本研究拟检验：{hypothesis}"),
         "methods": {
-            "overall_design": str(methods.get("overall_design") or package.get("validation_idea") or "可证伪的观察性研究设计"),
+            "overall_design": str(
+                methods.get("overall_design")
+                or package.get("validation_idea")
+                or "可证伪的观察性研究设计"
+            ),
             "steps": method_steps,
         },
         "experiments": {
             "main_experiment": {
-                "objective": str(main_experiment.get("objective") or package.get("expected_observation") or hypothesis),
-                "independent_variables": _string_items(main_experiment.get("independent_variables")) or target_variables[:1],
-                "dependent_variables": _string_items(main_experiment.get("dependent_variables")) or target_variables[1:],
+                "objective": str(
+                    main_experiment.get("objective")
+                    or package.get("expected_observation")
+                    or hypothesis
+                ),
+                "independent_variables": _string_items(main_experiment.get("independent_variables"))
+                or target_variables[:1],
+                "dependent_variables": _string_items(main_experiment.get("dependent_variables"))
+                or target_variables[1:],
                 "control_variables": _string_items(main_experiment.get("control_variables")),
             },
             "baselines": _dict_items(experiments.get("baselines")),
             "metrics": _dict_items(experiments.get("metrics")),
-            "procedure": _string_items(experiments.get("procedure")) or [item.get("description", "") for item in method_steps],
-            "ablation_or_sensitivity_analysis": _string_items(experiments.get("ablation_or_sensitivity_analysis")),
+            "procedure": _string_items(experiments.get("procedure"))
+            or [item.get("description", "") for item in method_steps],
+            "ablation_or_sensitivity_analysis": _string_items(
+                experiments.get("ablation_or_sensitivity_analysis")
+            ),
         },
         "results": {
             "result_type": str(results.get("result_type") or "expected_or_feasibility_result"),
-            "expected_findings": _string_items(results.get("expected_findings")) or _string_items(package.get("expected_observation")),
-            "feasibility_check": str(results.get("feasibility_check") or package.get("validation_idea") or "需先确认数据字段可用性。"),
+            "expected_findings": _string_items(results.get("expected_findings"))
+            or _string_items(package.get("expected_observation")),
+            "feasibility_check": str(
+                results.get("feasibility_check")
+                or package.get("validation_idea")
+                or "需先确认数据字段可用性。"
+            ),
             "falsification_criteria": falsification,
         },
         "references": references,
         "feedback_tasks": feedback_tasks,
-        "limitations": list(dict.fromkeys([
-            *_string_items(raw_plan.get("limitations")),
-            *_string_items(package.get("limitations")),
-        ])),
+        "limitations": list(
+            dict.fromkeys(
+                [
+                    *_string_items(raw_plan.get("limitations")),
+                    *_string_items(package.get("limitations")),
+                ]
+            )
+        ),
     }
     return {
         "schema_version": "experiment_planner_plan_result_v1",
@@ -615,7 +661,10 @@ def _literature_clients(root: Path, task_context: dict[str, Any]) -> list[Any]:
             *_string_items(question.get("key_concepts")),
         ]
     ).lower()
-    if any(term in domain_text for term in ("bio", "medic", "health", "disease", "neuro", "生物", "医学", "疾病", "神经")):
+    if any(
+        term in domain_text
+        for term in ("bio", "medic", "health", "disease", "neuro", "生物", "医学", "疾病", "神经")
+    ):
         clients.extend([retrieval.PubMedClient(), retrieval.EuropePmcClient()])
     if any(term in domain_text for term in ("astro", "space", "天文", "宇宙", "星系")):
         clients.extend([retrieval.ArxivClient(), retrieval.NasaAdsClient()])
@@ -687,10 +736,46 @@ class AgentRegistry:
             "evidence_mapping": self._run_evidence_mapping,
             "research_planning": self._run_research_planning,
         }[stage]
+        started = time.perf_counter()
         try:
-            return runner(task_context, feedback)
+            raw = runner(task_context, feedback)
         except Exception as exc:
-            return failure_response(task_context, stage, f"{stage}_agent", exc)
+            raw = failure_response(task_context, stage, get_agent_spec(stage).agent_id, exc)
+        metadata = raw.setdefault("metadata", {})
+        metadata.update(
+            task_id=str(task_context.get("task_id") or metadata.get("task_id") or ""),
+            agent_id=str(metadata.get("agent_id") or get_agent_spec(stage).agent_id),
+            stage=stage,
+            iteration=int(task_context.get("iteration") or 1),
+            status=_status(metadata.get("status")),
+        )
+        metadata.setdefault("trace_id", f"trace_{uuid4().hex[:12]}")
+        metadata["duration_ms"] = round((time.perf_counter() - started) * 1000)
+        raw.setdefault("payload", {})
+        raw.setdefault(
+            "self_review",
+            {
+                "passed": False,
+                "overall_score": 0.0,
+                "threshold": 0.75,
+                "dimension_scores": {},
+                "issues": ["Agent did not provide a self-review."],
+                "suggestions": ["Implement the unified self_review contract."],
+            },
+        )
+        return raw
+
+    def describe(self) -> list[dict[str, Any]]:
+        sources = self.settings.source_status()
+        return [
+            {
+                **AGENT_SPECS[stage].as_dict(),
+                "contract_version": "1.0",
+                "available": bool(sources.get(stage, {}).get("available")),
+                "source": sources.get(stage, {}),
+            }
+            for stage in sorted(REAL_AGENT_STAGES)
+        ]
 
     def _run_question_understanding(
         self, task_context: dict[str, Any], feedback: str | None
@@ -720,15 +805,24 @@ class AgentRegistry:
             "payload": {
                 "question_card": canonical_question_card(
                     source_card or {},
-                    str((task_context.get("user_input") or {}).get("user_constraints", {}).get("language") or "zh"),
-                ) if success else None
+                    str(
+                        (task_context.get("user_input") or {})
+                        .get("user_constraints", {})
+                        .get("language")
+                        or "zh"
+                    ),
+                )
+                if success
+                else None
             },
             "self_review": {
                 "passed": success and confidence >= 0.35,
                 "overall_score": confidence if success else 0.0,
                 "threshold": 0.35,
                 "dimension_scores": {"confidence": confidence if success else 0.0},
-                "issues": [] if success else [str(issue.get("message") or "问题理解 Agent 执行失败")],
+                "issues": []
+                if success
+                else [str(issue.get("message") or "问题理解 Agent 执行失败")],
                 "suggestions": [] if success else ["检查 user_input 和模型配置后重试。"],
             },
         }
@@ -776,9 +870,7 @@ class AgentRegistry:
             "team_hypothesis_generation_agent",
         )
         config = module.HypothesisAgentConfig(
-            min_evidence_keyword_overlap=float(
-                os.getenv("HYPOTHESIS_MIN_EVIDENCE_OVERLAP", "0")
-            ),
+            min_evidence_keyword_overlap=float(os.getenv("HYPOTHESIS_MIN_EVIDENCE_OVERLAP", "0")),
             max_retries=int(os.getenv("HYPOTHESIS_MAX_RETRIES", "1")),
         )
         agent = module.HypothesisGenerationAgent(config=config)
@@ -790,12 +882,8 @@ class AgentRegistry:
     def _run_evidence_mapping(
         self, task_context: dict[str, Any], _feedback: str | None
     ) -> dict[str, Any]:
-        package = _load_package(
-            self.settings.evidence_agent_root / "src", "evidence_mapping"
-        )
-        raw = package.EvidenceMappingAgent().run_dict(
-            evidence_mapping_request(task_context)
-        )
+        package = _load_package(self.settings.evidence_agent_root / "src", "evidence_mapping")
+        raw = package.EvidenceMappingAgent().run_dict(evidence_mapping_request(task_context))
         raw["metadata"]["status"] = _status(raw.get("metadata", {}).get("status"))
         for item in raw.get("payload", {}).get("evidence_map", []):
             review = item.get("detailed_review") or {}
@@ -814,17 +902,11 @@ class AgentRegistry:
     def _run_research_planning(
         self, task_context: dict[str, Any], _feedback: str | None
     ) -> dict[str, Any]:
-        service = _load_package(
-            self.settings.planning_agent_root, "planning_agent.service"
-        )
-        dify_client = _load_package(
-            self.settings.planning_agent_root, "planning_agent.dify_client"
-        )
+        service = _load_package(self.settings.planning_agent_root, "planning_agent.service")
+        dify_client = _load_package(self.settings.planning_agent_root, "planning_agent.dify_client")
         raw = service.run_planning_agent(
             planning_request(task_context),
-            dify_client=ProjectPlanningWorkflowClient(
-                workflow_error=dify_client.DifyWorkflowError
-            ),
+            dify_client=ProjectPlanningWorkflowClient(workflow_error=dify_client.DifyWorkflowError),
             max_packages=int(os.getenv("PLANNING_MAX_HYPOTHESES", "2")),
             max_parallel_calls=int(os.getenv("PLANNING_MAX_PARALLEL_CALLS", "1")),
         )

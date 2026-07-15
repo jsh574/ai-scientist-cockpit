@@ -39,6 +39,8 @@ try {
 
     Write-Host "Backend: http://${HostAddress}:${BackendPort}"
     Write-Host "Frontend: http://${HostAddress}:${FrontendPort}"
+    Write-Host "OpenAPI: http://${HostAddress}:${BackendPort}/docs"
+    Write-Host "MCP: .\.venv\Scripts\python.exe -m backend.mcp_server"
     & $npm run dev -- --host $HostAddress --port $FrontendPort
 }
 finally {

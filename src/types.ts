@@ -319,6 +319,15 @@ export interface AgentResponse<TPayload = Record<string, unknown>> {
   };
 }
 
+export interface StageExecutionResult {
+  task_id: string;
+  stage: StageId;
+  status: "passed" | "completed" | "human_review" | "retry" | "failed";
+  response: AgentResponse;
+  review: ReviewRecord | null;
+  task_context?: TaskContext;
+}
+
 export interface ReviewRecord {
   review_id: string;
   task_id: string;
@@ -372,7 +381,7 @@ export interface ApiSpec {
   method: "GET" | "POST";
   path: string;
   owner: string;
-  status: "mocked" | "planned";
+  status: "ready" | "mocked" | "planned";
   writes: string;
   description: string;
 }

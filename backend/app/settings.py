@@ -4,7 +4,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_AGENTS_ROOT = PROJECT_ROOT / "agents"
 
@@ -36,9 +35,13 @@ class Settings:
     hypothesis_agent_file: Path
     evidence_agent_root: Path
     planning_agent_root: Path
+    artifacts_root: Path
+    review_threshold: float
+    max_iterations: int
+    cors_origins: tuple[str, ...]
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         agents_root = _resolve_project_path(os.getenv("AGENTS_ROOT"), DEFAULT_AGENTS_ROOT)
         return cls(
             problem_agent_root=_resolve_project_path(
@@ -56,6 +59,19 @@ class Settings:
             ),
             planning_agent_root=_resolve_project_path(
                 os.getenv("PLANNING_AGENT_ROOT"), agents_root / "planning"
+            ),
+            artifacts_root=_resolve_project_path(
+                os.getenv("ARTIFACTS_ROOT"), PROJECT_ROOT / "artifacts" / "tasks"
+            ),
+            review_threshold=float(os.getenv("REVIEW_GATE_THRESHOLD", "0.75")),
+            max_iterations=int(os.getenv("MAX_WORKFLOW_ITERATIONS", "3")),
+            cors_origins=tuple(
+                origin.strip()
+                for origin in os.getenv(
+                    "CORS_ALLOWED_ORIGINS",
+                    "http://localhost:5173,http://127.0.0.1:5173",
+                ).split(",")
+                if origin.strip()
             ),
         )
 
@@ -90,5 +106,10 @@ class Settings:
                     or os.getenv("QWEN_API_KEY")
                     or os.getenv("LLM_API_KEY")
                 ),
+            },
+            "artifact_service": {
+                "path": str(self.artifacts_root),
+                "available": self.artifacts_root.parent.exists(),
+                "mode": "filesystem_mcp",
             },
         }

@@ -36,50 +36,58 @@ class AdapterContractTests(unittest.TestCase):
                 "core_question": "神经炎症是否促进 Tau 扩散？",
                 "research_object": {"name": "阿尔茨海默病"},
             },
-            "literature_cards": [{
-                "literature_id": "lit_001",
-                "title": "Neuroinflammation and tau progression",
-                "authors": ["Author A"],
-                "year": 2024,
-                "source": "Demo Journal",
-                "doi": "10.0000/demo",
-                "url": "https://example.org/demo",
-                "literature_type": "cohort",
-                "relevance_score": 0.9,
-                "main_findings": ["炎症指标与后续 Tau 变化相关"],
-                "related_concepts": ["神经炎症", "Tau 扩散"],
-            }],
-            "evidence_cards": [{
-                "evidence_id": "ev_001",
-                "claim": "炎症指标升高与后续 Tau 扩散相关",
-                "source_literature_id": "lit_001",
-                "evidence_type": "cohort",
-                "support_direction": "support",
-                "related_concepts": ["神经炎症", "Tau 扩散"],
-                "strength_score": 0.82,
-                "summary": "纵向观察支持时间关联",
-            }],
-            "knowledge_gaps": [{
-                "gap_id": "gap_001",
-                "description": "因果方向未知",
-                "related_concepts": ["神经炎症", "Tau 扩散"],
-            }],
-            "hypothesis_cards": [{
-                "hypothesis_id": "hyp_001",
-                "statement": "神经炎症可能促进 Tau 扩散",
-                "rationale": "纵向关联提示可能存在时间路径",
-                "based_on_evidence_ids": ["ev_001"],
-                "related_gap_ids": ["gap_001"],
-                "target_variables": ["炎症指标", "Tau 变化"],
-                "expected_observation": "炎症指标升高先于 Tau 变化",
-                "validation_idea": "使用纵向公开队列进行滞后回归",
-                "initial_scores": {
-                    "novelty": 0.7,
-                    "testability": 0.9,
-                    "relevance": 0.9,
-                    "risk": 0.3,
-                },
-            }],
+            "literature_cards": [
+                {
+                    "literature_id": "lit_001",
+                    "title": "Neuroinflammation and tau progression",
+                    "authors": ["Author A"],
+                    "year": 2024,
+                    "source": "Demo Journal",
+                    "doi": "10.0000/demo",
+                    "url": "https://example.org/demo",
+                    "literature_type": "cohort",
+                    "relevance_score": 0.9,
+                    "main_findings": ["炎症指标与后续 Tau 变化相关"],
+                    "related_concepts": ["神经炎症", "Tau 扩散"],
+                }
+            ],
+            "evidence_cards": [
+                {
+                    "evidence_id": "ev_001",
+                    "claim": "炎症指标升高与后续 Tau 扩散相关",
+                    "source_literature_id": "lit_001",
+                    "evidence_type": "cohort",
+                    "support_direction": "support",
+                    "related_concepts": ["神经炎症", "Tau 扩散"],
+                    "strength_score": 0.82,
+                    "summary": "纵向观察支持时间关联",
+                }
+            ],
+            "knowledge_gaps": [
+                {
+                    "gap_id": "gap_001",
+                    "description": "因果方向未知",
+                    "related_concepts": ["神经炎症", "Tau 扩散"],
+                }
+            ],
+            "hypothesis_cards": [
+                {
+                    "hypothesis_id": "hyp_001",
+                    "statement": "神经炎症可能促进 Tau 扩散",
+                    "rationale": "纵向关联提示可能存在时间路径",
+                    "based_on_evidence_ids": ["ev_001"],
+                    "related_gap_ids": ["gap_001"],
+                    "target_variables": ["炎症指标", "Tau 变化"],
+                    "expected_observation": "炎症指标升高先于 Tau 变化",
+                    "validation_idea": "使用纵向公开队列进行滞后回归",
+                    "initial_scores": {
+                        "novelty": 0.7,
+                        "testability": 0.9,
+                        "relevance": 0.9,
+                        "risk": 0.3,
+                    },
+                }
+            ],
         }
 
     def test_question_card_is_normalized_for_frontend(self) -> None:
@@ -155,17 +163,21 @@ class AdapterContractTests(unittest.TestCase):
                     "key_concepts": [{"name": "神经炎症"}, {"name": "Tau 扩散"}],
                     "key_variables": [{"name": "神经炎症"}, {"name": "Tau 扩散"}],
                 },
-                "evidence_cards": [{
-                    "evidence_id": "ev_001",
-                    "claim": "炎症与 Tau 扩散相关",
-                    "related_concepts": ["神经炎症", "Tau 扩散"],
-                    "summary": "纵向观察支持时间关联",
-                }],
-                "knowledge_gaps": [{
-                    "gap_id": "gap_001",
-                    "description": "因果方向未知",
-                    "related_concepts": ["神经炎症", "Tau 扩散"],
-                }],
+                "evidence_cards": [
+                    {
+                        "evidence_id": "ev_001",
+                        "claim": "炎症与 Tau 扩散相关",
+                        "related_concepts": ["神经炎症", "Tau 扩散"],
+                        "summary": "纵向观察支持时间关联",
+                    }
+                ],
+                "knowledge_gaps": [
+                    {
+                        "gap_id": "gap_001",
+                        "description": "因果方向未知",
+                        "related_concepts": ["神经炎症", "Tau 扩散"],
+                    }
+                ],
             }
         )
         normalized = module.HypothesisGenerationAgent().validate_input(request)
@@ -187,9 +199,7 @@ class AdapterContractTests(unittest.TestCase):
             evidence_mapping_request(self.downstream_context())
         )
         self.assertEqual(response["metadata"]["stage"], "evidence_mapping")
-        self.assertEqual(
-            response["payload"]["evidence_map"][0]["hypothesis_id"], "hyp_001"
-        )
+        self.assertEqual(response["payload"]["evidence_map"][0]["hypothesis_id"], "hyp_001")
 
     def test_planning_workflow_filters_unknown_traceability_ids(self) -> None:
         class FakePlanningLLM:
@@ -197,11 +207,13 @@ class AdapterContractTests(unittest.TestCase):
                 return {
                     "plan": {
                         "rationale": {
-                            "logic_chain": [{
-                                "claim": "测试因果路径",
-                                "evidence_ids": ["ev_001", "ev_invented"],
-                                "source_ids": ["lit_001", "lit_invented"],
-                            }]
+                            "logic_chain": [
+                                {
+                                    "claim": "测试因果路径",
+                                    "evidence_ids": ["ev_001", "ev_invented"],
+                                    "source_ids": ["lit_001", "lit_invented"],
+                                }
+                            ]
                         },
                         "references": [
                             {"source_id": "lit_001", "used_for": ["rationale"]},
@@ -211,16 +223,18 @@ class AdapterContractTests(unittest.TestCase):
                 }
 
         context = self.downstream_context()
-        context["evidence_map"] = [{
-            "hypothesis_id": "hyp_001",
-            "supporting_evidence_ids": ["ev_001"],
-            "opposing_evidence_ids": [],
-            "uncertain_evidence_ids": [],
-            "evidence_summary": {"support": "支持", "oppose": "", "uncertain": ""},
-            "evidence_strength_score": 0.82,
-            "main_limitations": ["缺少干预证据"],
-            "needs_more_evidence": True,
-        }]
+        context["evidence_map"] = [
+            {
+                "hypothesis_id": "hyp_001",
+                "supporting_evidence_ids": ["ev_001"],
+                "opposing_evidence_ids": [],
+                "uncertain_evidence_ids": [],
+                "evidence_summary": {"support": "支持", "oppose": "", "uncertain": ""},
+                "evidence_strength_score": 0.82,
+                "main_limitations": ["缺少干预证据"],
+                "needs_more_evidence": True,
+            }
+        ]
         request = planning_request(context)
         service = _load_package(Settings.from_env().planning_agent_root, "planning_agent.service")
         client = ProjectPlanningWorkflowClient(llm=FakePlanningLLM())
@@ -231,9 +245,7 @@ class AdapterContractTests(unittest.TestCase):
         logic = plan["rationale"]["logic_chain"][0]
         self.assertEqual(logic["evidence_ids"], ["ev_001"])
         self.assertEqual(logic["source_ids"], ["lit_001"])
-        self.assertEqual(
-            [item["source_id"] for item in plan["references"]], ["lit_001"]
-        )
+        self.assertEqual([item["source_id"] for item in plan["references"]], ["lit_001"])
 
     def test_registry_wraps_native_planning_payload(self) -> None:
         class FakePlanningLLM:
@@ -241,17 +253,11 @@ class AdapterContractTests(unittest.TestCase):
                 return {"plan": {"problem_statement": "测试研究问题"}}
 
         context = self.downstream_context()
-        evidence_response = AgentRegistry(Settings.from_env()).run(
-            "evidence_mapping", context
-        )
+        evidence_response = AgentRegistry(Settings.from_env()).run("evidence_mapping", context)
         context["evidence_map"] = evidence_response["payload"]["evidence_map"]
         client = ProjectPlanningWorkflowClient(llm=FakePlanningLLM())
-        with patch(
-            "backend.app.adapters.ProjectPlanningWorkflowClient", return_value=client
-        ):
-            response = AgentRegistry(Settings.from_env()).run(
-                "research_planning", context
-            )
+        with patch("backend.app.adapters.ProjectPlanningWorkflowClient", return_value=client):
+            response = AgentRegistry(Settings.from_env()).run("research_planning", context)
         self.assertEqual(response["metadata"]["stage"], "research_planning")
         self.assertIn("research_plan", response["payload"])
         self.assertEqual(

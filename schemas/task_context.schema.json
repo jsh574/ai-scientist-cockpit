@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eurekaloop.local/schemas/task_context.schema.json",
+  "title": "AI Scientist Task Context",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "task_id", "mode", "current_stage", "iteration", "user_input",
+    "question_card", "literature_cards", "evidence_cards", "knowledge_gaps",
+    "hypothesis_cards", "evidence_map", "research_plan", "reviews", "versions",
+    "feedback_events"
+  ],
+  "properties": {
+    "task_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,96}$"},
+    "mode": {"enum": ["auto", "manual", "hybrid"]},
+    "current_stage": {"type": "string"},
+    "iteration": {"type": "integer", "minimum": 1},
+    "user_input": {
+      "type": "object",
+      "required": ["original_question", "user_constraints"],
+      "properties": {
+        "original_question": {"type": "string", "minLength": 3},
+        "user_constraints": {"type": "object"}
+      }
+    },
+    "question_card": {"type": ["object", "null"]},
+    "literature_cards": {"type": "array", "items": {"type": "object"}},
+    "evidence_cards": {"type": "array", "items": {"type": "object"}},
+    "knowledge_gaps": {"type": "array", "items": {"type": "object"}},
+    "hypothesis_cards": {"type": "array", "items": {"type": "object"}},
+    "evidence_map": {"type": "array", "items": {"type": "object"}},
+    "research_plan": {"type": ["object", "null"]},
+    "final_review": {"type": ["object", "null"]},
+    "reviews": {"type": "array", "items": {"type": "object"}},
+    "versions": {"type": "array", "items": {"type": "object"}},
+    "feedback_events": {"type": "array", "items": {"type": "object"}}
+  }
+}

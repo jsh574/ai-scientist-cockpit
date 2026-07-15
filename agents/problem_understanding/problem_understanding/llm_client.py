@@ -88,8 +88,11 @@ class LLMClient:
                 prov = LLMProvider(
                     name=p.get("name", "unnamed"),
                     api_key=p.get("api_key", ""),
-                    base_url=p.get("base_url", "https://api.openai.com/v1"),
-                    model=p.get("model", "gpt-4o-mini"),
+                    base_url=p.get(
+                        "base_url",
+                        "https://ws-7hqgj5wzj4r60zy7.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+                    ),
+                    model=p.get("model", "qwen3.7-max"),
                     retry_count=retry_count,
                     timeout=timeout,
                 )
@@ -97,8 +100,11 @@ class LLMClient:
                     self._providers.append(prov)
         else:
             key = api_key or os.getenv("LLM_API_KEY", "")
-            url = base_url or os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-            mdl = model or os.getenv("LLM_MODEL", "gpt-4o-mini")
+            url = base_url or os.getenv(
+                "LLM_BASE_URL",
+                "https://ws-7hqgj5wzj4r60zy7.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+            )
+            mdl = model or os.getenv("LLM_MODEL", "qwen3.7-max")
             prov = LLMProvider(
                 name="default",
                 api_key=key,
