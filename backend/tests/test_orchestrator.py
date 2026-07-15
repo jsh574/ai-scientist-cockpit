@@ -103,6 +103,19 @@ class FakeRegistry:
         }
 
 
+class BorderlineHypothesisRegistry(FakeRegistry):
+    def run(self, stage: str, context: dict, feedback: str | None = None) -> dict:
+        response = super().run(stage, context, feedback)
+        if stage == "hypothesis_generation":
+            response["metadata"]["status"] = "partial_success"
+            response["self_review"].update(
+                passed=False,
+                overall_score=0.731,
+                threshold=0.75,
+            )
+        return response
+
+
 class OrchestratorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -165,6 +178,26 @@ class OrchestratorTests(unittest.TestCase):
         latest = self.artifacts.load_context(context["task_id"])
         self.assertEqual(len(latest["feedback_events"]), 1)
         self.assertGreaterEqual(len(latest["versions"]), 8)
+
+    def test_operator_can_continue_after_quality_gate_retry(self) -> None:
+        self.orchestrator.registry = BorderlineHypothesisRegistry()
+        context = self.create()
+        result = self.orchestrator.run_from(context["task_id"])
+        self.assertEqual(result["status"], "retry")
+        self.assertEqual(result["executions"][-1]["stage"], "hypothesis_generation")
+
+        accepted = self.orchestrator.submit_review(
+            context["task_id"],
+            HumanReviewRequest(
+                stage="hypothesis_generation",
+                decision="accept",
+                comment="Keep this result and continue.",
+            ),
+        )
+        self.assertEqual(accepted["status"], "passed")
+        self.assertTrue(accepted["task_context"]["hypothesis_cards"])
+        self.assertEqual(accepted["review"]["operator"], "human")
+        self.assertAlmostEqual(accepted["review"]["overall_score"], 0.9731)
 
     def test_artifact_path_traversal_is_rejected(self) -> None:
         context = self.create()

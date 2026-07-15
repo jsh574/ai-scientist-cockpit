@@ -343,6 +343,7 @@ export interface ReviewRecord {
     iteration_value: number;
   };
   overall_score: number;
+  issues?: string[];
   operator: "system" | "human";
   created_at: string;
 }

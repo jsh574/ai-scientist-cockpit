@@ -302,8 +302,23 @@ class Orchestrator:
         get_agent_spec(request.stage)
         with self._task_lock(task_id):
             context = self.artifacts.load_context(task_id)
-            if context.get("current_stage") != "human_review":
-                raise OrchestrationError("Task is not waiting for human review")
+            current_stage = context.get("current_stage")
+            source_review: ReviewRecord | None = None
+            quality_override = current_stage == request.stage and request.decision == "accept"
+            if quality_override:
+                source_review = ReviewRecord.model_validate(
+                    self.artifacts.read_json(
+                        task_id, f"reviews/{request.stage}.latest.review.json"
+                    )
+                )
+                if source_review.decision != "retry":
+                    raise OrchestrationError(
+                        "Only a Review Gate retry can be accepted as a quality override"
+                    )
+            elif current_stage != "human_review":
+                raise OrchestrationError(
+                    "Task is not waiting for human review or a quality decision"
+                )
 
             if request.decision == "retry":
                 return self.run_stage(task_id, request.stage, request.comment)
@@ -322,20 +337,29 @@ class Orchestrator:
 
             raw = self.artifacts.latest_stage_output(task_id, request.stage)
             response = AgentResponse.model_validate(raw)
+            if response.metadata.status == "failed":
+                raise OrchestrationError("A failed Agent response cannot be accepted")
             human_review = ReviewRecord(
                 review_id=f"review_{uuid4().hex[:12]}",
                 task_id=task_id,
                 stage=request.stage,
                 decision="accept",
-                comment=request.comment or "Accepted by human reviewer.",
-                score=ReviewScore(
+                comment=request.comment
+                or (
+                    "Accepted by operator despite the recommended quality threshold."
+                    if quality_override
+                    else "Accepted by human reviewer."
+                ),
+                score=source_review.score
+                if source_review
+                else ReviewScore(
                     schema_validity=1,
                     required_fields=1,
                     downstream_readiness=1,
                     evidence_traceability=1,
                     iteration_value=response.self_review.overall_score,
                 ),
-                overall_score=1,
+                overall_score=source_review.overall_score if source_review else 1,
                 operator="human",
             )
             context = self._accept(
@@ -343,7 +367,7 @@ class Orchestrator:
                 request.stage,
                 response,
                 human_review,
-                trigger="human_review_accept",
+                trigger="quality_gate_override" if quality_override else "human_review_accept",
             )
             self.artifacts.write_review(
                 task_id,
@@ -354,7 +378,7 @@ class Orchestrator:
             self.artifacts.set_stage_status(task_id, request.stage, "passed")
             self._event(
                 task_id,
-                "human_review_accepted",
+                "quality_gate_overridden" if quality_override else "human_review_accepted",
                 human_review.comment,
                 request.stage,
             )

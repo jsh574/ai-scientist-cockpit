@@ -175,6 +175,23 @@ function getFeedbackTargetStage(response: AgentResponse, fallback: StageId): Sta
   return fallback;
 }
 
+function buildSystemRevisionNote(
+  response: AgentResponse,
+  review: ReviewRecord | null,
+  language: Language,
+): string {
+  const details = [
+    ...response.self_review.issues,
+    ...response.self_review.suggestions,
+    ...(review?.issues ?? []),
+  ].filter((value, index, values) => value && values.indexOf(value) === index);
+  const fallback = language === "zh"
+    ? "提高本阶段输出的完整性、可验证性和下游可用性。"
+    : "Improve completeness, testability, and downstream readiness.";
+  const prefix = language === "zh" ? "总控自动修订要求：" : "Controller revision request: ";
+  return `${prefix}${details.join("；") || fallback}`;
+}
+
 const approvalToRunMode: Record<ApprovalMode, RunMode> = {
   ask: "manual",
   assist: "hybrid",
@@ -281,7 +298,7 @@ const statusLabel: Record<Language, Record<string, string>> = {
     human_review: "待审批",
     passed: "已通过",
     failed: "失败",
-    revision_required: "需补证",
+    revision_required: "待选择",
     retrying: "重跑中",
     created: "待开始",
     completed: "已完成",
@@ -293,7 +310,7 @@ const statusLabel: Record<Language, Record<string, string>> = {
     human_review: "Needs approval",
     passed: "Passed",
     failed: "Failed",
-    revision_required: "Needs evidence",
+    revision_required: "Choose action",
     retrying: "Retrying",
     created: "Ready",
     completed: "Done",
@@ -751,6 +768,7 @@ function App() {
 
       for (let index = startIndex; index < stageOrder.length; index += 1) {
         const stage = stageOrder[index];
+        const stageRevisionNote = index === startIndex ? revisionNote : undefined;
         const input = createStageInput(stage, workingContext);
         const startTime = performance.now();
         const messageId = pushMessage({
@@ -760,7 +778,7 @@ function App() {
           response: null,
           review: null,
           needsApproval: false,
-          revisionNote: index === startIndex ? revisionNote : undefined,
+          revisionNote: stageRevisionNote,
         });
 
         setActiveStage(stage);
@@ -769,7 +787,7 @@ function App() {
         appendEvent("stage_started", `${stageLabel.zh[stage]}开始执行。`, `${stageLabel.en[stage]} started.`, stage);
         await delay(430);
 
-        const execution = await executeStage(stage, workingContext, index === startIndex ? revisionNote : undefined);
+        const execution = await executeStage(stage, workingContext, stageRevisionNote);
         const response = execution.response;
         updateStage(stage, {
           status: "validating",
@@ -845,14 +863,16 @@ function App() {
           });
           appendEvent(
             "stage_revision_required",
-            `${stageLabel.zh[stage]}证据质量未达阈值，需要从${stageLabel.zh[retryFromStage]}补充后重试。`,
-            `${stageLabel.en[stage]} needs stronger evidence. Resume from ${stageLabel.en[retryFromStage]}.`,
+            `${stageLabel.zh[stage]}低于建议质量阈值，请选择继续执行或重新执行。`,
+            `${stageLabel.en[stage]} is below the recommended quality threshold. Continue or rerun this stage.`,
             stage,
           );
           workingContext = nextContext;
           workingVersions = nextContext.versions;
           setContext(nextContext);
           setVersions(workingVersions);
+          setReviewStage(stage);
+          setPendingIndex(index);
           setRunning(false);
           return;
         }
@@ -937,13 +957,22 @@ function App() {
     await continueFrom(0, fresh, []);
   }, [appendEvent, approval, buildFreshTask, continueFrom, language, memory, pushMessage, questionDraft, reasoning, running, t.controllerStarted]);
 
-  const approveReview = useCallback(async () => {
-    if (!reviewStage || pendingIndex === null || running) return;
-    const stage = reviewStage;
+  const approveReview = useCallback(async (stageOverride?: StageId) => {
+    const stage = stageOverride ?? reviewStage;
+    if (!stage || running) return;
+    const resumeIndex = pendingIndex ?? stageOrder.indexOf(stage);
+    if (resumeIndex < 0) return;
     const stageRun = stages.find((item) => item.id === stage);
     if (!stageRun?.output) return;
 
-    const comment = language === "zh" ? "人工审批通过，继续进入下一阶段。" : "Human approval granted. Continue.";
+    const qualityOverride = stageRun.status === "revision_required";
+    const comment = qualityOverride
+      ? language === "zh"
+        ? "保留当前输出并继续进入下一阶段。"
+        : "Keep the current result and continue to the next stage."
+      : language === "zh"
+        ? "人工审批通过，继续进入下一阶段。"
+        : "Human approval granted. Continue.";
     let remoteResult: Awaited<ReturnType<typeof submitHumanReview>>;
     try {
       remoteResult = await submitHumanReview(context.task_id, stage, "accept", comment);
@@ -961,14 +990,19 @@ function App() {
     updateStage(stage, { status: "passed", review: approvedReview });
     setMessages((current) =>
       current.map((message) =>
-        message.stage === stage && message.needsApproval
+        message.stage === stage && (message.needsApproval || message.status === "revision_required")
           ? { ...message, status: "passed", review: approvedReview, needsApproval: false }
           : message,
       ),
     );
     setReviewStage(null);
     setPendingIndex(null);
-    appendEvent("human_review_approved", `${stageLabel.zh[stage]}已批准。`, `${stageLabel.en[stage]} approved.`, stage);
+    appendEvent(
+      qualityOverride ? "quality_gate_overridden" : "human_review_approved",
+      qualityOverride ? `${stageLabel.zh[stage]}保留当前输出并继续执行。` : `${stageLabel.zh[stage]}已批准。`,
+      qualityOverride ? `${stageLabel.en[stage]} kept the current result and continued.` : `${stageLabel.en[stage]} approved.`,
+      stage,
+    );
 
     let nextContext = remoteResult.task_context ?? mergeStagePayload(context, stage, stageRun.output);
     if (!remoteResult.task_context) {
@@ -981,15 +1015,23 @@ function App() {
 
     setRunning(true);
     await delay(260);
-    await continueFrom(pendingIndex + 1, nextContext, nextVersions);
+    await continueFrom(resumeIndex + 1, nextContext, nextVersions);
   }, [appendEvent, context, continueFrom, language, pendingIndex, reviewStage, running, stages, updateStage, versions]);
 
   const rerunStageWithFeedback = useCallback(
-    async (stage: StageId, sourceMessageId: string) => {
+    async (
+      stage: StageId,
+      sourceMessageId: string,
+      systemGenerated = false,
+      response: AgentResponse | null = null,
+      review: ReviewRecord | null = null,
+    ) => {
       if (running) return;
       const index = stageOrder.indexOf(stage);
       if (index < 0) return;
-      const note = feedbackDrafts[sourceMessageId]?.trim() || (language === "zh" ? "请重新检查并改进这一阶段输出。" : "Please re-check and improve this stage output.");
+      const note = systemGenerated && response
+        ? buildSystemRevisionNote(response, review, language)
+        : feedbackDrafts[sourceMessageId]?.trim() || (language === "zh" ? "请重新检查并改进这一阶段输出。" : "Please re-check and improve this stage output.");
 
       let rerunContext = context;
       let rerunVersions = versions;
@@ -1008,10 +1050,19 @@ function App() {
         return;
       }
 
-      pushMessage({ kind: "user", body: note, stage });
+      if (systemGenerated) {
+        pushMessage({
+          kind: "controller",
+          body: language === "zh"
+            ? `${stageLabel.zh[stage]}由总控根据质量审查意见再次自动修订。`
+            : `${stageLabel.en[stage]} will be revised automatically from the quality review.`,
+        });
+      } else {
+        pushMessage({ kind: "user", body: note, stage });
+      }
       setMessages((current) =>
         current.map((message) =>
-          message.stage === stage && message.needsApproval
+          message.id === sourceMessageId
             ? { ...message, status: "retrying", needsApproval: false, revisionNote: note }
             : message,
         ),
@@ -1020,7 +1071,16 @@ function App() {
       setReviewStage(null);
       setPendingIndex(null);
       updateStage(stage, { status: "retrying", review: createReviewRecord(stage, "retry") });
-      appendEvent("stage_retry_requested", `${stageLabel.zh[stage]}收到修改意见，准备重跑。`, `${stageLabel.en[stage]} received feedback and will rerun.`, stage);
+      appendEvent(
+        systemGenerated ? "stage_auto_revision_requested" : "stage_retry_requested",
+        systemGenerated
+          ? `${stageLabel.zh[stage]}由总控生成修订意见并准备重跑。`
+          : `${stageLabel.zh[stage]}收到修改意见，准备重跑。`,
+        systemGenerated
+          ? `${stageLabel.en[stage]} received controller-generated revision guidance and will rerun.`
+          : `${stageLabel.en[stage]} received feedback and will rerun.`,
+        stage,
+      );
 
       setRunning(true);
       await delay(320);
@@ -1174,12 +1234,20 @@ function App() {
                     key={message.id}
                     language={language}
                     message={message}
-                    onApprove={approveReview}
+                    onApprove={() => message.stage && void approveReview(message.stage)}
                     onFeedbackChange={(value) => setFeedbackDrafts((current) => ({ ...current, [message.id]: value }))}
                     onOpenJson={(title, data) => setJsonOpen({ title, data })}
                     onRerun={() => {
                       const targetStage = message.retryFromStage ?? message.stage;
-                      if (targetStage) void rerunStageWithFeedback(targetStage, message.id);
+                      if (targetStage) {
+                        void rerunStageWithFeedback(
+                          targetStage,
+                          message.id,
+                          message.status === "revision_required",
+                          message.response ?? null,
+                          message.review ?? null,
+                        );
+                      }
                     }}
                     onSelectStage={(stage) => setActiveStage(stage)}
                     running={running}
@@ -2024,8 +2092,8 @@ function ThreadMessageCard({
           <section className="inline-review revision-required-actions">
             <p>
               {language === "zh"
-                ? `证据质量未达阈值，需要从${stageLabel.zh[message.retryFromStage ?? stage]}补充后重试。`
-                : `Evidence quality is below the gate. Resume from ${stageLabel.en[message.retryFromStage ?? stage]}.`}
+                ? "当前输出低于建议质量阈值，但结构和追溯校验结果仍可查看。你可以保留当前结果继续，也可以让系统重新执行。"
+                : "The result is below the recommended quality threshold, but its structure and traceability checks remain available. Continue with it or let the system rerun."}
             </p>
             <BulletList
               label={language === "zh" ? "审查问题" : "Review issues"}
@@ -2035,17 +2103,18 @@ function ThreadMessageCard({
               label={language === "zh" ? "补证建议" : "Evidence suggestions"}
               values={message.response?.self_review.suggestions ?? []}
             />
-            <div className="revision-composer">
-              <textarea
-                disabled={running}
-                onChange={(event) => onFeedbackChange(event.target.value)}
-                placeholder={language === "zh" ? "补充检索范围、证据来源或具体修改意见" : "Add retrieval scope, evidence sources, or revision notes"}
-                value={feedbackValue}
-              />
-              <button className="ghost-button" disabled={running} type="button" onClick={onRerun}>
-                <RotateCcw size={15} />
-                {language === "zh" ? "提交补证并重跑" : "Submit and rerun"}
-              </button>
+            <div className="system-revision-action">
+              <span>{language === "zh" ? "重新执行时，修订意见由总控自动生成，无需填写。" : "For a rerun, the controller generates revision guidance automatically."}</span>
+              <div className="quality-choice-buttons">
+                <button className="main-action" disabled={running} type="button" onClick={onApprove}>
+                  <CheckCircle2 size={16} />
+                  {language === "zh" ? "继续执行" : "Continue"}
+                </button>
+                <button className="ghost-button" disabled={running} type="button" onClick={onRerun}>
+                  <RotateCcw size={15} />
+                  {language === "zh" ? "重新执行" : "Rerun"}
+                </button>
+              </div>
             </div>
           </section>
         ) : stage && message.status === "failed" ? (

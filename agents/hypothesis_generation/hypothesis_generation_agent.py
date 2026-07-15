@@ -7,12 +7,13 @@ building, retries, JSON parsing, payload normalization, validation, and review.
 
 from __future__ import annotations
 
-import os
 import json
+import os
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from statistics import pstdev
-from typing import Any, Iterable
+from typing import Any
 
 
 class AgentInputError(ValueError):
@@ -182,6 +183,9 @@ class HypothesisGenerationAgent:
         """Build the LLM prompt for Qwen or another chat model."""
         max_hypotheses = input_data["user_constraints"]["max_hypotheses"]
         language = input_data["user_constraints"]["language"]
+        revision_feedback = str(
+            input_data["user_constraints"].get("revision_feedback") or ""
+        ).strip()
         schema_hint = self._schema_hint()
         context = {
             "question_card": input_data["question_card"],
@@ -189,6 +193,14 @@ class HypothesisGenerationAgent:
             "knowledge_gaps": input_data["knowledge_gaps"],
             "user_constraints": input_data["user_constraints"],
         }
+
+        revision_instruction = (
+            "\nController revision feedback:\n"
+            f"{revision_feedback}\n"
+            "Apply this feedback directly while preserving valid evidence and gap IDs.\n"
+            if revision_feedback
+            else ""
+        )
 
         return (
             "You are a scientific hypothesis generation Agent.\n"
@@ -211,6 +223,7 @@ class HypothesisGenerationAgent:
             "- predictions must contain 1 to 3 concrete, evidence-checkable predictions.\n"
             "- initial_scores and hypothesis_scores must contain numbers between 0 and 1, and both score objects must be identical.\n"
             "- risk means higher is worse.\n\n"
+            f"{revision_instruction}"
             "Few-shot good example:\n"
             f"{json.dumps(self._few_shot_example(), ensure_ascii=False, indent=2)}\n\n"
             "Required output JSON schema:\n"

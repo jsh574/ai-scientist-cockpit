@@ -976,6 +976,31 @@ textarea:disabled {
   background: rgba(255, 255, 255, 0.72);
 }
 
+.system-revision-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.system-revision-action > span {
+  color: #6d4a00;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.system-revision-action .ghost-button {
+  flex: 0 0 auto;
+}
+
+.quality-choice-buttons {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
 .stage-purpose {
   display: inline-flex;
   align-items: center;

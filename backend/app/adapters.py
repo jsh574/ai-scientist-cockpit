@@ -861,7 +861,7 @@ class AgentRegistry:
         return raw
 
     def _run_hypothesis_generation(
-        self, task_context: dict[str, Any], _feedback: str | None
+        self, task_context: dict[str, Any], feedback: str | None
     ) -> dict[str, Any]:
         if not os.getenv("DASHSCOPE_API_KEY"):
             raise AgentIntegrationError("候选假设生成 Agent 需要 DASHSCOPE_API_KEY 环境变量")
@@ -875,7 +875,13 @@ class AgentRegistry:
         )
         agent = module.HypothesisGenerationAgent(config=config)
         agent.call_llm = ProjectLLMClient().generate_text
-        raw = agent.run(hypothesis_request(task_context))
+        request = hypothesis_request(task_context)
+        if feedback:
+            request["user_constraints"] = {
+                **request["user_constraints"],
+                "revision_feedback": feedback,
+            }
+        raw = agent.run(request)
         raw["metadata"]["status"] = _status(raw.get("metadata", {}).get("status"))
         return raw
 
