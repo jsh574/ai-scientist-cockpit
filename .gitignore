@@ -26,6 +26,9 @@ agents/**/.git/
 agents/**/.env
 agents/**/.tmp/
 agents/**/test-artifacts/
+samples/test-artifacts/
+artifacts/tasks/*
+!artifacts/tasks/.gitkeep
 
 # Editor directories and files
 .vscode/*

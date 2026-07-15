@@ -251,10 +251,10 @@ class HypothesisGenerationAgent:
     
         base_url = os.getenv(
             "DASHSCOPE_BASE_URL",
-            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "https://ws-7hqgj5wzj4r60zy7.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
         )
     
-        model = os.getenv("QWEN_MODEL", "qwen-plus")
+        model = os.getenv("QWEN_MODEL", "qwen3.7-max")
     
         client = OpenAI(
             api_key=api_key,

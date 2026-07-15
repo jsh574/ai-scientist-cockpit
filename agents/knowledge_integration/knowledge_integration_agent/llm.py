@@ -15,8 +15,10 @@ from typing import Any, Protocol
 #
 # If this file is only used locally, you may fill QWEN_API_KEY once here.
 QWEN_API_KEY = ""
-QWEN_MODEL = "qwen3.6-flash"
-QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+QWEN_MODEL = "qwen3.7-max"
+QWEN_BASE_URL = (
+    "https://ws-7hqgj5wzj4r60zy7.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+)
 
 
 class LLMClient(Protocol):
