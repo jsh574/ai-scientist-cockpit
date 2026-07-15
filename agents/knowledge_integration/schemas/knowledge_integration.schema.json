@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "KnowledgeIntegrationPayload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["literature_cards", "evidence_cards", "knowledge_gaps"],
+  "properties": {
+    "literature_cards": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "literature_id",
+          "title",
+          "authors",
+          "year",
+          "source",
+          "doi",
+          "url",
+          "literature_type",
+          "relevance_score",
+          "main_findings",
+          "related_concepts"
+        ],
+        "properties": {
+          "literature_id": {"type": "string", "pattern": "^lit_[0-9]{3}$"},
+          "title": {"type": "string", "minLength": 1},
+          "authors": {"type": "array", "items": {"type": "string"}},
+          "year": {"type": "integer", "minimum": 1800},
+          "source": {"type": "string", "minLength": 1},
+          "doi": {"type": "string"},
+          "url": {"type": "string"},
+          "literature_type": {"type": "string"},
+          "relevance_score": {"type": "number", "minimum": 0, "maximum": 1},
+          "main_findings": {"type": "array", "items": {"type": "string"}},
+          "related_concepts": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "evidence_cards": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "evidence_id",
+          "claim",
+          "source_literature_id",
+          "evidence_type",
+          "support_direction",
+          "related_concepts",
+          "strength_score",
+          "summary",
+          "limitations"
+        ],
+        "properties": {
+          "evidence_id": {"type": "string", "pattern": "^ev_[0-9]{3}$"},
+          "claim": {"type": "string", "minLength": 1},
+          "source_literature_id": {"type": "string", "pattern": "^lit_[0-9]{3}$"},
+          "evidence_type": {"type": "string"},
+          "support_direction": {"type": "string"},
+          "related_concepts": {"type": "array", "items": {"type": "string"}},
+          "strength_score": {"type": "number", "minimum": 0, "maximum": 1},
+          "summary": {"type": "string"},
+          "limitations": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "knowledge_gaps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "gap_id",
+          "description",
+          "gap_type",
+          "related_concepts",
+          "related_evidence_ids",
+          "importance_score",
+          "why_it_matters_for_hypothesis_generation"
+        ],
+        "properties": {
+          "gap_id": {"type": "string", "pattern": "^gap_[0-9]{3}$"},
+          "description": {"type": "string", "minLength": 1},
+          "gap_type": {
+            "type": "string",
+            "enum": [
+              "mechanism_unknown",
+              "causal_uncertain",
+              "data_missing",
+              "method_limitation",
+              "contradiction"
+            ]
+          },
+          "related_concepts": {"type": "array", "items": {"type": "string"}},
+          "related_evidence_ids": {
+            "type": "array",
+            "items": {"type": "string", "pattern": "^ev_[0-9]{3}$"}
+          },
+          "importance_score": {"type": "number", "minimum": 0, "maximum": 1},
+          "why_it_matters_for_hypothesis_generation": {"type": "string"}
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,223 @@
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+
+def test_cli_writes_failed_response_when_dify_is_not_configured():
+    output = Path("samples/test-artifacts") / f"cli-test-output-{os.getpid()}.json"
+    polluted_env = os.environ.copy()
+    polluted_env["DIFY_API_URL"] = "http://127.0.0.1:9"
+    polluted_env["DIFY_API_KEY"] = "test-key"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "planning_agent.cli",
+            "--sample",
+            "--output",
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=_without_dify_configuration(polluted_env),
+    )
+
+    assert result.returncode == 1
+    data = json.loads(output.read_text(encoding="utf-8"))
+    assert data["metadata"]["status"] == "failed"
+    assert "Dify workflow is not configured" in data["self_review"]["issues"][0]
+
+
+def _without_dify_configuration(env: dict[str, str]) -> dict[str, str]:
+    clean_env = env.copy()
+    for key in (
+        "DIFY_API_URL",
+        "DIFY_API_KEY",
+        "DIFY_USER",
+        "DIFY_RESPONSE_MODE",
+        "DIFY_TIMEOUT_SECONDS",
+        "DIFY_SHOW_PROGRESS",
+    ):
+        clean_env.pop(key, None)
+    clean_env["PLANNING_AGENT_SKIP_DOTENV"] = "1"
+    return clean_env
+
+
+def test_cli_default_response_path_uses_output_dir_and_minute_timestamp():
+    from planning_agent.cli import timestamped_response_path
+
+    path = timestamped_response_path(datetime(2026, 7, 12, 22, 5))
+
+    assert path == Path("samples/output/planning_response07_12-22_05.json")
+
+def test_dify_workflow_json_has_required_test_nodes():
+    workflow_path = Path("dify/planning_agent_workflow.json")
+
+    workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
+    node_types = {node["data"]["type"] for node in workflow["workflow"]["graph"]["nodes"]}
+
+    assert {"start", "llm", "end"} <= node_types
+    assert workflow["app"]["name"] == "Research Planning Agent Test Workflow"
+
+
+def test_primary_dify_yml_file_exists():
+    dsl_path = Path("dify/Research Planning Agent.yml")
+
+    text = dsl_path.read_text(encoding="utf-8")
+
+    assert "kind: app" in text
+    assert "version: 0.6.0" in text
+    assert "mode: workflow" in text
+    assert "type: start" in text
+    assert "type: llm" in text
+    assert "type: end" in text
+    assert "variable: plan_result" in text
+
+
+def test_cli_prints_dify_target_without_exposing_api_key():
+    env = os.environ.copy()
+    env["DIFY_API_URL"] = "http://115.190.208.240:31880"
+    env["DIFY_API_KEY"] = "secret-test-key"
+    env["DIFY_USER"] = "research-planning-agent"
+
+    result = subprocess.run(
+        [sys.executable, "-m", "planning_agent.cli", "--print-dify-target"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.returncode == 0
+    target = json.loads(result.stdout)
+    assert target["configured"] is True
+    assert target["endpoint"] == "http://115.190.208.240:31880/v1/workflows/run"
+    assert target["user"] == "research-planning-agent"
+    assert target["api_key_present"] is True
+    assert target["response_mode"] in {"blocking", "streaming"}
+    assert target["timeout_seconds"] >= 1
+    assert "secret-test-key" not in result.stdout
+
+
+def test_primary_dify_yml_uses_single_hypothesis_contract():
+    yml_path = Path("dify/Research Planning Agent.yml")
+
+    text = yml_path.read_text(encoding="utf-8")
+
+    assert "variable: hypothesis_evidence_package" in text
+    assert "variable: hypothesis_evidence_packages" not in text
+    assert "variable: plan_result" in text
+    assert "experiment_planner_plan_result_v1" in text
+    assert "不要输出 plans 数组" in text
+    assert "structured_output_enabled: true" in text
+
+
+def test_primary_dify_yml_has_multi_stage_planning_pipeline():
+    yml_path = Path("dify/Research Planning Agent.yml")
+
+    text = yml_path.read_text(encoding="utf-8")
+
+    assert "id: normalize_evidence" in text
+    assert "title: Normalize Evidence Context" in text
+    assert "normalized_evidence_context:" in text
+    assert "{{#normalize_evidence.normalized_evidence_context#}}" in text
+    assert "id: evidence_brief" in text
+    assert "title: Build Evidence Brief JSON" in text
+    assert "{{#evidence_brief.text#}}" in text
+    assert "id: plan_skeleton" in text
+    assert "title: Draft Plan Skeleton JSON" in text
+    assert "{{#plan_skeleton.text#}}" in text
+    assert "id: full_plan" in text
+    assert "title: Generate Full Plan Result JSON" in text
+    assert "id: critic_repair" in text
+    assert "title: Critic and Repair Plan Result JSON" in text
+    assert "{{#full_plan.text#}}" in text
+    assert "variable: plan_result" in text
+    assert text.count("type: llm") >= 4
+    assert "type: code" in text
+
+
+def test_primary_dify_yml_avoids_manual_yaml_anchors_for_import_safety():
+    yml_path = Path("dify/Research Planning Agent.yml")
+
+    text = yml_path.read_text(encoding="utf-8")
+
+    assert "&plan_result" not in text
+    assert "*plan_result" not in text
+
+def test_agents_file_documents_dify_dsl_rules_for_future_agents():
+    agents_path = Path("AGENTS.md")
+
+    text = agents_path.read_text(encoding="utf-8")
+
+    assert "Dify Workflow DSL 规则" in text
+    assert "data.type" in text
+    assert "sourceType" in text
+    assert "targetType" in text
+    assert "value_selector" in text
+    assert "variable_selector" in text
+    assert "hypothesis_evidence_package" in text
+    assert "plan_result" in text
+    assert "YAML anchor/alias" in text
+
+def test_short_sample_file_exists_and_is_smaller_than_full_sample():
+    short_path = Path("samples/input/module5_input_short.json")
+    full_path = Path("samples/input/module5_input_sample.json")
+
+    short_data = json.loads(short_path.read_text(encoding="utf-8"))
+    full_data = json.loads(full_path.read_text(encoding="utf-8"))
+
+    assert short_data["task_id"] == "task_short_001"
+    assert short_data["user_constraints"]["max_hypotheses"] == 2
+    assert short_path.stat().st_size < full_path.stat().st_size
+
+
+def test_cli_sample_uses_short_sample_when_dify_is_not_configured():
+    output = Path("samples/test-artifacts") / f"cli-test-output-{os.getpid()}.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "planning_agent.cli",
+            "--sample",
+            "--output",
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=_without_dify_configuration(os.environ.copy()),
+    )
+
+    assert result.returncode == 1
+    data = json.loads(output.read_text(encoding="utf-8"))
+    assert data["metadata"]["task_id"] == "task_short_001"
+
+
+def test_cli_full_sample_keeps_original_full_sample_when_dify_is_not_configured():
+    output = Path("samples/test-artifacts") / f"cli-test-output-{os.getpid()}.json"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "planning_agent.cli",
+            "--full-sample",
+            "--output",
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=_without_dify_configuration(os.environ.copy()),
+    )
+
+    assert result.returncode == 1
+    data = json.loads(output.read_text(encoding="utf-8"))
+    assert data["metadata"]["task_id"] == "task_demo_001"

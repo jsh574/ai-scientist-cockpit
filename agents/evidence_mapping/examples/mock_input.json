@@ -1,0 +1,162 @@
+{
+  "task_id": "task_001",
+  "stage": "evidence_mapping",
+  "iteration": 1,
+  "threshold": 7.0,
+  "hypothesis_cards": [
+    {
+      "hypothesis_id": "hyp_001",
+      "statement": "神经炎症可能通过促进 Tau 病理扩散，加速阿尔茨海默病认知功能下降。",
+      "rationale": "现有证据显示神经炎症、Tau 病理和认知下降均有关联，但神经炎症是否作为中介机制仍存在研究空白。",
+      "based_on_evidence_ids": ["ev_001", "ev_003"],
+      "related_gap_ids": ["gap_001"],
+      "target_variables": ["神经炎症", "Tau蛋白异常", "认知下降"],
+      "expected_observation": "若假设成立，炎症标志物升高应先于或伴随 Tau 病理扩散；炎症标志物升高可预测认知下降速度。",
+      "validation_idea": "可通过纵向队列数据、动物模型或细胞模型验证炎症标志物与 Tau 扩散之间的关系。",
+      "initial_scores": {
+        "novelty": 0.72,
+        "testability": 0.86,
+        "relevance": 0.91,
+        "risk": 0.38
+      },
+      "predictions": [
+        "炎症标志物升高先于或伴随 Tau 病理扩散",
+        "炎症标志物升高可预测认知下降速度"
+      ]
+    },
+    {
+      "hypothesis_id": "hyp_002",
+      "statement": "仅靠 Aβ 沉积即可完全解释阿尔茨海默病认知下降。",
+      "rationale": "Aβ 假说长期占主导，但临床抗 Aβ 疗效有限。",
+      "based_on_evidence_ids": ["ev_002"],
+      "related_gap_ids": ["gap_002"],
+      "target_variables": ["Aβ沉积", "认知下降"],
+      "expected_observation": "若假设成立，Aβ 负荷应与认知下降速度高度一致，且清除 Aβ 应显著改善认知。",
+      "validation_idea": "对照抗 Aβ 临床试验与纵向影像数据。",
+      "initial_scores": {
+        "novelty": 0.2,
+        "testability": 0.9,
+        "relevance": 0.8,
+        "risk": 0.7
+      }
+    }
+  ],
+  "evidence_cards": [
+    {
+      "evidence_id": "ev_001",
+      "claim": "多项研究提示神经炎症与 Tau 病理、认知下降存在相关关系，炎症标志物升高伴随疾病进展。",
+      "literature_id": "lit_001",
+      "source_type": "review",
+      "support_direction_hint": "support",
+      "confidence": 0.82,
+      "quotes": [
+        "Neuroinflammation is associated with tau pathology and cognitive decline in AD."
+      ],
+      "related_concepts": ["神经炎症", "Tau蛋白异常", "认知下降"],
+      "population_or_model": "欧美人群队列",
+      "method_note": "综述汇总观察性研究",
+      "sample_size": null
+    },
+    {
+      "evidence_id": "ev_002",
+      "claim": "Aβ 聚集可能早于 Tau 病理扩散，但与认知下降的相关性弱于 Tau。",
+      "literature_id": "lit_001",
+      "source_type": "review",
+      "support_direction_hint": "support",
+      "confidence": 0.8,
+      "quotes": [
+        "Tau pathology correlates more strongly with cognitive decline than amyloid burden."
+      ],
+      "related_concepts": ["Aβ沉积", "Tau蛋白异常", "认知下降"],
+      "population_or_model": "human autopsy and imaging cohorts",
+      "method_note": "影像与病理相关分析"
+    },
+    {
+      "evidence_id": "ev_003",
+      "claim": "动物模型中，抑制小胶质细胞介导的炎症可减缓 Tau 扩散。",
+      "literature_id": "lit_002",
+      "source_type": "animal_study",
+      "support_direction_hint": "support",
+      "confidence": 0.75,
+      "quotes": [
+        "Microglial modulation reduced tau spreading in mice."
+      ],
+      "related_concepts": ["神经炎症", "Tau蛋白异常"],
+      "population_or_model": "mouse",
+      "method_note": "干预实验",
+      "sample_size": 40
+    },
+    {
+      "evidence_id": "ev_005",
+      "claim": "部分研究认为炎症反应可能是病理结果而非原因，不支持炎症驱动 Tau 扩散。",
+      "literature_id": "lit_003",
+      "source_type": "opinion_or_study",
+      "support_direction_hint": "support",
+      "confidence": 0.7,
+      "quotes": [
+        "Inflammation may be a consequence rather than a cause of tau pathology."
+      ],
+      "related_concepts": ["神经炎症", "Tau蛋白异常"],
+      "population_or_model": "mixed human/animal",
+      "method_note": "机制讨论与部分观察"
+    },
+    {
+      "evidence_id": "ev_007",
+      "claim": "目前缺少直接证明炎症导致 Tau 扩散的因果证据，相关关系尚不足以确立中介机制。",
+      "literature_id": "lit_003",
+      "source_type": "gap_note",
+      "support_direction_hint": "uncertain",
+      "confidence": 0.66,
+      "quotes": [
+        "Causal evidence that inflammation drives tau spreading remains limited."
+      ],
+      "related_concepts": ["神经炎症", "Tau蛋白异常", "因果"],
+      "population_or_model": "human",
+      "method_note": "证据综合"
+    }
+  ],
+  "literature_cards": [
+    {
+      "literature_id": "lit_001",
+      "title": "Amyloid-beta and tau in Alzheimer's disease",
+      "authors": ["Author A", "Author B"],
+      "year": 2022,
+      "source": "Nature Reviews Neuroscience",
+      "doi": "10.xxxx/xxxx",
+      "url": "https://example.com/lit001",
+      "literature_type": "review",
+      "relevance_score": 0.91,
+      "main_findings": [
+        "Aβ 聚集可能早于 Tau 病理扩散",
+        "Tau 病理与认知下降相关性更强"
+      ],
+      "related_concepts": ["Aβ沉积", "Tau蛋白异常", "认知下降"]
+    },
+    {
+      "literature_id": "lit_002",
+      "title": "Microglia and tau spreading",
+      "authors": ["Author C"],
+      "year": 2023,
+      "source": "Neuron",
+      "doi": "10.yyyy/yyyy",
+      "url": "https://example.com/lit002",
+      "literature_type": "animal_study",
+      "relevance_score": 0.84,
+      "main_findings": ["抑制炎症相关通路可减缓 Tau 扩散"],
+      "related_concepts": ["神经炎症", "Tau蛋白异常"]
+    },
+    {
+      "literature_id": "lit_003",
+      "title": "Is neuroinflammation causal in AD progression?",
+      "authors": ["Author D"],
+      "year": 2021,
+      "source": "Alzheimer's Research & Therapy",
+      "doi": "10.zzzz/zzzz",
+      "url": "https://example.com/lit003",
+      "literature_type": "review",
+      "relevance_score": 0.8,
+      "main_findings": ["炎症可能是结果而非原因", "因果证据不足"],
+      "related_concepts": ["神经炎症", "因果推断"]
+    }
+  ]
+}
