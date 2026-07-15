@@ -1,0 +1,169 @@
+{
+  "schema_version": "experiment_planner_input_v1",
+  "task_id": "task_short_001",
+  "iteration": 1,
+  "request_mode": "batch",
+  "question_card": {
+    "question_id": "q_short_001",
+    "core_question": "运动是否能改善轻度认知障碍的记忆表现？",
+    "question_type": "intervention_feasibility",
+    "domain": [
+      "biomedicine"
+    ],
+    "research_object": {
+      "name": "轻度认知障碍",
+      "type": "condition"
+    }
+  },
+  "hypothesis_cards": [
+    {
+      "hypothesis_id": "hyp_short_001",
+      "statement": "规律有氧运动可能通过改善睡眠质量提升轻度认知障碍人群的记忆表现。",
+      "rationale": "运动、睡眠和记忆表现之间已有相关证据，但中介路径仍需验证。",
+      "based_on_evidence_ids": [
+        "ev_short_001"
+      ],
+      "related_gap_ids": [
+        "gap_short_001"
+      ],
+      "target_variables": [
+        "有氧运动",
+        "睡眠质量",
+        "记忆表现"
+      ],
+      "expected_observation": "运动频率更高者睡眠评分更好，记忆测验改善更明显。",
+      "validation_idea": "用公开队列或小型观察数据做相关和中介分析。",
+      "initial_scores": {
+        "novelty": 0.5,
+        "testability": 0.9,
+        "relevance": 0.8,
+        "risk": 0.25
+      }
+    },
+    {
+      "hypothesis_id": "hyp_short_002",
+      "statement": "社交活动频率可能调节轻度认知障碍人群的认知下降速度。",
+      "rationale": "社交参与与认知健康相关，但作用大小和边界条件不清楚。",
+      "based_on_evidence_ids": [
+        "ev_short_002"
+      ],
+      "related_gap_ids": [
+        "gap_short_002"
+      ],
+      "target_variables": [
+        "社交活动",
+        "认知下降"
+      ],
+      "expected_observation": "社交活动较高者认知下降更慢。",
+      "validation_idea": "用纵向认知评分检验交互效应。",
+      "initial_scores": {
+        "novelty": 0.45,
+        "testability": 0.75,
+        "relevance": 0.76,
+        "risk": 0.35
+      }
+    }
+  ],
+  "evidence_map": [
+    {
+      "hypothesis_id": "hyp_short_001",
+      "supporting_evidence_ids": [
+        "ev_short_001"
+      ],
+      "opposing_evidence_ids": [],
+      "uncertain_evidence_ids": [],
+      "evidence_summary": {
+        "support": "运动与睡眠质量改善相关。"
+      },
+      "evidence_strength_score": 0.7,
+      "main_limitations": [
+        "缺少因果验证"
+      ],
+      "needs_more_evidence": true
+    },
+    {
+      "hypothesis_id": "hyp_short_002",
+      "supporting_evidence_ids": [
+        "ev_short_002"
+      ],
+      "opposing_evidence_ids": [],
+      "uncertain_evidence_ids": [],
+      "evidence_summary": {
+        "support": "社交参与与认知保持相关。"
+      },
+      "evidence_strength_score": 0.55,
+      "main_limitations": [
+        "混杂因素较多"
+      ],
+      "needs_more_evidence": true
+    }
+  ],
+  "literature_cards": [
+    {
+      "literature_id": "lit_short_001",
+      "title": "Exercise, sleep and cognition in aging",
+      "authors": [
+        "Demo A"
+      ],
+      "year": 2023,
+      "doi": "10.0000/short1",
+      "url": "https://example.org/short1"
+    },
+    {
+      "literature_id": "lit_short_002",
+      "title": "Social engagement and cognitive trajectories",
+      "authors": [
+        "Demo B"
+      ],
+      "year": 2022,
+      "doi": "10.0000/short2",
+      "url": "https://example.org/short2"
+    }
+  ],
+  "evidence_cards": [
+    {
+      "evidence_id": "ev_short_001",
+      "claim": "有氧运动频率与睡眠质量评分改善相关。",
+      "source_literature_id": "lit_short_001",
+      "support_direction": "support",
+      "strength_score": 0.7,
+      "summary": "观察研究提示运动和睡眠质量存在正相关。"
+    },
+    {
+      "evidence_id": "ev_short_002",
+      "claim": "社交活动频率较高者认知评分下降更慢。",
+      "source_literature_id": "lit_short_002",
+      "support_direction": "support",
+      "strength_score": 0.55,
+      "summary": "纵向队列中社交参与和认知保持相关。"
+    }
+  ],
+  "knowledge_gaps": [
+    {
+      "gap_id": "gap_short_001",
+      "description": "睡眠是否中介运动对记忆的影响仍待验证。"
+    },
+    {
+      "gap_id": "gap_short_002",
+      "description": "社交活动作用是否独立于教育和健康状态仍不清楚。"
+    }
+  ],
+  "user_constraints": {
+    "language": "zh",
+    "max_hypotheses": 2,
+    "output_detail_level": "brief"
+  },
+  "planning_constraints": {
+    "plan_depth": "brief",
+    "resource_level": "smoke_test",
+    "allowed_validation_types": [
+      "statistical_test",
+      "literature_based_feasibility"
+    ],
+    "forbidden_actions": [
+      "invent_references",
+      "invent_dataset_url"
+    ],
+    "preferred_output_language": "zh-CN"
+  }
+}

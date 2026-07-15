@@ -1,0 +1,306 @@
+{
+  "schema_version": "experiment_planner_input_v1",
+  "task_id": "task_demo_001",
+  "iteration": 1,
+  "request_mode": "batch",
+  "question_card": {
+    "question_id": "q_001",
+    "original_question": "阿尔茨海默病的关键致病机制是什么？",
+    "core_question": "哪些分子、细胞和系统层面的机制驱动阿尔茨海默病的发生与进展？",
+    "question_type": "mechanism_analysis",
+    "domain": [
+      "neuroscience",
+      "biomedicine"
+    ],
+    "research_object": {
+      "name": "阿尔茨海默病",
+      "type": "disease",
+      "aliases": [
+        "Alzheimer's disease",
+        "AD"
+      ]
+    },
+    "key_variables": [
+      {
+        "name": "神经炎症",
+        "type": "causal_factor",
+        "role": "potential_driver"
+      },
+      {
+        "name": "Tau蛋白异常",
+        "type": "mediator",
+        "role": "disease_progression_factor"
+      },
+      {
+        "name": "认知下降",
+        "type": "outcome",
+        "role": "clinical_endpoint"
+      }
+    ],
+    "sub_questions": [
+      {
+        "sub_question_id": "sq_001",
+        "content": "神经炎症是否会放大阿尔茨海默病的病理进展？"
+      }
+    ],
+    "research_scope": {
+      "included": [
+        "机制解释",
+        "候选假设验证",
+        "公共数据分析"
+      ],
+      "excluded": [
+        "个体诊断",
+        "临床用药建议"
+      ]
+    }
+  },
+  "hypothesis_cards": [
+    {
+      "hypothesis_id": "hyp_001",
+      "statement": "神经炎症可能通过促进 Tau 病理扩散，加速阿尔茨海默病认知功能下降。",
+      "rationale": "现有证据显示神经炎症、Tau 病理和认知下降均有关联，但神经炎症是否作为中介机制仍存在研究空白。",
+      "based_on_evidence_ids": [
+        "ev_001",
+        "ev_002"
+      ],
+      "related_gap_ids": [
+        "gap_001"
+      ],
+      "target_variables": [
+        "神经炎症",
+        "Tau蛋白异常",
+        "认知下降"
+      ],
+      "expected_observation": "炎症标志物升高应先于或伴随 Tau 病理扩散，并预测认知下降速度。",
+      "validation_idea": "可通过纵向队列数据验证炎症标志物、Tau PET 与认知评分变化之间的关系。",
+      "initial_scores": {
+        "novelty": 0.72,
+        "testability": 0.86,
+        "relevance": 0.91,
+        "risk": 0.38
+      }
+    },
+    {
+      "hypothesis_id": "hyp_002",
+      "statement": "Aβ 沉积可能通过诱导突触损伤触发早期认知下降。",
+      "rationale": "Aβ 聚集被认为是较早出现的病理过程，但其与短期认知变化的直接关系仍不稳定。",
+      "based_on_evidence_ids": [
+        "ev_004"
+      ],
+      "related_gap_ids": [
+        "gap_002"
+      ],
+      "target_variables": [
+        "Aβ沉积",
+        "突触损伤",
+        "认知下降"
+      ],
+      "expected_observation": "Aβ 负荷越高，突触功能指标越低，并伴随认知评分下降。",
+      "validation_idea": "可通过公开影像和认知量表数据进行相关性与中介分析。",
+      "initial_scores": {
+        "novelty": 0.55,
+        "testability": 0.74,
+        "relevance": 0.83,
+        "risk": 0.52
+      }
+    }
+  ],
+  "evidence_map": [
+    {
+      "hypothesis_id": "hyp_001",
+      "supporting_evidence_ids": [
+        "ev_001",
+        "ev_002"
+      ],
+      "opposing_evidence_ids": [
+        "ev_003"
+      ],
+      "uncertain_evidence_ids": [],
+      "evidence_summary": {
+        "support": "多项研究提示炎症标志物与 Tau 病理、认知下降存在相关关系。",
+        "oppose": "部分研究认为炎症反应可能是病理结果而非原因。",
+        "uncertain": "缺少直接证明炎症导致 Tau 扩散的因果证据。"
+      },
+      "evidence_strength_score": 0.76,
+      "main_limitations": [
+        "因果证据不足",
+        "队列人群差异"
+      ],
+      "needs_more_evidence": true,
+      "detailed_review": {}
+    },
+    {
+      "hypothesis_id": "hyp_002",
+      "supporting_evidence_ids": [
+        "ev_004"
+      ],
+      "opposing_evidence_ids": [],
+      "uncertain_evidence_ids": [
+        "ev_005"
+      ],
+      "evidence_summary": {
+        "support": "Aβ 负荷与部分突触功能指标下降相关。",
+        "oppose": "",
+        "uncertain": "Aβ 与短期认知变化关系不稳定。"
+      },
+      "evidence_strength_score": 0.61,
+      "main_limitations": [
+        "认知变化效应弱"
+      ],
+      "needs_more_evidence": true,
+      "detailed_review": {}
+    }
+  ],
+  "literature_cards": [
+    {
+      "literature_id": "lit_001",
+      "title": "Neuroinflammation and tau pathology in Alzheimer's disease",
+      "authors": [
+        "Author A",
+        "Author B"
+      ],
+      "year": 2022,
+      "source": "Nature Reviews Neuroscience",
+      "doi": "10.0000/example1",
+      "url": "https://example.org/lit_001",
+      "literature_type": "review",
+      "relevance_score": 0.91,
+      "main_findings": [
+        "炎症反应与 Tau 病理扩散存在统计相关。"
+      ],
+      "related_concepts": [
+        "神经炎症",
+        "Tau蛋白异常"
+      ]
+    },
+    {
+      "literature_id": "lit_002",
+      "title": "Longitudinal biomarkers of cognitive decline",
+      "authors": [
+        "Author C"
+      ],
+      "year": 2021,
+      "source": "Alzheimer's Research",
+      "doi": "10.0000/example2",
+      "url": "https://example.org/lit_002",
+      "literature_type": "paper",
+      "relevance_score": 0.87,
+      "main_findings": [
+        "炎症指标和 Tau PET 信号与认知评分变化相关。"
+      ],
+      "related_concepts": [
+        "认知下降",
+        "Tau蛋白异常"
+      ]
+    }
+  ],
+  "evidence_cards": [
+    {
+      "evidence_id": "ev_001",
+      "claim": "炎症标志物水平与 Tau 病理负荷正相关。",
+      "source_literature_id": "lit_001",
+      "evidence_type": "literature_finding",
+      "support_direction": "support",
+      "related_concepts": [
+        "神经炎症",
+        "Tau蛋白异常"
+      ],
+      "strength_score": 0.82,
+      "summary": "综述归纳多项研究发现炎症指标与 Tau 病理存在关联。"
+    },
+    {
+      "evidence_id": "ev_002",
+      "claim": "Tau 病理负荷与认知下降速度相关。",
+      "source_literature_id": "lit_002",
+      "evidence_type": "observational_result",
+      "support_direction": "support",
+      "related_concepts": [
+        "Tau蛋白异常",
+        "认知下降"
+      ],
+      "strength_score": 0.79,
+      "summary": "纵向生物标志物研究显示 Tau PET 信号与认知评分变化相关。"
+    },
+    {
+      "evidence_id": "ev_003",
+      "claim": "炎症反应可能是神经退行性改变的结果而非原因。",
+      "source_literature_id": "lit_001",
+      "evidence_type": "theoretical_argument",
+      "support_direction": "oppose",
+      "related_concepts": [
+        "神经炎症"
+      ],
+      "strength_score": 0.55,
+      "summary": "部分解释模型认为炎症是下游响应。"
+    },
+    {
+      "evidence_id": "ev_004",
+      "claim": "Aβ 负荷与突触功能指标下降相关。",
+      "source_literature_id": "lit_002",
+      "evidence_type": "observational_result",
+      "support_direction": "support",
+      "related_concepts": [
+        "Aβ沉积",
+        "突触损伤"
+      ],
+      "strength_score": 0.64,
+      "summary": "公开队列中 Aβ 指标与突触功能代理指标相关。"
+    },
+    {
+      "evidence_id": "ev_005",
+      "claim": "Aβ 指标对短期认知变化的解释力不稳定。",
+      "source_literature_id": "lit_002",
+      "evidence_type": "methodological_uncertainty",
+      "support_direction": "uncertain",
+      "related_concepts": [
+        "Aβ沉积",
+        "认知下降"
+      ],
+      "strength_score": 0.48,
+      "summary": "不同模型和时间窗下相关性结果不一致。"
+    }
+  ],
+  "knowledge_gaps": [
+    {
+      "gap_id": "gap_001",
+      "description": "神经炎症在 Tau 病理扩散中的因果作用仍不明确。",
+      "related_concepts": [
+        "神经炎症",
+        "Tau蛋白异常"
+      ],
+      "importance_score": 0.84
+    },
+    {
+      "gap_id": "gap_002",
+      "description": "Aβ 与短期认知下降之间是否存在稳定中介路径仍不清楚。",
+      "related_concepts": [
+        "Aβ沉积",
+        "认知下降"
+      ],
+      "importance_score": 0.72
+    }
+  ],
+  "user_constraints": {
+    "language": "zh",
+    "domain_preference": "biomedicine",
+    "max_hypotheses": 2,
+    "output_detail_level": "standard"
+  },
+  "planning_constraints": {
+    "plan_depth": "standard",
+    "resource_level": "demo",
+    "allowed_validation_types": [
+      "public_dataset_analysis",
+      "statistical_test",
+      "literature_based_feasibility",
+      "human_feedback"
+    ],
+    "forbidden_actions": [
+      "invent_references",
+      "invent_dataset_url",
+      "claim_real_experiment_completed_without_execution"
+    ],
+    "preferred_output_language": "zh-CN"
+  }
+}

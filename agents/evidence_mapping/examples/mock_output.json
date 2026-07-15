@@ -1,0 +1,312 @@
+{
+  "metadata": {
+    "task_id": "task_001",
+    "agent_id": "evidence_mapping_agent",
+    "stage": "evidence_mapping",
+    "iteration": 1,
+    "status": "partial_success"
+  },
+  "payload": {
+    "evidence_map": [
+      {
+        "hypothesis_id": "hyp_001",
+        "supporting_evidence_ids": [
+          "ev_001",
+          "ev_003"
+        ],
+        "opposing_evidence_ids": [
+          "ev_005",
+          "ev_007"
+        ],
+        "uncertain_evidence_ids": [
+          "ev_002"
+        ],
+        "evidence_summary": {
+          "support": "支持侧：多项研究提示神经炎症与 Tau 病理、认知下降存在相关关系，炎症标志物升高伴随疾病进展。；动物模型中，抑制小胶质细胞介导的炎症可减缓 Tau 扩散。",
+          "oppose": "反对侧：部分研究认为炎症反应可能是病理结果而非原因，不支持炎症驱动 Tau 扩散。；目前缺少直接证明炎症导致 Tau 扩散的因果证据，相关关系尚不足以确立中介机制。",
+          "uncertain": "不确定侧：Aβ 聚集可能早于 Tau 病理扩散，但与认知下降的相关性弱于 Tau。"
+        },
+        "evidence_strength_score": 0.425,
+        "main_limitations": [
+          "表述偏相关，因果强度有限",
+          "研究人群/模型与目标场景可能不完全匹配",
+          "假设含因果/中介主张，但现有证据可能仅为相关，需补因果链证据"
+        ],
+        "needs_more_evidence": true,
+        "detailed_review": {
+          "review_id": "REV_001",
+          "threshold": 7.0,
+          "evidence_bindings": [
+            {
+              "evidence_id": "ev_001",
+              "binding_type": "direct_support",
+              "support_direction": "support",
+              "prediction_index": 1,
+              "prediction_text": "炎症标志物升高可预测认知下降速度",
+              "evidence_quality": {
+                "directness": 0.875,
+                "reliability": 0.88,
+                "sufficiency": 0.714,
+                "applicability": 0.694,
+                "total_score": 8.0
+              },
+              "supporting_quotes": [
+                "Neuroinflammation is associated with tau pathology and cognitive decline in AD."
+              ],
+              "contradictory_quotes": [],
+              "limitations": [
+                "表述偏相关，因果强度有限",
+                "研究人群/模型与目标场景可能不完全匹配"
+              ],
+              "recheck_note": "文本含支持信号，独立改判为 support"
+            },
+            {
+              "evidence_id": "ev_003",
+              "binding_type": "direct_support",
+              "support_direction": "support",
+              "prediction_index": 0,
+              "prediction_text": "炎症标志物升高先于或伴随 Tau 病理扩散",
+              "evidence_quality": {
+                "directness": 0.856,
+                "reliability": 0.8,
+                "sufficiency": 0.7,
+                "applicability": 0.606,
+                "total_score": 7.53
+              },
+              "supporting_quotes": [
+                "Microglial modulation reduced tau spreading in mice."
+              ],
+              "contradictory_quotes": [],
+              "limitations": [],
+              "recheck_note": "文本含支持信号，独立改判为 support"
+            },
+            {
+              "evidence_id": "ev_002",
+              "binding_type": "uncertain",
+              "support_direction": "uncertain",
+              "prediction_index": 0,
+              "prediction_text": "炎症标志物升高先于或伴随 Tau 病理扩散",
+              "evidence_quality": {
+                "directness": 0.35,
+                "reliability": 0.88,
+                "sufficiency": 0.71,
+                "applicability": 0.814,
+                "total_score": 6.65
+              },
+              "supporting_quotes": [
+                "Tau pathology correlates more strongly with cognitive decline than amyloid burden."
+              ],
+              "contradictory_quotes": [],
+              "limitations": [
+                "表述偏相关，因果强度有限"
+              ],
+              "recheck_note": "仅见相关性/证据不足表述，判为 uncertain"
+            },
+            {
+              "evidence_id": "ev_005",
+              "binding_type": "direct_oppose",
+              "support_direction": "oppose",
+              "prediction_index": 0,
+              "prediction_text": "炎症标志物升高先于或伴随 Tau 病理扩散",
+              "evidence_quality": {
+                "directness": 0.856,
+                "reliability": 0.88,
+                "sufficiency": 0.69,
+                "applicability": 0.77,
+                "total_score": 8.03
+              },
+              "supporting_quotes": [
+                "Inflammation may be a consequence rather than a cause of tau pathology."
+              ],
+              "contradictory_quotes": [],
+              "limitations": [],
+              "recheck_note": "文本含反对/否定信号，独立改判为 oppose"
+            },
+            {
+              "evidence_id": "ev_007",
+              "binding_type": "direct_oppose",
+              "support_direction": "oppose",
+              "prediction_index": 0,
+              "prediction_text": "炎症标志物升高先于或伴随 Tau 病理扩散",
+              "evidence_quality": {
+                "directness": 0.854,
+                "reliability": 0.88,
+                "sufficiency": 0.682,
+                "applicability": 0.77,
+                "total_score": 8.01
+              },
+              "supporting_quotes": [
+                "Causal evidence that inflammation drives tau spreading remains limited."
+              ],
+              "contradictory_quotes": [],
+              "limitations": [
+                "表述偏相关，因果强度有限"
+              ],
+              "recheck_note": "文本含反对/否定信号，独立改判为 oppose"
+            }
+          ],
+          "conflict_pairs": [
+            {
+              "evidence_id_a": "ev_001",
+              "evidence_id_b": "ev_005",
+              "conflict_reason": "支持证据称「多项研究提示神经炎症与 Tau 病理、认知下降存在相关关系，炎症标志物升高伴随疾…」，反对证据称「部分研究认为炎症反应可能是病理结果而非原因，不支持炎症驱动 Tau 扩散。…」"
+            },
+            {
+              "evidence_id_a": "ev_001",
+              "evidence_id_b": "ev_007",
+              "conflict_reason": "支持证据称「多项研究提示神经炎症与 Tau 病理、认知下降存在相关关系，炎症标志物升高伴随疾…」，反对证据称「目前缺少直接证明炎症导致 Tau 扩散的因果证据，相关关系尚不足以确立中介机制。…」"
+            },
+            {
+              "evidence_id_a": "ev_003",
+              "evidence_id_b": "ev_005",
+              "conflict_reason": "支持证据称「动物模型中，抑制小胶质细胞介导的炎症可减缓 Tau 扩散。…」，反对证据称「部分研究认为炎症反应可能是病理结果而非原因，不支持炎症驱动 Tau 扩散。…」"
+            }
+          ],
+          "gaps": [
+            {
+              "gap_code": "missing_causal_link",
+              "prediction_index": null,
+              "description": "假设含因果/中介主张，但现有证据可能仅为相关，需补因果链证据",
+              "suggested_evidence_type": "mediation_or_intervention"
+            }
+          ],
+          "recheck_delta": [
+            {
+              "evidence_id": "ev_002",
+              "module2_hint": "support",
+              "module4_direction": "uncertain",
+              "note": "仅见相关性/证据不足表述，判为 uncertain"
+            },
+            {
+              "evidence_id": "ev_005",
+              "module2_hint": "support",
+              "module4_direction": "oppose",
+              "note": "文本含反对/否定信号，独立改判为 oppose"
+            },
+            {
+              "evidence_id": "ev_007",
+              "module2_hint": "uncertain",
+              "module4_direction": "oppose",
+              "note": "文本含反对/否定信号，独立改判为 oppose"
+            }
+          ],
+          "verdict": {
+            "score": 6.29,
+            "passed": false,
+            "reason": "反对证据强度不低于支持侧，假设需修订",
+            "reason_codes": [
+              "evidence_conflict_unresolved",
+              "missing_causal_link"
+            ],
+            "rollback_target": "hypothesis_generation",
+            "rollback_suggestion": "回退假设生成：反对证据不少于支持证据，建议改写或收缩假设主张"
+          }
+        }
+      },
+      {
+        "hypothesis_id": "hyp_002",
+        "supporting_evidence_ids": [],
+        "opposing_evidence_ids": [],
+        "uncertain_evidence_ids": [
+          "ev_002"
+        ],
+        "evidence_summary": {
+          "support": "暂无明确支持证据。",
+          "oppose": "暂无明确反对证据。",
+          "uncertain": "不确定侧：Aβ 聚集可能早于 Tau 病理扩散，但与认知下降的相关性弱于 Tau。"
+        },
+        "evidence_strength_score": 0.467,
+        "main_limitations": [
+          "表述偏相关，因果强度有限",
+          "缺少直接支持预测的证据：若假设成立，Aβ 负荷应与认知下降速度高度一致，且清除 Aβ 应显著改善认知",
+          "当前无支持证据"
+        ],
+        "needs_more_evidence": true,
+        "detailed_review": {
+          "review_id": "REV_002",
+          "threshold": 7.0,
+          "evidence_bindings": [
+            {
+              "evidence_id": "ev_002",
+              "binding_type": "uncertain",
+              "support_direction": "uncertain",
+              "prediction_index": 0,
+              "prediction_text": "若假设成立，Aβ 负荷应与认知下降速度高度一致，且清除 Aβ 应显著改善认知",
+              "evidence_quality": {
+                "directness": 0.35,
+                "reliability": 0.88,
+                "sufficiency": 0.71,
+                "applicability": 0.814,
+                "total_score": 6.65
+              },
+              "supporting_quotes": [
+                "Tau pathology correlates more strongly with cognitive decline than amyloid burden."
+              ],
+              "contradictory_quotes": [],
+              "limitations": [
+                "表述偏相关，因果强度有限"
+              ],
+              "recheck_note": "仅见相关性/证据不足表述，判为 uncertain"
+            }
+          ],
+          "conflict_pairs": [],
+          "gaps": [
+            {
+              "gap_code": "prediction_uncovered:P0",
+              "prediction_index": 0,
+              "description": "缺少直接支持预测的证据：若假设成立，Aβ 负荷应与认知下降速度高度一致，且清除 Aβ 应显著改善认知",
+              "suggested_evidence_type": "causal_or_longitudinal"
+            },
+            {
+              "gap_code": "missing_support",
+              "prediction_index": null,
+              "description": "当前无支持证据",
+              "suggested_evidence_type": "primary_study"
+            },
+            {
+              "gap_code": "why_no_oppose",
+              "prediction_index": null,
+              "description": "未发现明确反对证据；需确认是全面检索后仍无，还是检索不足",
+              "suggested_evidence_type": "contradictory_or_null_result"
+            }
+          ],
+          "recheck_delta": [
+            {
+              "evidence_id": "ev_002",
+              "module2_hint": "support",
+              "module4_direction": "uncertain",
+              "note": "仅见相关性/证据不足表述，判为 uncertain"
+            }
+          ],
+          "verdict": {
+            "score": 5.86,
+            "passed": false,
+            "reason": "无支持证据，无法形成可追踪支持链",
+            "reason_codes": [
+              "missing_support",
+              "prediction_uncovered:P0",
+              "why_no_oppose"
+            ],
+            "rollback_target": "knowledge_integration",
+            "rollback_suggestion": "回退知识整合：补充至少 1 条可直接支持核心预测的证据，并附 quotes"
+          }
+        }
+      }
+    ]
+  },
+  "self_review": {
+    "passed": false,
+    "overall_score": 0.223,
+    "threshold": 0.75,
+    "dimension_scores": {
+      "hypothesis_pass_rate": 0.0,
+      "avg_evidence_strength": 0.446,
+      "schema_validity": 1.0
+    },
+    "issues": [],
+    "suggestions": [
+      "hyp_001: 回退假设生成：反对证据不少于支持证据，建议改写或收缩假设主张",
+      "hyp_002: 回退知识整合：补充至少 1 条可直接支持核心预测的证据，并附 quotes"
+    ]
+  }
+}

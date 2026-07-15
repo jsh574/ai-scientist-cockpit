@@ -1,0 +1,10 @@
+{
+  "name": "EurekaLoop 灵光闭环",
+  "short_name": "EurekaLoop",
+  "description": "Conversation-first multi-agent AI Scientist research controller demo.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#eef1f5",
+  "theme_color": "#eef1f5",
+  "icons": []
+}
