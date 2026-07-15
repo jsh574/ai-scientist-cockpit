@@ -17,6 +17,7 @@ export type StageStatus =
   | "human_review"
   | "passed"
   | "failed"
+  | "revision_required"
   | "retrying";
 
 export type ViewId = "workbench" | "research" | "artifacts" | "api" | "submission";

@@ -64,7 +64,7 @@ class Settings:
                 os.getenv("ARTIFACTS_ROOT"), PROJECT_ROOT / "artifacts" / "tasks"
             ),
             review_threshold=float(os.getenv("REVIEW_GATE_THRESHOLD", "0.75")),
-            max_iterations=int(os.getenv("MAX_WORKFLOW_ITERATIONS", "3")),
+            max_iterations=int(os.getenv("MAX_WORKFLOW_ITERATIONS", "10")),
             cors_origins=tuple(
                 origin.strip()
                 for origin in os.getenv(

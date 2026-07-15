@@ -66,6 +66,7 @@ def health() -> dict[str, Any]:
         "version": app.version,
         "protocol_version": "1.0",
         "model": "qwen3.7-max",
+        "max_iterations": settings.max_iterations,
         "real_agent_stages": sorted(REAL_AGENT_STAGES),
         "workflow": list(STAGE_ORDER),
         "sources": sources,

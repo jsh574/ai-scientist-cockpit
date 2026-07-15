@@ -10,6 +10,17 @@ import type {
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
 const useRealAgents = import.meta.env.VITE_ENABLE_REAL_AGENTS !== "false";
 
+export interface HealthStatus {
+  status: "ok" | "degraded";
+  version: string;
+  protocol_version: string;
+  model: string;
+  max_iterations: number;
+  real_agent_stages: string[];
+  sources: Record<string, { available?: boolean; credential_configured?: boolean }>;
+  mcp: { server: string; transport: string };
+}
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${apiBaseUrl}${path}`, init);
   const body = await response.json().catch(() => null);
@@ -54,6 +65,10 @@ export async function createTask(context: TaskContext): Promise<TaskContext> {
     }),
   });
   return result.task_context;
+}
+
+export async function fetchHealthStatus(): Promise<HealthStatus> {
+  return requestJson<HealthStatus>("/api/health");
 }
 
 export async function executeStage(

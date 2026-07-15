@@ -10,6 +10,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import {
+  Activity,
   Archive,
   ArrowDown,
   Bot,
@@ -35,6 +36,7 @@ import {
   PlusCircle,
   RotateCcw,
   Send,
+  Server,
   SlidersHorizontal,
   Sparkles,
   Upload,
@@ -47,10 +49,12 @@ import {
   executeStage,
   exportTaskBundle,
   fetchArtifacts,
+  fetchHealthStatus,
   fetchVersionDiff,
   fetchVersions,
   recordFeedback,
   submitHumanReview,
+  type HealthStatus,
   type RemoteArtifact,
   type VersionDiffResult,
 } from "./agentApi";
@@ -67,7 +71,7 @@ import {
   stageMeta,
   stageOrder,
 } from "./mockData";
-import type { AgentResponse, EventLog, ReviewRecord, RunMode, StageId, StageRun, TaskContext, VersionRecord } from "./types";
+import type { AgentResponse, EventLog, ReviewRecord, RunMode, StageId, StageRun, TaskContext, UserInput, VersionRecord } from "./types";
 
 type Language = "zh" | "en";
 type PageId = "workbench" | "system" | "docs";
@@ -79,6 +83,12 @@ type MenuId = "reasoning" | "approval" | "memory" | null;
 type ProjectMenuPanel = "root" | "sidebar" | "sort" | null;
 type ProjectGroupMode = "project" | "recent" | "time" | "movedown";
 type ProjectSortMode = "manual" | "created" | "updated";
+
+interface StarterQuestion {
+  domain: string;
+  domainLabel: Record<Language, string>;
+  question: Record<Language, string>;
+}
 
 type FlowNode = Node<FlowNodeData, "flowNode">;
 
@@ -108,6 +118,7 @@ interface ThreadMessage {
   review?: ReviewRecord | null;
   status?: StageRun["status"];
   needsApproval?: boolean;
+  retryFromStage?: StageId;
   revisionNote?: string;
   createdAt: string;
 }
@@ -141,10 +152,87 @@ const delay = (ms: number) => new Promise((resolve) => window.setTimeout(resolve
 
 const makeMessageId = (prefix: string) => `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 
+function getFeedbackTargetStage(response: AgentResponse, fallback: StageId): StageId {
+  const validStages = new Set<StageId>(stageOrder);
+  const payload = response.payload as Record<string, unknown>;
+  const evidenceMap = Array.isArray(payload.evidence_map) ? payload.evidence_map : [];
+
+  for (const item of evidenceMap) {
+    if (!item || typeof item !== "object") continue;
+    const detailedReview = (item as Record<string, unknown>).detailed_review;
+    if (!detailedReview || typeof detailedReview !== "object") continue;
+    const review = detailedReview as Record<string, unknown>;
+    const verdict = review.verdict;
+    const feedback = review.feedback_for_iteration;
+    const candidates = [
+      verdict && typeof verdict === "object" ? (verdict as Record<string, unknown>).rollback_target : undefined,
+      feedback && typeof feedback === "object" ? (feedback as Record<string, unknown>).back_to : undefined,
+    ];
+    const target = candidates.find((candidate) => typeof candidate === "string" && validStages.has(candidate as StageId));
+    if (target) return target as StageId;
+  }
+
+  return fallback;
+}
+
 const approvalToRunMode: Record<ApprovalMode, RunMode> = {
   ask: "manual",
   assist: "hybrid",
   auto: "auto",
+};
+
+const starterQuestions: StarterQuestion[] = [
+  {
+    domain: "biomedicine",
+    domainLabel: { zh: "生命科学", en: "Life science" },
+    question: {
+      zh: "神经炎症是否会驱动 Tau 病理扩散，并进一步导致阿尔茨海默病认知下降？",
+      en: "Does neuroinflammation drive tau pathology spread and subsequent cognitive decline in Alzheimer's disease?",
+    },
+  },
+  {
+    domain: "materials_science",
+    domainLabel: { zh: "材料科学", en: "Materials" },
+    question: {
+      zh: "室温超导候选材料中的电子配对机制，可以通过哪些可证伪实验加以区分？",
+      en: "Which falsifiable experiments can distinguish electron-pairing mechanisms in room-temperature superconductor candidates?",
+    },
+  },
+  {
+    domain: "astronomy",
+    domainLabel: { zh: "天文学", en: "Astronomy" },
+    question: {
+      zh: "矮星系的恒星运动学能否区分冷暗物质与自相互作用暗物质模型？",
+      en: "Can stellar kinematics in dwarf galaxies distinguish cold dark matter from self-interacting dark matter?",
+    },
+  },
+  {
+    domain: "earth_science",
+    domainLabel: { zh: "地球科学", en: "Earth science" },
+    question: {
+      zh: "海洋热浪如何改变碳汇效率，其关键反馈机制能否通过多源数据验证？",
+      en: "How do marine heatwaves alter carbon-sink efficiency, and can the key feedback mechanisms be validated with multi-source data?",
+    },
+  },
+];
+
+const domainOptions = ["general", "biomedicine", "materials_science", "astronomy", "earth_science"] as const;
+
+const domainLabels: Record<Language, Record<(typeof domainOptions)[number], string>> = {
+  zh: {
+    general: "跨学科",
+    biomedicine: "生命科学",
+    materials_science: "材料科学",
+    astronomy: "天文学",
+    earth_science: "地球科学",
+  },
+  en: {
+    general: "Cross-domain",
+    biomedicine: "Life science",
+    materials_science: "Materials",
+    astronomy: "Astronomy",
+    earth_science: "Earth science",
+  },
 };
 
 const stageLabel: Record<Language, Record<StageId, string>> = {
@@ -193,6 +281,7 @@ const statusLabel: Record<Language, Record<string, string>> = {
     human_review: "待审批",
     passed: "已通过",
     failed: "失败",
+    revision_required: "需补证",
     retrying: "重跑中",
     created: "待开始",
     completed: "已完成",
@@ -204,6 +293,7 @@ const statusLabel: Record<Language, Record<string, string>> = {
     human_review: "Needs approval",
     passed: "Passed",
     failed: "Failed",
+    revision_required: "Needs evidence",
     retrying: "Retrying",
     created: "Ready",
     completed: "Done",
@@ -264,14 +354,14 @@ const copy = {
     controllerStarted: "总控已创建任务，并按当前策略调度各模块。",
     emptyThread: "等待新的科研问题。",
     docsTitle: "EurekaLoop 使用文档",
-    docsLead: "这个 demo 先做前端闭环：输入问题、选择总控策略、查看每个 Agent 输出、在消息尾部审批或要求重跑，最后得到总控最终输出。",
+    docsLead: "工作台连接真实总控 API，任务、审核、反馈、版本和 Artifact 都由服务端持久化。",
     doc1: "输入一个科学问题，左下角 + 可以附加文件或背景材料。",
     doc2: "在输入框下方选择推理强度、访问权限和记忆能力。",
     doc3: "启动后，每个模块都会在对话记录中输出自己的结果。",
     doc4: "需要审批时，按钮出现在对应模块消息的结尾；不满意就写修改意见并重跑。",
     doc5: "总控最终输出会作为最后一条控制器消息出现，可打开 JSON 追踪完整结构。",
-    backendTitle: "后端落地",
-    backendText: "后续把 mock 调度替换为 POST /api/tasks、/start、/reviews、/feedback 与 SSE 事件流即可；Artifact Service 继续负责文件、快照和日志。",
+    backendTitle: "运行契约",
+    backendText: "任务通过 /api/tasks 创建，各阶段由 Review Gate 校验；反馈、版本快照、事件和导出结果写入任务隔离的 Artifact 目录。",
   },
   en: {
     appName: "EurekaLoop",
@@ -326,14 +416,14 @@ const copy = {
     controllerStarted: "The controller created a task and started routing modules with the selected policy.",
     emptyThread: "Waiting for a scientific question.",
     docsTitle: "EurekaLoop Guide",
-    docsLead: "This demo focuses on the frontend loop: ask a question, choose controller policy, inspect every Agent output, approve or rerun inside the message, and finish with the controller output.",
+    docsLead: "The workbench is connected to the live controller API. Tasks, reviews, feedback, versions, and artifacts are persisted by the server.",
     doc1: "Enter a scientific question. Use + to attach files or background context.",
     doc2: "Choose reasoning, access, and memory from the controls below the composer.",
     doc3: "After start, every module writes its output into the conversation thread.",
     doc4: "Approval buttons appear at the end of the related module message; add feedback and rerun if needed.",
     doc5: "The final controller output appears as the last controller message, with JSON available for tracing.",
-    backendTitle: "Backend path",
-    backendText: "Later, replace the mock runner with POST /api/tasks, /start, /reviews, /feedback and an SSE event stream; Artifact Service keeps handling files, snapshots, and logs.",
+    backendTitle: "Runtime contract",
+    backendText: "Tasks are created through /api/tasks and every stage is validated by the Review Gate. Feedback, snapshots, events, and exports are stored in task-isolated artifact directories.",
   },
 };
 
@@ -418,7 +508,9 @@ function App() {
   const [remoteArtifacts, setRemoteArtifacts] = useState<RemoteArtifact[]>([]);
   const [runtimeError, setRuntimeError] = useState("");
   const [versionDiff, setVersionDiff] = useState<VersionDiffResult | null>(null);
+  const [health, setHealth] = useState<HealthStatus | null>(null);
   const threadEndRef = useRef<HTMLDivElement | null>(null);
+  const taskIdRef = useRef(context.task_id);
 
   const t = copy[language];
   const runMode = approvalToRunMode[approval];
@@ -428,6 +520,10 @@ function App() {
   const currentStageLabel = finished ? statusLabel[language].completed : stageLabel[language][activeStage];
   const uploadedLabel = files.length ? files.join(", ") : t.noFiles;
   const latestEvent = events[0]?.message;
+  const maxIterations = health?.max_iterations ?? 10;
+  const readyAgentCount = health
+    ? Object.entries(health.sources).filter(([stage, source]) => stage !== "artifact_service" && source.available).length
+    : 0;
   const activeProject = projects.find((project) => project.id === activeProjectId) ?? projects[0];
   const sortedProjects = useMemo(() => {
     const list = [...projects];
@@ -465,6 +561,20 @@ function App() {
   useEffect(() => {
     if (page === "system") void refreshRuntimeData();
   }, [page, refreshRuntimeData]);
+
+  useEffect(() => {
+    let active = true;
+    void fetchHealthStatus()
+      .then((result) => {
+        if (active) setHealth(result);
+      })
+      .catch(() => {
+        if (active) setHealth(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     threadEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -512,6 +622,7 @@ function App() {
   ]);
 
   const hydrateProject = useCallback((project: ProjectSession) => {
+    taskIdRef.current = project.context.task_id;
     setContext(project.context);
     setStages(project.stages);
     setEvents(project.events);
@@ -524,6 +635,9 @@ function App() {
     setHasSubmittedQuestion(project.hasSubmittedQuestion);
     setFiles(project.files);
     setFeedbackDrafts(project.feedbackDrafts);
+    setRemoteArtifacts([]);
+    setRuntimeError("");
+    setVersionDiff(null);
     setRunning(false);
     setTreeOpen(false);
     setJsonOpen(null);
@@ -557,7 +671,7 @@ function App() {
       setEvents((current) => [
         {
           event_id: `evt_${String(current.length + 1).padStart(3, "0")}`,
-          task_id: "task_001",
+          task_id: taskIdRef.current,
           type,
           stage,
           message: language === "zh" ? messageZh : messageEn,
@@ -593,16 +707,28 @@ function App() {
           original_question: question,
           user_constraints: {
             ...base.user_input.user_constraints,
+            ...context.user_input.user_constraints,
             language: language === "zh" ? "zh-CN" : "en-US",
           },
         },
       };
     },
-    [language, runMode],
+    [context.user_input.user_constraints, language, runMode],
   );
+
+  const updateConstraints = useCallback((patch: Partial<UserInput["user_constraints"]>) => {
+    setContext((current) => ({
+      ...current,
+      user_input: {
+        ...current.user_input,
+        user_constraints: { ...current.user_input.user_constraints, ...patch },
+      },
+    }));
+  }, []);
 
   const resetDemo = useCallback(() => {
     const fresh = createInitialContext(runMode);
+    taskIdRef.current = fresh.task_id;
     setRunning(false);
     setContext(fresh);
     setStages(createInitialStages(fresh));
@@ -659,8 +785,8 @@ function App() {
         );
         await delay(360);
 
-        if (response.metadata.status === "failed" || execution.status === "failed" || execution.status === "retry") {
-          const failedReview = execution.review ?? createReviewRecord(stage, execution.status === "retry" ? "retry" : "fail");
+        if (response.metadata.status === "failed" || execution.status === "failed") {
+          const failedReview = execution.review ?? createReviewRecord(stage, "fail");
           updateStage(stage, { status: "failed", review: failedReview });
           patchMessage(messageId, { status: "failed", review: failedReview, needsApproval: false });
           appendEvent(
@@ -669,7 +795,7 @@ function App() {
             `${stageLabel.en[stage]} failed. Check the error details and retry.`,
             stage,
           );
-          setContext((current) => ({ ...current, current_stage: stage }));
+          setContext(execution.task_context ?? { ...workingContext, current_stage: stage });
           setRunning(false);
           return;
         }
@@ -692,26 +818,67 @@ function App() {
         );
 
         if (needsHuman) {
+          if (execution.task_context) {
+            workingContext = execution.task_context;
+            workingVersions = execution.task_context.versions;
+            setVersions(workingVersions);
+            setContext(workingContext);
+          } else {
+            setContext((current) => ({ ...current, current_stage: "human_review" }));
+          }
           setReviewStage(stage);
           setPendingIndex(index);
-          setContext((current) => ({ ...current, current_stage: "human_review" }));
           setRunning(false);
           return;
         }
 
-        workingContext = mergeStagePayload(workingContext, stage, response);
-        workingContext = { ...workingContext, reviews: [...workingContext.reviews, review] };
-        const version = createVersion(stage, workingVersions.length);
-        workingVersions = [...workingVersions, version];
-        workingContext = { ...workingContext, versions: workingVersions };
+        if (execution.status === "retry") {
+          const retryReview = execution.review ?? createReviewRecord(stage, "retry");
+          const retryFromStage = getFeedbackTargetStage(response, stage);
+          const nextContext = execution.task_context ?? { ...workingContext, current_stage: stage };
+          updateStage(stage, { status: "revision_required", review: retryReview });
+          patchMessage(messageId, {
+            status: "revision_required",
+            review: retryReview,
+            needsApproval: false,
+            retryFromStage,
+          });
+          appendEvent(
+            "stage_revision_required",
+            `${stageLabel.zh[stage]}证据质量未达阈值，需要从${stageLabel.zh[retryFromStage]}补充后重试。`,
+            `${stageLabel.en[stage]} needs stronger evidence. Resume from ${stageLabel.en[retryFromStage]}.`,
+            stage,
+          );
+          workingContext = nextContext;
+          workingVersions = nextContext.versions;
+          setContext(nextContext);
+          setVersions(workingVersions);
+          setRunning(false);
+          return;
+        }
+
+        const previousVersionCount = workingVersions.length;
+        if (execution.task_context) {
+          workingContext = execution.task_context;
+          workingVersions = execution.task_context.versions;
+        } else {
+          workingContext = mergeStagePayload(workingContext, stage, response);
+          workingContext = { ...workingContext, reviews: [...workingContext.reviews, review] };
+          const fallbackVersion = createVersion(stage, workingVersions.length);
+          workingVersions = [...workingVersions, fallbackVersion];
+          workingContext = { ...workingContext, versions: workingVersions };
+        }
         setVersions(workingVersions);
         setContext(workingContext);
-        appendEvent(
-          "context_snapshot_created",
-          `${version.version_id} 已保存。`,
-          `${version.version_id} snapshot saved.`,
-          stage,
-        );
+        const latestVersion = workingVersions.at(-1);
+        if (latestVersion && workingVersions.length > previousVersionCount) {
+          appendEvent(
+            "context_snapshot_created",
+            `${latestVersion.version_id} 已保存。`,
+            `${latestVersion.version_id} snapshot saved.`,
+            stage,
+          );
+        }
         await delay(260);
       }
 
@@ -740,6 +907,7 @@ function App() {
       });
       return;
     }
+    taskIdRef.current = fresh.task_id;
     setContext(fresh);
     setStages(createInitialStages(fresh));
     setVersions([]);
@@ -823,20 +991,6 @@ function App() {
       if (index < 0) return;
       const note = feedbackDrafts[sourceMessageId]?.trim() || (language === "zh" ? "请重新检查并改进这一阶段输出。" : "Please re-check and improve this stage output.");
 
-      pushMessage({ kind: "user", body: note, stage });
-      setMessages((current) =>
-        current.map((message) =>
-          message.stage === stage && message.needsApproval
-            ? { ...message, status: "retrying", needsApproval: false, revisionNote: note }
-            : message,
-        ),
-      );
-      setFeedbackDrafts((current) => ({ ...current, [sourceMessageId]: "" }));
-      setReviewStage(null);
-      setPendingIndex(null);
-      updateStage(stage, { status: "retrying", review: createReviewRecord(stage, "retry") });
-      appendEvent("stage_retry_requested", `${stageLabel.zh[stage]}收到修改意见，准备重跑。`, `${stageLabel.en[stage]} received feedback and will rerun.`, stage);
-
       let rerunContext = context;
       let rerunVersions = versions;
       try {
@@ -850,8 +1004,23 @@ function App() {
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         appendEvent("feedback_record_failed", `反馈保存失败：${detail}`, `Feedback persistence failed: ${detail}`, stage);
+        setRuntimeError(detail);
         return;
       }
+
+      pushMessage({ kind: "user", body: note, stage });
+      setMessages((current) =>
+        current.map((message) =>
+          message.stage === stage && message.needsApproval
+            ? { ...message, status: "retrying", needsApproval: false, revisionNote: note }
+            : message,
+        ),
+      );
+      setFeedbackDrafts((current) => ({ ...current, [sourceMessageId]: "" }));
+      setReviewStage(null);
+      setPendingIndex(null);
+      updateStage(stage, { status: "retrying", review: createReviewRecord(stage, "retry") });
+      appendEvent("stage_retry_requested", `${stageLabel.zh[stage]}收到修改意见，准备重跑。`, `${stageLabel.en[stage]} received feedback and will rerun.`, stage);
 
       setRunning(true);
       await delay(320);
@@ -950,7 +1119,7 @@ function App() {
           </div>
           <div className="meter-grid">
             <StatusMetric label={t.progress} value={`${progress}%`} />
-            <StatusMetric label={t.iteration} value={`R${context.iteration}`} />
+            <StatusMetric label={t.iteration} value={`R${context.iteration}/${maxIterations}`} />
           </div>
           {latestEvent ? <p className="latest-event">{latestEvent}</p> : null}
           <button className="ghost-button" type="button" onClick={resetDemo}>
@@ -968,15 +1137,34 @@ function App() {
                 <p>{t.appSub}</p>
                 <h1>{t.appName}</h1>
               </div>
-              <span className={`state-chip ${activeStageRun.status}`}>{statusLabel[language][activeStageRun.status]}</span>
+              <div className="thread-header-status">
+                <span className={`connection-status ${health?.status ?? "offline"}`}>
+                  <Activity size={13} />
+                  {health
+                    ? language === "zh"
+                      ? `${readyAgentCount} 个 Agent · ${health.model}`
+                      : `${readyAgentCount} agents · ${health.model}`
+                    : language === "zh"
+                      ? "后端未连接"
+                      : "Backend offline"}
+                </span>
+                <span className={`state-chip ${activeStageRun.status}`}>{statusLabel[language][activeStageRun.status]}</span>
+              </div>
             </header>
 
             <section className="thread-area" aria-label={language === "zh" ? "对话记录" : "Conversation"}>
               {messages.length === 0 ? (
-                <div className="empty-thread">
-                  <Sparkles size={18} />
-                  <span>{t.emptyThread}</span>
-                </div>
+                <ResearchStarter
+                  constraints={context.user_input.user_constraints}
+                  health={health}
+                  language={language}
+                  maxIterations={maxIterations}
+                  onConstraintChange={updateConstraints}
+                  onSelectQuestion={(starter) => {
+                    setQuestionDraft(starter.question[language]);
+                    updateConstraints({ domain_preference: starter.domain });
+                  }}
+                />
               ) : null}
 
               <div className="message-list">
@@ -989,7 +1177,10 @@ function App() {
                     onApprove={approveReview}
                     onFeedbackChange={(value) => setFeedbackDrafts((current) => ({ ...current, [message.id]: value }))}
                     onOpenJson={(title, data) => setJsonOpen({ title, data })}
-                    onRerun={() => message.stage && rerunStageWithFeedback(message.stage, message.id)}
+                    onRerun={() => {
+                      const targetStage = message.retryFromStage ?? message.stage;
+                      if (targetStage) void rerunStageWithFeedback(targetStage, message.id);
+                    }}
                     onSelectStage={(stage) => setActiveStage(stage)}
                     running={running}
                     t={t}
@@ -1065,6 +1256,8 @@ function App() {
             context={context}
             events={events}
             language={language}
+            health={health}
+            maxIterations={maxIterations}
             onExport={() => void exportTaskBundle(context.task_id).catch((error) => setRuntimeError(String(error)))}
             onRefresh={() => void refreshRuntimeData()}
             runtimeError={runtimeError}
@@ -1095,11 +1288,119 @@ function App() {
   );
 }
 
+function ResearchStarter({
+  constraints,
+  health,
+  language,
+  maxIterations,
+  onConstraintChange,
+  onSelectQuestion,
+}: {
+  constraints: UserInput["user_constraints"];
+  health: HealthStatus | null;
+  language: Language;
+  maxIterations: number;
+  onConstraintChange: (patch: Partial<UserInput["user_constraints"]>) => void;
+  onSelectQuestion: (starter: StarterQuestion) => void;
+}) {
+  const zh = language === "zh";
+  const selectedDomain = domainOptions.includes(constraints.domain_preference as (typeof domainOptions)[number])
+    ? (constraints.domain_preference as (typeof domainOptions)[number])
+    : "general";
+  const readyAgents = health
+    ? Object.entries(health.sources).filter(([stage, source]) => stage !== "artifact_service" && source.available).length
+    : 0;
+  const detailOptions: Array<UserInput["user_constraints"]["output_detail_level"]> = ["brief", "standard", "detailed"];
+  const detailLabels: Record<Language, Record<UserInput["user_constraints"]["output_detail_level"], string>> = {
+    zh: { brief: "精简", standard: "标准", detailed: "详细" },
+    en: { brief: "Brief", standard: "Standard", detailed: "Detailed" },
+  };
+
+  return (
+    <section className="research-starter">
+      <header className="starter-heading">
+        <div>
+          <span>{zh ? "科研起点" : "Research starting point"}</span>
+          <h2>{zh ? "代表性科学问题" : "Representative scientific questions"}</h2>
+        </div>
+        <div className={`starter-connection ${health?.status ?? "offline"}`}>
+          <Activity size={14} />
+          {health ? (zh ? "总控在线" : "Controller online") : zh ? "等待后端" : "Backend offline"}
+        </div>
+      </header>
+
+      <div className="starter-question-grid">
+        {starterQuestions.map((starter) => (
+          <button key={starter.domain} type="button" onClick={() => onSelectQuestion(starter)}>
+            <span>{starter.domainLabel[language]}</span>
+            <strong>{starter.question[language]}</strong>
+            <ArrowDown size={15} />
+          </button>
+        ))}
+      </div>
+
+      <div className="starter-bottom-grid">
+        <section className="constraint-panel">
+          <div className="starter-section-title">
+            <SlidersHorizontal size={15} />
+            <strong>{zh ? "科研约束" : "Research constraints"}</strong>
+          </div>
+          <label>
+            <span>{zh ? "领域" : "Domain"}</span>
+            <select value={selectedDomain} onChange={(event) => onConstraintChange({ domain_preference: event.target.value })}>
+              {domainOptions.map((domain) => <option key={domain} value={domain}>{domainLabels[language][domain]}</option>)}
+            </select>
+          </label>
+          <div className="constraint-field">
+            <span>{zh ? "输出深度" : "Output detail"}</span>
+            <div className="detail-segments">
+              {detailOptions.map((detail) => (
+                <button
+                  className={constraints.output_detail_level === detail ? "active" : ""}
+                  key={detail}
+                  type="button"
+                  onClick={() => onConstraintChange({ output_detail_level: detail })}
+                >
+                  {detailLabels[language][detail]}
+                </button>
+              ))}
+            </div>
+          </div>
+          <label>
+            <span>{zh ? "最大假设数" : "Max hypotheses"}</span>
+            <input
+              max={8}
+              min={1}
+              type="number"
+              value={constraints.max_hypotheses}
+              onChange={(event) => onConstraintChange({ max_hypotheses: Math.min(8, Math.max(1, Number(event.target.value) || 1)) })}
+            />
+          </label>
+        </section>
+
+        <section className="runtime-summary">
+          <div className="starter-section-title">
+            <Server size={15} />
+            <strong>{zh ? "真实运行环境" : "Live runtime"}</strong>
+          </div>
+          <dl>
+            <div><dt>{zh ? "模型" : "Model"}</dt><dd>{health?.model ?? "--"}</dd></div>
+            <div><dt>Agents</dt><dd>{health ? readyAgents : "--"}</dd></div>
+            <div><dt>{zh ? "最大轮次" : "Iteration limit"}</dt><dd>{maxIterations}</dd></div>
+          </dl>
+        </section>
+      </div>
+    </section>
+  );
+}
+
 function SystemPage({
   artifacts,
   context,
   events,
+  health,
   language,
+  maxIterations,
   onExport,
   onRefresh,
   runtimeError,
@@ -1110,7 +1411,9 @@ function SystemPage({
   artifacts: RemoteArtifact[];
   context: TaskContext;
   events: EventLog[];
+  health: HealthStatus | null;
   language: Language;
+  maxIterations: number;
   onExport: () => void;
   onRefresh: () => void;
   runtimeError: string;
@@ -1123,7 +1426,10 @@ function SystemPage({
     <section className="system-page">
       <header className="system-header">
         <div>
-          <p>{zh ? "运行状态" : "Runtime"}</p>
+          <p>
+            {zh ? "运行状态" : "Runtime"}
+            {health ? ` · ${health.model} · ${health.real_agent_stages.length} Agents` : ""}
+          </p>
           <h2>{context.task_id}</h2>
         </div>
         <div className="system-actions">
@@ -1142,7 +1448,7 @@ function SystemPage({
 
       <div className="runtime-metrics">
         <StatusMetric label={zh ? "当前阶段" : "Current stage"} value={context.current_stage} />
-        <StatusMetric label={zh ? "迭代" : "Iteration"} value={`R${context.iteration}`} />
+        <StatusMetric label={zh ? "迭代" : "Iteration"} value={`R${context.iteration}/${maxIterations}`} />
         <StatusMetric label={zh ? "版本" : "Versions"} value={String(versions.length)} />
         <StatusMetric label={zh ? "事件" : "Events"} value={String(events.length)} />
       </div>
@@ -1711,6 +2017,34 @@ function ThreadMessageCard({
               />
               <button className="ghost-button" disabled={running} type="button" onClick={onRerun}>
                 {t.revise}
+              </button>
+            </div>
+          </section>
+        ) : stage && message.status === "revision_required" ? (
+          <section className="inline-review revision-required-actions">
+            <p>
+              {language === "zh"
+                ? `证据质量未达阈值，需要从${stageLabel.zh[message.retryFromStage ?? stage]}补充后重试。`
+                : `Evidence quality is below the gate. Resume from ${stageLabel.en[message.retryFromStage ?? stage]}.`}
+            </p>
+            <BulletList
+              label={language === "zh" ? "审查问题" : "Review issues"}
+              values={message.response?.self_review.issues ?? []}
+            />
+            <BulletList
+              label={language === "zh" ? "补证建议" : "Evidence suggestions"}
+              values={message.response?.self_review.suggestions ?? []}
+            />
+            <div className="revision-composer">
+              <textarea
+                disabled={running}
+                onChange={(event) => onFeedbackChange(event.target.value)}
+                placeholder={language === "zh" ? "补充检索范围、证据来源或具体修改意见" : "Add retrieval scope, evidence sources, or revision notes"}
+                value={feedbackValue}
+              />
+              <button className="ghost-button" disabled={running} type="button" onClick={onRerun}>
+                <RotateCcw size={15} />
+                {language === "zh" ? "提交补证并重跑" : "Submit and rerun"}
               </button>
             </div>
           </section>

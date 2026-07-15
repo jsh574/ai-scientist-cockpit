@@ -36,7 +36,7 @@ class Orchestrator:
         artifacts: ArtifactService,
         review_gate: ReviewGate,
         *,
-        max_iterations: int = 3,
+        max_iterations: int = 10,
     ) -> None:
         self.registry = registry
         self.artifacts = artifacts
@@ -376,7 +376,9 @@ class Orchestrator:
             iteration = int(context.get("iteration") or 1) + 1
             if iteration > self.max_iterations:
                 raise OrchestrationError(
-                    f"Maximum workflow iterations exceeded ({self.max_iterations})"
+                    "Maximum workflow iterations exceeded "
+                    f"({self.max_iterations}). Export the current task or create a new task "
+                    "before submitting more feedback."
                 )
             event = {
                 "feedback_id": f"feedback_{uuid4().hex[:12]}",
