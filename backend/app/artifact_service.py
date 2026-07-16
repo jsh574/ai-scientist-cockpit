@@ -8,11 +8,13 @@ import threading
 import zipfile
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .contracts import TaskEvent, utc_now
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,96}$")
 _SAFE_RELATIVE_PART = re.compile(r"^[^<>:\"|?*\x00-\x1f]+$")
+_ALLOWED_ATTACHMENT_EXTENSIONS = {".txt", ".md", ".csv", ".json"}
 
 
 class ArtifactError(RuntimeError):
@@ -72,6 +74,20 @@ class ArtifactService:
             if os.path.exists(temp_name):
                 os.unlink(temp_name)
 
+    @staticmethod
+    def _atomic_write_bytes(path: Path, content: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, path)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+
     def write_json(self, task_id: str, relative_path: str, value: Any) -> Path:
         path = self._resolve(task_id, relative_path, create_parent=True)
         content = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=False) + "\n"
@@ -109,10 +125,14 @@ class ArtifactService:
             raise ArtifactError(f"Task already exists: {task_id}")
         manifest = {
             "task_id": task_id,
+            "title": str(
+                ((context.get("user_input") or {}).get("original_question") or task_id)
+            )[:120],
             "mode": context.get("mode", "auto"),
             "status": "created",
             "current_stage": "created",
             "iteration": context.get("iteration", 1),
+            "archived": False,
             "stage_status": {},
             "created_at": utc_now(),
             "updated_at": utc_now(),
@@ -134,13 +154,107 @@ class ArtifactService:
         except ArtifactError:
             return False
 
-    def list_tasks(self) -> list[dict[str, Any]]:
+    def list_tasks(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
         tasks = []
         for path in sorted(self.root.iterdir(), reverse=True):
             manifest = path / "manifest.json"
             if path.is_dir() and manifest.is_file():
-                tasks.append(json.loads(manifest.read_text(encoding="utf-8")))
+                item = json.loads(manifest.read_text(encoding="utf-8"))
+                if include_archived or not item.get("archived", False):
+                    tasks.append(item)
+        tasks.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         return tasks
+
+    def set_archived(self, task_id: str, archived: bool) -> dict[str, Any]:
+        return self.update_manifest(
+            task_id,
+            archived=archived,
+            archived_at=utc_now() if archived else None,
+        )
+
+    def list_attachments(self, task_id: str) -> list[dict[str, Any]]:
+        try:
+            value = self.read_json(task_id, "attachments/index.json")
+        except ArtifactError:
+            return []
+        return [dict(item) for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+    def add_attachment(
+        self,
+        task_id: str,
+        filename: str,
+        content: bytes,
+        media_type: str | None,
+        *,
+        context_char_limit: int,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        safe_name = Path(filename).name
+        if safe_name != filename or not safe_name:
+            raise ArtifactError("Attachment filename must not contain a path")
+        extension = Path(safe_name).suffix.lower()
+        if extension not in _ALLOWED_ATTACHMENT_EXTENSIONS:
+            allowed = ", ".join(sorted(_ALLOWED_ATTACHMENT_EXTENSIONS))
+            raise ArtifactError(f"Unsupported attachment type. Allowed: {allowed}")
+        try:
+            text = content.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ArtifactError("Attachment must be UTF-8 text") from exc
+
+        attachment_id = f"att_{uuid4().hex[:12]}"
+        stored_name = f"{attachment_id}_{safe_name}"
+        relative_path = f"attachments/{stored_name}"
+        path = self._resolve(task_id, relative_path, create_parent=True)
+        with self._lock:
+            self._atomic_write_bytes(path, content)
+
+        item = {
+            "attachment_id": attachment_id,
+            "name": safe_name,
+            "path": relative_path,
+            "media_type": media_type or "text/plain",
+            "size": len(content),
+            "text_excerpt": text[:context_char_limit],
+            "created_at": utc_now(),
+        }
+        attachments = [*self.list_attachments(task_id), item]
+        self.write_json(task_id, "attachments/index.json", attachments)
+
+        context = self.load_context(task_id)
+        user_input = dict(context.get("user_input") or {})
+        base_description = str(
+            user_input.get("base_question_description")
+            or user_input.get("question_description")
+            or ""
+        ).strip()
+        user_input["base_question_description"] = base_description
+        user_input["attachments"] = [
+            {key: value for key, value in attachment.items() if key != "text_excerpt"}
+            for attachment in attachments
+        ]
+        attachment_context = "\n\n".join(
+            f"[{attachment['name']}]\n{attachment['text_excerpt']}" for attachment in attachments
+        )[:context_char_limit]
+        user_input["question_description"] = "\n\n".join(
+            part
+            for part in (
+                base_description,
+                f"[附件背景材料]\n{attachment_context}" if attachment_context else "",
+            )
+            if part
+        )
+        context["user_input"] = user_input
+        self.save_context(task_id, context)
+        self.update_manifest(task_id, attachment_count=len(attachments))
+        self.append_event(
+            TaskEvent(
+                event_id=f"evt_{uuid4().hex[:12]}",
+                task_id=task_id,
+                type="attachment_uploaded",
+                message=f"Attachment uploaded: {safe_name}",
+                data={"attachment_id": attachment_id, "path": relative_path},
+            )
+        )
+        return item, context
 
     def load_context(self, task_id: str) -> dict[str, Any]:
         value = self.read_json(task_id, "context/task_context.latest.json")

@@ -38,6 +38,8 @@ class Settings:
     artifacts_root: Path
     review_threshold: float
     max_iterations: int
+    attachment_max_bytes: int
+    attachment_context_chars: int
     cors_origins: tuple[str, ...]
 
     @classmethod
@@ -65,6 +67,8 @@ class Settings:
             ),
             review_threshold=float(os.getenv("REVIEW_GATE_THRESHOLD", "0.75")),
             max_iterations=int(os.getenv("MAX_WORKFLOW_ITERATIONS", "10")),
+            attachment_max_bytes=int(os.getenv("ATTACHMENT_MAX_BYTES", "2000000")),
+            attachment_context_chars=int(os.getenv("ATTACHMENT_CONTEXT_CHARS", "30000")),
             cors_origins=tuple(
                 origin.strip()
                 for origin in os.getenv(
@@ -76,40 +80,63 @@ class Settings:
         )
 
     def source_status(self) -> dict[str, dict[str, object]]:
+        any_credential = bool(
+            os.getenv("DASHSCOPE_API_KEY")
+            or os.getenv("QWEN_API_KEY")
+            or os.getenv("LLM_API_KEY")
+        )
+        dashscope_credential = bool(os.getenv("DASHSCOPE_API_KEY"))
+        qwen_credential = bool(os.getenv("DASHSCOPE_API_KEY") or os.getenv("QWEN_API_KEY"))
+
+        def status(
+            path: Path,
+            *,
+            credential_required: bool = False,
+            credential_configured: bool = True,
+            mode: str = "model",
+        ) -> dict[str, object]:
+            available = path.is_dir() or path.is_file()
+            ready = available and (credential_configured or not credential_required)
+            return {
+                "path": str(path),
+                "available": available,
+                "ready": ready,
+                "credential_required": credential_required,
+                "credential_configured": credential_configured,
+                "mode": mode,
+            }
+
         return {
-            "question_understanding": {
-                "path": str(self.problem_agent_root),
-                "available": self.problem_agent_root.is_dir(),
-            },
-            "knowledge_integration": {
-                "path": str(self.knowledge_agent_root),
-                "available": self.knowledge_agent_root.is_dir(),
-                "credential_configured": bool(
-                    os.getenv("DASHSCOPE_API_KEY") or os.getenv("QWEN_API_KEY")
-                ),
-            },
-            "hypothesis_generation": {
-                "path": str(self.hypothesis_agent_file),
-                "available": self.hypothesis_agent_file.is_file(),
-                "credential_configured": bool(os.getenv("DASHSCOPE_API_KEY")),
-            },
-            "evidence_mapping": {
-                "path": str(self.evidence_agent_root),
-                "available": (self.evidence_agent_root / "src" / "evidence_mapping").is_dir(),
-                "mode": "rule_engine",
-            },
-            "research_planning": {
-                "path": str(self.planning_agent_root),
-                "available": self.planning_agent_root.is_dir(),
-                "credential_configured": bool(
-                    os.getenv("DASHSCOPE_API_KEY")
-                    or os.getenv("QWEN_API_KEY")
-                    or os.getenv("LLM_API_KEY")
-                ),
-            },
+            "question_understanding": status(
+                self.problem_agent_root,
+                credential_required=True,
+                credential_configured=any_credential,
+            ),
+            "knowledge_integration": status(
+                self.knowledge_agent_root,
+                credential_required=True,
+                credential_configured=qwen_credential,
+            ),
+            "hypothesis_generation": status(
+                self.hypothesis_agent_file,
+                credential_required=True,
+                credential_configured=dashscope_credential,
+            ),
+            "evidence_mapping": status(
+                self.evidence_agent_root / "src" / "evidence_mapping",
+                mode="rule_engine",
+            ),
+            "research_planning": status(
+                self.planning_agent_root,
+                credential_required=True,
+                credential_configured=any_credential,
+            ),
             "artifact_service": {
                 "path": str(self.artifacts_root),
                 "available": self.artifacts_root.parent.exists(),
+                "ready": self.artifacts_root.parent.exists(),
+                "credential_required": False,
+                "credential_configured": True,
                 "mode": "filesystem_mcp",
             },
         }

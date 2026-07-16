@@ -102,6 +102,13 @@ class FeedbackRequest(BaseModel):
     comment: str = Field(min_length=1, max_length=20_000)
     rerun_downstream: bool = True
     execute: bool = True
+    mode: RunMode | None = None
+    reasoning_level: Literal["low", "medium", "high", "ultra"] | None = None
+    memory_level: Literal["low", "medium", "high"] | None = None
+
+
+class TaskArchiveRequest(BaseModel):
+    archived: bool = True
 
 
 class TaskEvent(BaseModel):

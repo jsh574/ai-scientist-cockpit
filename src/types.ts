@@ -24,11 +24,23 @@ export type ViewId = "workbench" | "research" | "artifacts" | "api" | "submissio
 
 export interface UserInput {
   original_question: string;
+  question_description?: string;
+  base_question_description?: string;
+  attachments?: Array<{
+    attachment_id: string;
+    name: string;
+    path: string;
+    media_type: string;
+    size: number;
+    created_at: string;
+  }>;
   user_constraints: {
     language: string;
     domain_preference: string;
     max_hypotheses: number;
     output_detail_level: "brief" | "standard" | "detailed";
+    reasoning_level: "low" | "medium" | "high" | "ultra";
+    memory_level: "low" | "medium" | "high";
   };
 }
 
@@ -280,6 +292,7 @@ export interface FeedbackEvent {
   };
   controller_action: string;
   revision_suggestion: string;
+  created_at?: string;
 }
 
 export interface TaskContext {
@@ -308,6 +321,7 @@ export interface AgentResponse<TPayload = Record<string, unknown>> {
     stage: StageId;
     iteration: number;
     status: "success" | "partial_success" | "failed";
+    duration_ms?: number | null;
   };
   payload: TPayload;
   self_review: {
@@ -382,6 +396,7 @@ export interface ArtifactItem {
 export interface ApiSpec {
   method: "GET" | "POST";
   path: string;
+  capability: string;
   owner: string;
   status: "ready" | "mocked" | "planned";
   writes: string;

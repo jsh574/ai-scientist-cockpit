@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from backend.app.adapters import (
     AgentRegistry,
+    ProjectLLMClient,
     ProjectPlanningWorkflowClient,
     _load_file,
     _load_package,
@@ -121,6 +123,62 @@ class AdapterContractTests(unittest.TestCase):
         self.assertEqual(response["metadata"]["status"], "success")
         self.assertIn("question_card", response["payload"])
         self.assertIn("overall_score", response["self_review"])
+
+    def test_model_gateway_sends_attachment_context_in_user_message(self) -> None:
+        captured: dict = {}
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok": true}'))]
+                )
+
+        client = ProjectLLMClient.__new__(ProjectLLMClient)
+        client.model = "test-model"
+        client.max_tokens = 4096
+        client.enable_thinking = False
+        client.background_context = "ATTACHMENT_SENTINEL_7F31"
+        client.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=FakeCompletions())
+        )
+
+        result = client._complete("system", "base prompt", 0.2)
+
+        self.assertEqual(result, '{"ok": true}')
+        user_message = captured["messages"][1]["content"]
+        self.assertIn("base prompt", user_message)
+        self.assertIn("ATTACHMENT_SENTINEL_7F31", user_message)
+        self.assertIn("uploaded attachment context", user_message)
+        self.assertEqual(
+            client._with_background_context("ATTACHMENT_SENTINEL_7F31").count(
+                "ATTACHMENT_SENTINEL_7F31"
+            ),
+            1,
+        )
+
+    def test_reasoning_level_does_not_enable_thinking_without_operator_flag(self) -> None:
+        context = {
+            **self.context,
+            "user_input": {
+                **self.context["user_input"],
+                "user_constraints": {"reasoning_level": "high"},
+            },
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "DASHSCOPE_API_KEY": "test-key",
+                "LLM_MAX_TOKENS": "8192",
+                "LLM_MAX_RETRIES": "0",
+                "QWEN_ENABLE_THINKING": "false",
+            },
+        ), patch("openai.OpenAI") as openai_client:
+            client = ProjectLLMClient(context)
+
+        self.assertEqual(client.max_tokens, 6144)
+        self.assertFalse(client.enable_thinking)
+        self.assertEqual(openai_client.call_args.kwargs["max_retries"], 0)
 
     def test_knowledge_agent_rejects_missing_environment_credential(self) -> None:
         with patch.dict(os.environ, {"DASHSCOPE_API_KEY": "", "QWEN_API_KEY": ""}):

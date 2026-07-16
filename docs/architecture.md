@@ -2,7 +2,7 @@
 
 ```text
 React Workbench
-  |  task/review/feedback/artifact/version APIs + SSE
+  |  task/archive/attachment/review/feedback/artifact/version APIs + SSE
 FastAPI
   |-- Orchestrator
   |     |-- Context slicer and merge policy
@@ -60,12 +60,23 @@ Review Gate 在合并上下文前执行：
 
 自动模式通过后直接合并；人工模式暂停；混合模式在证据梳理和研究计划阶段暂停。
 
+## 前端状态边界
+
+- 后端 `task_context` 和 `manifest.json` 是已创建任务的权威状态源。
+- 前端只在尚未提交科学问题时维护本地草稿；首次提交调用一次 `POST /api/tasks`。
+- 已有 `task_id` 后，主输入框只提交指定阶段的反馈，不得再次创建任务。
+- 页面刷新通过 `GET /api/tasks` 恢复未归档任务，再读取 context、events、attachments 和六阶段详情。
+- 单个旧格式任务恢复失败时，其余任务继续载入，错误原因显示在系统页。
+- PC 完整状态树一次展开六阶段主干、全部 Artifact 和已有 Agent 输出摘要，使用固定节点尺寸和纵向滚动保持文字可读；完整输入、输出、审核和 JSON 在右侧详情检查器中展示。
+
 ## Artifact 布局
 
 ```text
 artifacts/tasks/{task_id}/
   manifest.json
   context/task_context.latest.json
+  attachments/index.json
+  attachments/{attachment_id}_{filename}
   stages/{stage}/i001.input.json
   stages/{stage}/i001.output.json
   stages/{stage}/latest.output.json
@@ -77,3 +88,5 @@ artifacts/tasks/{task_id}/
 ```
 
 JSON 文件使用同目录临时文件和原子替换写入。所有任务 ID 和相对路径都经过白名单与目录边界校验。
+
+附件仅允许 UTF-8 文本格式。文件元数据写入 `user_input.attachments`，文本摘要合并到 `user_input.question_description`。`ProjectLLMClient` 会把该背景注入所有真实模型请求的用户消息，已有相同内容时不重复注入。
