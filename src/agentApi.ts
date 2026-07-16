@@ -1,9 +1,11 @@
 import { createAgentResponse } from "./mockData";
 import type {
   AgentResponse,
+  EventLog,
   ReviewRecord,
   StageExecutionResult,
   StageId,
+  StageStatus,
   TaskContext,
 } from "./types";
 
@@ -16,9 +18,64 @@ export interface HealthStatus {
   protocol_version: string;
   model: string;
   max_iterations: number;
+  ready_agent_count: number;
   real_agent_stages: string[];
-  sources: Record<string, { available?: boolean; credential_configured?: boolean }>;
+  sources: Record<
+    string,
+    {
+      available?: boolean;
+      ready?: boolean;
+      credential_required?: boolean;
+      credential_configured?: boolean;
+      mode?: string;
+    }
+  >;
+  capabilities: Record<string, boolean>;
+  attachments: { max_bytes: number; allowed_extensions: string[] };
+  llm?: {
+    timeout_seconds: number;
+    max_retries: number;
+    thinking_enabled: boolean;
+    knowledge_max_attempts: number;
+  };
   mcp: { server: string; transport: string };
+}
+
+export interface TaskManifest {
+  task_id: string;
+  title?: string;
+  mode: TaskContext["mode"];
+  status: string;
+  current_stage: TaskContext["current_stage"];
+  iteration: number;
+  archived?: boolean;
+  attachment_count?: number;
+  stage_status?: Partial<Record<StageId, StageStatus | "completed">>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TaskRecord {
+  manifest: TaskManifest;
+  task_context: TaskContext;
+}
+
+export interface TaskStageDetail {
+  task_id: string;
+  stage: { stage: StageId; agent_id: string };
+  status: StageStatus | "completed" | "retry";
+  input: Record<string, unknown> | null;
+  output: AgentResponse | null;
+  review: ReviewRecord | null;
+}
+
+export interface RemoteAttachment {
+  attachment_id: string;
+  name: string;
+  path: string;
+  media_type: string;
+  size: number;
+  created_at: string;
 }
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -69,6 +126,60 @@ export async function createTask(context: TaskContext): Promise<TaskContext> {
 
 export async function fetchHealthStatus(): Promise<HealthStatus> {
   return requestJson<HealthStatus>("/api/health");
+}
+
+export async function fetchTasks(includeArchived = false): Promise<TaskManifest[]> {
+  const query = includeArchived ? "?include_archived=true" : "";
+  const result = await requestJson<{ tasks: TaskManifest[] }>(`/api/tasks${query}`);
+  return result.tasks;
+}
+
+export async function fetchTaskRecord(taskId: string): Promise<TaskRecord> {
+  return requestJson(`/api/tasks/${encodeURIComponent(taskId)}`);
+}
+
+export async function fetchTaskStage(taskId: string, stage: StageId): Promise<TaskStageDetail> {
+  return requestJson(
+    `/api/tasks/${encodeURIComponent(taskId)}/stages/${encodeURIComponent(stage)}`,
+  );
+}
+
+export async function fetchTaskEvents(taskId: string): Promise<EventLog[]> {
+  const result = await requestJson<{ events: EventLog[] }>(
+    `/api/tasks/${encodeURIComponent(taskId)}/events`,
+  );
+  return result.events;
+}
+
+export async function archiveTask(taskId: string, archived = true): Promise<TaskManifest> {
+  const result = await requestJson<{ manifest: TaskManifest }>(
+    `/api/tasks/${encodeURIComponent(taskId)}/archive`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ archived }),
+    },
+  );
+  return result.manifest;
+}
+
+export async function fetchTaskAttachments(taskId: string): Promise<RemoteAttachment[]> {
+  const result = await requestJson<{ attachments: RemoteAttachment[] }>(
+    `/api/tasks/${encodeURIComponent(taskId)}/attachments`,
+  );
+  return result.attachments;
+}
+
+export async function uploadTaskAttachments(
+  taskId: string,
+  files: File[],
+): Promise<{ attachments: RemoteAttachment[]; task_context: TaskContext }> {
+  const form = new FormData();
+  files.forEach((file) => form.append("files", file));
+  return requestJson(`/api/tasks/${encodeURIComponent(taskId)}/attachments`, {
+    method: "POST",
+    body: form,
+  });
 }
 
 export async function executeStage(
@@ -124,6 +235,11 @@ export async function recordFeedback(
   taskId: string,
   targetStage: StageId,
   comment: string,
+  settings: {
+    mode: TaskContext["mode"];
+    reasoningLevel: TaskContext["user_input"]["user_constraints"]["reasoning_level"];
+    memoryLevel: TaskContext["user_input"]["user_constraints"]["memory_level"];
+  },
 ): Promise<TaskContext | null> {
   if (!useRealAgents) return null;
   const result = await requestJson<{ task_context: TaskContext }>(
@@ -136,6 +252,9 @@ export async function recordFeedback(
         comment,
         rerun_downstream: false,
         execute: false,
+        mode: settings.mode,
+        reasoning_level: settings.reasoningLevel,
+        memory_level: settings.memoryLevel,
       }),
     },
   );

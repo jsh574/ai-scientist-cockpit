@@ -71,6 +71,27 @@ npm run dev
 - Evidence Mapping Agent 保留原有规则引擎，通过字段适配兼容总控的 `source_literature_id`、`support_direction` 和 `strength_score`。
 - 问题理解、知识整合、候选假设生成、证据梳理和研究计划调用真实 Agent；最终审核由后端 Orchestrator Review Gate 根据完整上下文生成。
 
+## 推理与记忆参数
+
+`task_context.user_input.user_constraints` 中包含：
+
+```json
+{
+  "reasoning_level": "high",
+  "memory_level": "medium"
+}
+```
+
+- `reasoning_level` 支持 `low`、`medium`、`high`、`ultra`。各等级控制生成预算；当前 high 上限为 6144 tokens，ultra 使用 `LLM_MAX_TOKENS` 配置的完整预算。
+- thinking 不是 high/ultra 的隐式默认行为。只有运维显式设置 `QWEN_ENABLE_THINKING=true`，且推理等级为 high 或 ultra 时才开启；默认值为 `false`，避免长思考与多步骤调用叠加成不可控等待。
+- `memory_level=low` 只传当前反馈；`medium` 加入最近 2 条反馈和 1 条同阶段审核；`high` 最多加入 8 条反馈和 4 条同阶段审核。
+- 已有任务切换设置后，前端在 `POST /api/tasks/{id}/feedback` 中再次携带这些参数，后端先写回上下文，再启动下一轮。
+- Agent 不应自行从浏览器状态推断这些设置，必须以收到的 `task_context` 为准。
+
+## 附件输入
+
+附件上传后，Agent 可从 `user_input.attachments` 读取文件元数据，从 `user_input.question_description` 读取受长度限制的文本背景。共享的 `ProjectLLMClient` 会在每次真实模型调用前，把这段背景加入用户消息；若 Agent 自己的 Prompt 已包含相同文本则不会重复添加。Agent 不应直接访问用户原始文件路径，也不能假设附件是二进制 PDF、图片或 Office 文档。
+
 ## 新增 Agent 检查表
 
 1. 在 `agents/registry.json` 和 `AGENT_SPECS` 声明 stage、reads、writes。

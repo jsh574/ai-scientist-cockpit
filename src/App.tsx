@@ -1,6 +1,5 @@
 import {
   Background,
-  Controls,
   Handle,
   Position,
   ReactFlow,
@@ -45,17 +44,27 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
+  archiveTask,
   createTask,
   executeStage,
   exportTaskBundle,
   fetchArtifacts,
   fetchHealthStatus,
+  fetchTaskAttachments,
+  fetchTaskEvents,
+  fetchTaskRecord,
+  fetchTaskStage,
+  fetchTasks,
   fetchVersionDiff,
   fetchVersions,
   recordFeedback,
   submitHumanReview,
+  uploadTaskAttachments,
   type HealthStatus,
+  type RemoteAttachment,
   type RemoteArtifact,
+  type TaskManifest,
+  type TaskStageDetail,
   type VersionDiffResult,
 } from "./agentApi";
 import {
@@ -94,6 +103,8 @@ type FlowNode = Node<FlowNodeData, "flowNode">;
 
 interface FlowNodeData extends Record<string, unknown> {
   active: boolean;
+  artifactKey?: string;
+  detailId?: string;
   kind: "stage" | "artifact" | "detail";
   lang: Language;
   stage?: StageId;
@@ -120,6 +131,7 @@ interface ThreadMessage {
   needsApproval?: boolean;
   retryFromStage?: StageId;
   revisionNote?: string;
+  durationMs?: number;
   createdAt: string;
 }
 
@@ -144,7 +156,8 @@ interface ProjectSession {
   pendingIndex: number | null;
   questionDraft: string;
   hasSubmittedQuestion: boolean;
-  files: string[];
+  files: File[];
+  attachments: RemoteAttachment[];
   feedbackDrafts: Record<string, string>;
 }
 
@@ -330,10 +343,11 @@ const copy = {
     noFiles: "未添加文件",
     start: "启动总控",
     running: "运行中",
-    newTask: "重置当前项目",
+    newTask: "新建项目",
     projects: "项目",
     newProject: "创建新项目",
     archiveAll: "归档所有聊天",
+    archiveProject: "归档项目",
     organizeSidebar: "整理侧边栏",
     sortBy: "排序条件",
     groupByProject: "按项目",
@@ -392,10 +406,11 @@ const copy = {
     noFiles: "No files attached",
     start: "Start controller",
     running: "Running",
-    newTask: "Reset current project",
+    newTask: "New project",
     projects: "Projects",
     newProject: "New project",
     archiveAll: "Archive all chats",
+    archiveProject: "Archive project",
     organizeSidebar: "Organize sidebar",
     sortBy: "Sort by",
     groupByProject: "By project",
@@ -483,6 +498,136 @@ function createProjectSession(index: number, mode: RunMode, language: Language, 
     questionDraft: "",
     hasSubmittedQuestion: false,
     files: [],
+    attachments: [],
+    feedbackDrafts: {},
+  };
+}
+
+function normalizeRemoteStageStatus(status: TaskStageDetail["status"]): StageRun["status"] {
+  if (status === "completed") return "passed";
+  if (
+    status === "queued" ||
+    status === "running" ||
+    status === "validating" ||
+    status === "human_review" ||
+    status === "passed" ||
+    status === "failed" ||
+    status === "revision_required" ||
+    status === "retrying"
+  ) {
+    return status;
+  }
+  return status === "retry" ? "revision_required" : "queued";
+}
+
+function projectMessagesFromRemote(
+  context: TaskContext,
+  details: TaskStageDetail[],
+  language: Language,
+  createdAt: string,
+): ThreadMessage[] {
+  const messages: ThreadMessage[] = [
+    {
+      id: `remote_user_${context.task_id}`,
+      kind: "user",
+      body: context.user_input.original_question,
+      createdAt,
+    },
+    {
+      id: `remote_controller_${context.task_id}`,
+      kind: "controller",
+      body: copy[language].controllerStarted,
+      status: "passed",
+      createdAt,
+    },
+  ];
+  for (const event of context.feedback_events ?? []) {
+    const stage = event.target?.stage;
+    if (!stage || !stageOrder.includes(stage)) continue;
+    messages.push({
+      id: `remote_feedback_${event.feedback_id}`,
+      kind: "user",
+      stage,
+      body: event.input_summary,
+      createdAt: event.created_at ?? createdAt,
+    });
+  }
+  details.forEach((detail) => {
+    if (!detail.output) return;
+    const status = normalizeRemoteStageStatus(detail.status);
+    messages.push({
+      id: `remote_stage_${context.task_id}_${detail.stage.stage}`,
+      kind: detail.stage.stage === "final_review" ? "controller" : "agent",
+      stage: detail.stage.stage,
+      response: detail.output,
+      review: detail.review,
+      status,
+      needsApproval: status === "human_review",
+      durationMs: detail.output.metadata.duration_ms ?? undefined,
+      createdAt: detail.review?.created_at ?? createdAt,
+    });
+  });
+  return messages;
+}
+
+async function restoreRemoteProject(
+  manifest: TaskManifest,
+  index: number,
+  language: Language,
+): Promise<ProjectSession> {
+  const [record, events, attachments, details] = await Promise.all([
+    fetchTaskRecord(manifest.task_id),
+    fetchTaskEvents(manifest.task_id),
+    fetchTaskAttachments(manifest.task_id),
+    Promise.all(stageOrder.map((stage) => fetchTaskStage(manifest.task_id, stage))),
+  ]);
+  const context = record.task_context;
+  const baseStages = createInitialStages(context);
+  const stages = baseStages.map((stage) => {
+    const detail = details.find((item) => item.stage.stage === stage.id);
+    if (!detail) return stage;
+    return {
+      ...stage,
+      status: normalizeRemoteStageStatus(detail.status),
+      input: detail.input ?? stage.input,
+      output: detail.output,
+      review: detail.review,
+      duration: detail.output?.metadata.duration_ms
+        ? `${(detail.output.metadata.duration_ms / 1000).toFixed(1)}s`
+        : stage.duration,
+    };
+  });
+  const waitingIndex = stages.findIndex((stage) =>
+    ["human_review", "revision_required"].includes(stage.status),
+  );
+  const currentStage = stageOrder.includes(context.current_stage as StageId)
+    ? (context.current_stage as StageId)
+    : waitingIndex >= 0
+      ? stages[waitingIndex].id
+      : context.current_stage === "completed"
+        ? "final_review"
+        : "question_understanding";
+  const title = truncateTitle(
+    manifest.title || context.user_input.original_question,
+    language === "zh" ? `项目${index}` : `Project ${index}`,
+  );
+  return {
+    id: manifest.task_id,
+    title,
+    createdAt: manifest.created_at,
+    updatedAt: manifest.updated_at,
+    context,
+    stages,
+    events,
+    versions: context.versions,
+    messages: projectMessagesFromRemote(context, details, language, manifest.created_at),
+    activeStage: currentStage,
+    reviewStage: waitingIndex >= 0 ? stages[waitingIndex].id : null,
+    pendingIndex: waitingIndex >= 0 ? waitingIndex : null,
+    questionDraft: "",
+    hasSubmittedQuestion: true,
+    files: [],
+    attachments,
     feedbackDrafts: {},
   };
 }
@@ -520,7 +665,9 @@ function App() {
   const [jsonOpen, setJsonOpen] = useState<{ title: string; data: unknown } | null>(null);
   const [questionDraft, setQuestionDraft] = useState(() => projects[0].questionDraft);
   const [hasSubmittedQuestion, setHasSubmittedQuestion] = useState(() => projects[0].hasSubmittedQuestion);
-  const [files, setFiles] = useState<string[]>(() => projects[0].files);
+  const [files, setFiles] = useState<File[]>(() => projects[0].files);
+  const [attachments, setAttachments] = useState<RemoteAttachment[]>(() => projects[0].attachments);
+  const [feedbackTarget, setFeedbackTarget] = useState<StageId>("research_planning");
   const [feedbackDrafts, setFeedbackDrafts] = useState<Record<string, string>>(() => projects[0].feedbackDrafts);
   const [remoteArtifacts, setRemoteArtifacts] = useState<RemoteArtifact[]>([]);
   const [runtimeError, setRuntimeError] = useState("");
@@ -528,6 +675,7 @@ function App() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const threadEndRef = useRef<HTMLDivElement | null>(null);
   const taskIdRef = useRef(context.task_id);
+  const restoredLanguageRef = useRef<Language | null>(null);
 
   const t = copy[language];
   const runMode = approvalToRunMode[approval];
@@ -535,12 +683,13 @@ function App() {
   const finished = context.current_stage === "completed";
   const progress = Math.round((completedCount / stages.length) * 100);
   const currentStageLabel = finished ? statusLabel[language].completed : stageLabel[language][activeStage];
-  const uploadedLabel = files.length ? files.join(", ") : t.noFiles;
+  const uploadedLabel = [...attachments.map((item) => item.name), ...files.map((file) => file.name)].join(", ") || t.noFiles;
+  const composerCanSubmit = hasSubmittedQuestion
+    ? Boolean(questionDraft.trim() || files.length)
+    : Boolean(questionDraft.trim());
   const latestEvent = events[0]?.message;
   const maxIterations = health?.max_iterations ?? 10;
-  const readyAgentCount = health
-    ? Object.entries(health.sources).filter(([stage, source]) => stage !== "artifact_service" && source.available).length
-    : 0;
+  const readyAgentCount = health?.ready_agent_count ?? 0;
   const activeProject = projects.find((project) => project.id === activeProjectId) ?? projects[0];
   const sortedProjects = useMemo(() => {
     const list = [...projects];
@@ -594,7 +743,9 @@ function App() {
   }, []);
 
   useEffect(() => {
-    threadEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    if (messages.length) {
+      threadEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    }
   }, [messages, running]);
 
   useEffect(() => {
@@ -605,6 +756,7 @@ function App() {
           ? {
               ...project,
               activeStage,
+              attachments,
               context,
               events,
               feedbackDrafts,
@@ -625,6 +777,7 @@ function App() {
   }, [
     activeProjectId,
     activeStage,
+    attachments,
     context,
     events,
     feedbackDrafts,
@@ -651,6 +804,12 @@ function App() {
     setQuestionDraft(project.questionDraft);
     setHasSubmittedQuestion(project.hasSubmittedQuestion);
     setFiles(project.files);
+    setAttachments(project.attachments);
+    const constraints = project.context.user_input.user_constraints;
+    setReasoning(constraints.reasoning_level);
+    setMemory(constraints.memory_level);
+    setApproval(project.context.mode === "manual" ? "ask" : project.context.mode === "auto" ? "auto" : "assist");
+    setFeedbackTarget(project.activeStage === "final_review" ? "research_planning" : project.activeStage);
     setFeedbackDrafts(project.feedbackDrafts);
     setRemoteArtifacts([]);
     setRuntimeError("");
@@ -659,6 +818,46 @@ function App() {
     setTreeOpen(false);
     setJsonOpen(null);
   }, []);
+
+  useEffect(() => {
+    if (restoredLanguageRef.current === language) return;
+    let active = true;
+    void fetchTasks()
+      .then(async (manifests) => {
+        const results = await Promise.allSettled(
+          manifests.map((manifest, index) => restoreRemoteProject(manifest, index + 1, language)),
+        );
+        return {
+          failedCount: results.filter((result) => result.status === "rejected").length,
+          failureDetails: results.flatMap((result) =>
+            result.status === "rejected"
+              ? [result.reason instanceof Error ? result.reason.message : String(result.reason)]
+              : [],
+          ),
+          remoteProjects: results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []),
+        };
+      })
+      .then(({ failedCount, failureDetails, remoteProjects }) => {
+        if (!active) return;
+        if (failedCount) {
+          const reason = [...new Set(failureDetails)].slice(0, 2).join("; ");
+          setRuntimeError(language === "zh"
+            ? `${failedCount} 个项目暂时无法恢复：${reason}`
+            : `${failedCount} project(s) could not be restored: ${reason}`);
+        }
+        if (remoteProjects.length === 0) return;
+        restoredLanguageRef.current = language;
+        setProjects(remoteProjects);
+        setActiveProjectId(remoteProjects[0].id);
+        hydrateProject(remoteProjects[0]);
+      })
+      .catch((error) => {
+        if (active) setRuntimeError(error instanceof Error ? error.message : String(error));
+      });
+    return () => {
+      active = false;
+    };
+  }, [hydrateProject, language]);
 
   const selectProject = useCallback(
     (projectId: string) => {
@@ -682,6 +881,55 @@ function App() {
     setProjectMenuOpen(false);
     setProjectSubmenu(null);
   }, [hydrateProject, language, projects.length, runMode, running]);
+
+  const archiveAllProjects = useCallback(async () => {
+    if (running) return;
+    setRuntimeError("");
+    try {
+      await Promise.all(
+        projects
+          .filter((project) => project.hasSubmittedQuestion)
+          .map((project) => archiveTask(project.context.task_id)),
+      );
+      const fresh = createProjectSession(1, runMode, language);
+      setProjects([fresh]);
+      setActiveProjectId(fresh.id);
+      hydrateProject(fresh);
+      setPage("workbench");
+    } catch (error) {
+      setRuntimeError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setProjectMenuOpen(false);
+      setProjectSubmenu(null);
+    }
+  }, [hydrateProject, language, projects, runMode, running]);
+
+  const archiveProject = useCallback(async (projectId: string) => {
+    if (running) return;
+    const target = projects.find((project) => project.id === projectId);
+    if (!target) return;
+    setRuntimeError("");
+    try {
+      if (target.hasSubmittedQuestion) {
+        await archiveTask(target.context.task_id);
+      }
+      const remaining = projects.filter((project) => project.id !== projectId);
+      if (remaining.length) {
+        setProjects(remaining);
+        if (projectId === activeProjectId) {
+          setActiveProjectId(remaining[0].id);
+          hydrateProject(remaining[0]);
+        }
+      } else {
+        const fresh = createProjectSession(1, runMode, language);
+        setProjects([fresh]);
+        setActiveProjectId(fresh.id);
+        hydrateProject(fresh);
+      }
+    } catch (error) {
+      setRuntimeError(error instanceof Error ? error.message : String(error));
+    }
+  }, [activeProjectId, hydrateProject, language, projects, runMode, running]);
 
   const appendEvent = useCallback(
     (type: string, messageZh: string, messageEn: string, stage?: StageId | "final_review" | "feedback_revision") => {
@@ -726,11 +974,13 @@ function App() {
             ...base.user_input.user_constraints,
             ...context.user_input.user_constraints,
             language: language === "zh" ? "zh-CN" : "en-US",
+            reasoning_level: reasoning,
+            memory_level: memory,
           },
         },
       };
     },
-    [context.user_input.user_constraints, language, runMode],
+    [context.user_input.user_constraints, language, memory, reasoning, runMode],
   );
 
   const updateConstraints = useCallback((patch: Partial<UserInput["user_constraints"]>) => {
@@ -742,24 +992,6 @@ function App() {
       },
     }));
   }, []);
-
-  const resetDemo = useCallback(() => {
-    const fresh = createInitialContext(runMode);
-    taskIdRef.current = fresh.task_id;
-    setRunning(false);
-    setContext(fresh);
-    setStages(createInitialStages(fresh));
-    setEvents(seedEvents);
-    setVersions([]);
-    setMessages([]);
-    setQuestionDraft("");
-    setHasSubmittedQuestion(false);
-    setFiles([]);
-    setReviewStage(null);
-    setPendingIndex(null);
-    setFeedbackDrafts({});
-    setActiveStage("question_understanding");
-  }, [runMode]);
 
   const continueFrom = useCallback(
     async (startIndex: number, inputContext: TaskContext, inputVersions: VersionRecord[], revisionNote?: string) => {
@@ -789,12 +1021,13 @@ function App() {
 
         const execution = await executeStage(stage, workingContext, stageRevisionNote);
         const response = execution.response;
+        const elapsedMs = performance.now() - startTime;
         updateStage(stage, {
           status: "validating",
           output: response,
-          duration: `${((performance.now() - startTime) / 1000).toFixed(1)}s`,
+          duration: `${(elapsedMs / 1000).toFixed(1)}s`,
         });
-        patchMessage(messageId, { status: "validating", response });
+        patchMessage(messageId, { status: "validating", response, durationMs: elapsedMs });
         appendEvent(
           "agent_output_received",
           `${stageLabel.zh[stage]}返回统一响应。`,
@@ -922,7 +1155,7 @@ function App() {
       setRunning(false);
       pushMessage({
         kind: "controller",
-        body: language === "zh" ? `任务创建失败：${message}` : `Task creation failed: ${message}`,
+        body: language === "zh" ? `任务启动准备失败：${message}` : `Task preparation failed: ${message}`,
         status: "failed",
       });
       return;
@@ -949,13 +1182,33 @@ function App() {
 
     pushMessage({ kind: "user", body: question });
     pushMessage({ kind: "controller", body: t.controllerStarted, status: "passed" });
+
+    if (files.length) {
+      try {
+        const uploaded = await uploadTaskAttachments(fresh.task_id, files);
+        fresh = uploaded.task_context;
+        setContext(fresh);
+        setAttachments((current) => [...current, ...uploaded.attachments]);
+        setFiles([]);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        setRuntimeError(detail);
+        pushMessage({
+          kind: "controller",
+          body: language === "zh"
+            ? `任务已创建，但附件上传失败：${detail}。任务不会重复创建，可检查文件后再次发送。`
+            : `The task was created, but attachment upload failed: ${detail}. Fix the files and send again; no duplicate task will be created.`,
+          status: "failed",
+        });
+      }
+    }
     appendEvent(
       "task_started",
       `总控已启动：推理 ${reasoning}，权限 ${approval}，记忆 ${memory}。`,
       `Controller started: reasoning ${reasoning}, access ${approval}, memory ${memory}.`,
     );
     await continueFrom(0, fresh, []);
-  }, [appendEvent, approval, buildFreshTask, continueFrom, language, memory, pushMessage, questionDraft, reasoning, running, t.controllerStarted]);
+  }, [appendEvent, approval, buildFreshTask, continueFrom, files, language, memory, pushMessage, questionDraft, reasoning, running, t.controllerStarted]);
 
   const approveReview = useCallback(async (stageOverride?: StageId) => {
     const stage = stageOverride ?? reviewStage;
@@ -1036,7 +1289,11 @@ function App() {
       let rerunContext = context;
       let rerunVersions = versions;
       try {
-        const recorded = await recordFeedback(context.task_id, stage, note);
+        const recorded = await recordFeedback(context.task_id, stage, note, {
+          mode: runMode,
+          reasoningLevel: reasoning,
+          memoryLevel: memory,
+        });
         if (recorded) {
           rerunContext = recorded;
           rerunVersions = recorded.versions;
@@ -1086,15 +1343,115 @@ function App() {
       await delay(320);
       await continueFrom(index, rerunContext, rerunVersions, note);
     },
-    [appendEvent, context, continueFrom, feedbackDrafts, language, pushMessage, running, updateStage, versions],
+    [
+      appendEvent,
+      context,
+      continueFrom,
+      feedbackDrafts,
+      language,
+      memory,
+      pushMessage,
+      reasoning,
+      runMode,
+      running,
+      updateStage,
+      versions,
+    ],
   );
+
+  const submitProjectFeedback = useCallback(async () => {
+    const typedNote = questionDraft.trim();
+    if (running || (!typedNote && !files.length) || !hasSubmittedQuestion || context.current_stage === "human_review") return;
+    const targetStage = feedbackTarget;
+    const targetIndex = stageOrder.indexOf(targetStage);
+    if (targetIndex < 0) return;
+
+    setRuntimeError("");
+    let rerunContext = context;
+    try {
+      if (files.length) {
+        const uploaded = await uploadTaskAttachments(context.task_id, files);
+        rerunContext = uploaded.task_context;
+        setAttachments((current) => [...current, ...uploaded.attachments]);
+        setFiles([]);
+      }
+      const note = typedNote || (language === "zh"
+        ? "请结合本次新增附件重新检查并改进该模块输出。"
+        : "Re-check and improve this module using the newly attached files.");
+      rerunContext = (await recordFeedback(context.task_id, targetStage, note, {
+        mode: runMode,
+        reasoningLevel: reasoning,
+        memoryLevel: memory,
+      })) ?? rerunContext;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setRuntimeError(detail);
+      pushMessage({
+        kind: "controller",
+        body: language === "zh" ? `反馈保存失败：${detail}` : `Feedback failed: ${detail}`,
+        status: "failed",
+      });
+      return;
+    }
+
+    const note = typedNote || (language === "zh"
+      ? "请结合本次新增附件重新检查并改进该模块输出。"
+      : "Re-check and improve this module using the newly attached files.");
+    pushMessage({ kind: "user", body: note, stage: targetStage });
+    setQuestionDraft("");
+    setContext(rerunContext);
+    setVersions(rerunContext.versions);
+    setReviewStage(null);
+    setPendingIndex(null);
+    setActiveStage(targetStage);
+    setStages((current) =>
+      current.map((stage, index) =>
+        index < targetIndex
+          ? stage
+          : {
+              ...stage,
+              status: index === targetIndex ? "retrying" : "queued",
+              review: index === targetIndex ? createReviewRecord(targetStage, "retry") : null,
+            },
+      ),
+    );
+    appendEvent(
+      "project_feedback_submitted",
+      `修改意见已发送至${stageLabel.zh[targetStage]}，不会创建新任务。`,
+      `Feedback was sent to ${stageLabel.en[targetStage]} without creating a new task.`,
+      targetStage,
+    );
+    setRunning(true);
+    await delay(260);
+    await continueFrom(targetIndex, rerunContext, rerunContext.versions, note);
+  }, [
+    appendEvent,
+    context,
+    continueFrom,
+    feedbackTarget,
+    hasSubmittedQuestion,
+    files,
+    language,
+    memory,
+    pushMessage,
+    questionDraft,
+    reasoning,
+    runMode,
+    running,
+  ]);
+
+  const submitComposer = useCallback(() => {
+    if (hasSubmittedQuestion) {
+      void submitProjectFeedback();
+    } else {
+      void startDemo();
+    }
+  }, [hasSubmittedQuestion, startDemo, submitProjectFeedback]);
 
   const activeStageRun = stages.find((stage) => stage.id === activeStage) ?? stages[0];
 
   return (
     <div className="app-shell">
-      <MessageIndexRail language={language} messages={messages} />
-
       <aside className={`control-rail ${projectMenuOpen ? "menu-open" : ""}`}>
         <div className="brand-row">
           <span className="brand-mark">
@@ -1112,10 +1469,8 @@ function App() {
           groupMode={projectGroupMode}
           language={language}
           menuOpen={projectMenuOpen}
-          onArchiveAll={() => {
-            setProjectMenuOpen(false);
-            setProjectSubmenu(null);
-          }}
+          onArchiveAll={() => void archiveAllProjects()}
+          onArchiveProject={(projectId) => void archiveProject(projectId)}
           onCreateProject={createNewProject}
           onGroupModeChange={setProjectGroupMode}
           onMenuOpenChange={setProjectMenuOpen}
@@ -1160,6 +1515,7 @@ function App() {
                 type="button"
                 onClick={() => {
                   setActiveStage(stage.id);
+                  setFeedbackTarget(stage.id === "final_review" ? "research_planning" : stage.id);
                   setTreeOpen(true);
                 }}
               >
@@ -1182,8 +1538,8 @@ function App() {
             <StatusMetric label={t.iteration} value={`R${context.iteration}/${maxIterations}`} />
           </div>
           {latestEvent ? <p className="latest-event">{latestEvent}</p> : null}
-          <button className="ghost-button" type="button" onClick={resetDemo}>
-            <RotateCcw size={15} />
+          <button className="ghost-button" type="button" onClick={createNewProject}>
+            <FilePlus2 size={15} />
             {t.newTask}
           </button>
         </section>
@@ -1191,8 +1547,10 @@ function App() {
 
       <main className="thread-shell">
         {page === "workbench" ? (
-          <>
-            <header className="thread-header">
+          <div className={`workbench-shell ${messages.length ? "" : "no-index"}`}>
+            {messages.length ? <MessageIndexRail language={language} messages={messages} /> : null}
+            <div className="conversation-shell">
+              <header className="thread-header">
               <div>
                 <p>{t.appSub}</p>
                 <h1>{t.appName}</h1>
@@ -1249,7 +1607,10 @@ function App() {
                         );
                       }
                     }}
-                    onSelectStage={(stage) => setActiveStage(stage)}
+                    onSelectStage={(stage) => {
+                      setActiveStage(stage);
+                      setFeedbackTarget(stage === "final_review" ? "research_planning" : stage);
+                    }}
                     running={running}
                     t={t}
                   />
@@ -1260,27 +1621,65 @@ function App() {
 
             <section className="composer-shell">
               <div className="composer">
+                {hasSubmittedQuestion ? (
+                  <label className="feedback-target">
+                    <span>{language === "zh" ? "反馈目标" : "Feedback target"}</span>
+                    <select
+                      aria-label={language === "zh" ? "选择反馈目标模块" : "Select feedback target module"}
+                      disabled={running || context.current_stage === "human_review"}
+                      onChange={(event) => setFeedbackTarget(event.target.value as StageId)}
+                      value={feedbackTarget}
+                    >
+                      {stageOrder.map((stage) => (
+                        <option key={stage} value={stage}>{stageLabel[language][stage]}</option>
+                      ))}
+                    </select>
+                  </label>
+                ) : null}
                 <textarea
-                  aria-label={t.questionPlaceholder}
+                  aria-label={!hasSubmittedQuestion ? t.questionPlaceholder : language === "zh" ? "输入修改意见" : "Enter revision feedback"}
                   disabled={running || context.current_stage === "human_review"}
                   onChange={(event) => setQuestionDraft(event.target.value)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
                       event.preventDefault();
-                      void startDemo();
+                      submitComposer();
                     }
                   }}
-                  placeholder={!hasSubmittedQuestion ? t.questionPlaceholder : ""}
+                  placeholder={!hasSubmittedQuestion
+                    ? t.questionPlaceholder
+                    : language === "zh"
+                      ? "说明希望如何改进当前项目"
+                      : "Describe how this project should be improved"}
                   value={questionDraft}
                 />
                 <div className="composer-footer">
                   <label className="attach-button">
                     <input
                       multiple
+                      accept=".txt,.md,.csv,.json,text/plain,text/markdown,text/csv,application/json"
                       type="file"
                       onChange={(event) => {
-                        const nextFiles = Array.from(event.target.files ?? []).map((file) => file.name);
-                        setFiles(nextFiles);
+                        const selected = Array.from(event.target.files ?? []);
+                        const allowed = new Set(health?.attachments.allowed_extensions ?? [".txt", ".md", ".csv", ".json"]);
+                        const maxBytes = health?.attachments.max_bytes ?? 2_000_000;
+                        const invalid = selected.find((file) => {
+                          const dot = file.name.lastIndexOf(".");
+                          const extension = dot >= 0 ? file.name.slice(dot).toLowerCase() : "";
+                          return !allowed.has(extension) || file.size > maxBytes;
+                        });
+                        if (invalid) {
+                          setRuntimeError(language === "zh"
+                            ? `无法添加 ${invalid.name}：仅支持 ${[...allowed].join("、")}，单个文件不超过 ${formatBytes(maxBytes)}。`
+                            : `Cannot add ${invalid.name}. Use ${[...allowed].join(", ")} files up to ${formatBytes(maxBytes)} each.`);
+                        } else {
+                          setRuntimeError("");
+                          setFiles((current) => {
+                            const known = new Set(current.map((file) => `${file.name}:${file.size}:${file.lastModified}`));
+                            return [...current, ...selected.filter((file) => !known.has(`${file.name}:${file.size}:${file.lastModified}`))];
+                          });
+                        }
+                        event.currentTarget.value = "";
                       }}
                     />
                     <Plus size={17} />
@@ -1296,31 +1695,43 @@ function App() {
                     approval={approval}
                     language={language}
                     memory={memory}
+                    model={health?.model ?? null}
                     openMenu={openMenu}
                     reasoning={reasoning}
-                    setApproval={setApproval}
-                    setMemory={setMemory}
+                    setApproval={(value) => {
+                      setApproval(value);
+                      setContext((current) => ({ ...current, mode: approvalToRunMode[value] }));
+                    }}
+                    setMemory={(value) => {
+                      setMemory(value);
+                      updateConstraints({ memory_level: value });
+                    }}
                     setOpenMenu={setOpenMenu}
-                    setReasoning={setReasoning}
+                    setReasoning={(value) => {
+                      setReasoning(value);
+                      updateConstraints({ reasoning_level: value });
+                    }}
                     t={t}
                   />
 
                   <button
                     className="send-button"
-                    disabled={running || context.current_stage === "human_review" || !questionDraft.trim()}
+                    disabled={running || context.current_stage === "human_review" || !composerCanSubmit}
                     type="button"
-                    onClick={startDemo}
-                    title={t.start}
+                    onClick={submitComposer}
+                    title={!hasSubmittedQuestion ? t.start : language === "zh" ? "发送反馈并重跑" : "Send feedback and rerun"}
                   >
                     {running ? <Loader2 className="spin" size={17} /> : <Send size={17} />}
                   </button>
                 </div>
               </div>
-            </section>
-          </>
+              </section>
+            </div>
+          </div>
         ) : page === "system" ? (
           <SystemPage
             artifacts={remoteArtifacts}
+            attachments={attachments}
             context={context}
             events={events}
             language={language}
@@ -1343,7 +1754,10 @@ function App() {
           activeStage={activeStage}
           language={language}
           onClose={() => setTreeOpen(false)}
-          setActiveStage={setActiveStage}
+          onSelectStage={(stage) => {
+            setActiveStage(stage);
+            setFeedbackTarget(stage === "final_review" ? "research_planning" : stage);
+          }}
           stages={stages}
           t={t}
         />
@@ -1376,7 +1790,7 @@ function ResearchStarter({
     ? (constraints.domain_preference as (typeof domainOptions)[number])
     : "general";
   const readyAgents = health
-    ? Object.entries(health.sources).filter(([stage, source]) => stage !== "artifact_service" && source.available).length
+    ? Object.entries(health.sources).filter(([stage, source]) => stage !== "artifact_service" && source.ready).length
     : 0;
   const detailOptions: Array<UserInput["user_constraints"]["output_detail_level"]> = ["brief", "standard", "detailed"];
   const detailLabels: Record<Language, Record<UserInput["user_constraints"]["output_detail_level"], string>> = {
@@ -1393,7 +1807,11 @@ function ResearchStarter({
         </div>
         <div className={`starter-connection ${health?.status ?? "offline"}`}>
           <Activity size={14} />
-          {health ? (zh ? "总控在线" : "Controller online") : zh ? "等待后端" : "Backend offline"}
+          {health
+            ? health.status === "ok"
+              ? zh ? "全部 Agent 就绪" : "All agents ready"
+              : zh ? `${readyAgents} 个 Agent 就绪` : `${readyAgents} agents ready`
+            : zh ? "等待后端" : "Backend offline"}
         </div>
       </header>
 
@@ -1464,6 +1882,7 @@ function ResearchStarter({
 
 function SystemPage({
   artifacts,
+  attachments,
   context,
   events,
   health,
@@ -1477,6 +1896,7 @@ function SystemPage({
   versionDiff,
 }: {
   artifacts: RemoteArtifact[];
+  attachments: RemoteAttachment[];
   context: TaskContext;
   events: EventLog[];
   health: HealthStatus | null;
@@ -1496,7 +1916,7 @@ function SystemPage({
         <div>
           <p>
             {zh ? "运行状态" : "Runtime"}
-            {health ? ` · ${health.model} · ${health.real_agent_stages.length} Agents` : ""}
+            {health ? ` · ${health.model} · ${health.ready_agent_count}/${health.real_agent_stages.length} Agents` : ""}
           </p>
           <h2>{context.task_id}</h2>
         </div>
@@ -1523,6 +1943,36 @@ function SystemPage({
 
       <section className="runtime-section">
         <div className="runtime-title">
+          <h3>{zh ? "Agent 连接状态" : "Agent readiness"}</h3>
+          <span>
+            {health
+              ? `${health.ready_agent_count}/${health.real_agent_stages.length} · timeout ${health.llm?.timeout_seconds ?? "--"}s · retry ${health.llm?.max_retries ?? "--"}`
+              : "--"}
+          </span>
+        </div>
+        <div className="runtime-table agent-runtime-table">
+          {health ? health.real_agent_stages.map((stageName) => {
+            const source = health.sources[stageName] ?? {};
+            const state = source.ready ? "ready" : source.available ? "credential" : "offline";
+            const detail = source.ready
+              ? (zh ? "可执行" : "Ready")
+              : source.available && source.credential_required && !source.credential_configured
+                ? (zh ? "缺少模型密钥" : "Missing model credential")
+                : (zh ? "Agent 源不可用" : "Agent source unavailable");
+            return (
+              <div className="runtime-row" key={stageName}>
+                <strong>{stageLabel[language][stageName as StageId] ?? stageName}</strong>
+                <code>{source.mode ?? "--"}</code>
+                <span>{detail}</span>
+                <b className={`api-state ${state}`}>{state}</b>
+              </div>
+            );
+          }) : <p className="runtime-empty">{zh ? "后端未连接，无法判断 Agent 状态。" : "Backend offline; Agent readiness is unknown."}</p>}
+        </div>
+      </section>
+
+      <section className="runtime-section">
+        <div className="runtime-title">
           <h3>{zh ? "阶段与审核" : "Stages and reviews"}</h3>
           <span>Review Gate</span>
         </div>
@@ -1535,6 +1985,22 @@ function SystemPage({
               <em>{stage.review ? `${Math.round(stage.review.overall_score * 100)}%` : "--"}</em>
             </div>
           ))}
+        </div>
+      </section>
+
+      <section className="runtime-section">
+        <div className="runtime-title">
+          <h3>{zh ? "已上传附件" : "Uploaded attachments"}</h3>
+          <span>{attachments.length}</span>
+        </div>
+        <div className="runtime-table artifact-runtime-table">
+          {attachments.length ? attachments.map((attachment) => (
+            <div className="runtime-row" key={attachment.attachment_id}>
+              <Paperclip size={15} />
+              <code>{attachment.name}</code>
+              <span>{formatBytes(attachment.size)}</span>
+            </div>
+          )) : <p className="runtime-empty">{zh ? "当前任务还没有持久化附件。" : "This task has no persisted attachments."}</p>}
         </div>
       </section>
 
@@ -1578,11 +2044,16 @@ function SystemPage({
         </div>
         <div className="runtime-table api-runtime-table">
           {apiSpecs.map((api) => (
-            <div className="runtime-row" key={`${api.method}-${api.path}`}>
-              <b>{api.method}</b>
-              <code>{api.path}</code>
-              <span className={`api-state ${api.status}`}>{api.status}</span>
-            </div>
+            (() => {
+              const state = !health ? "unknown" : health.capabilities[api.capability] ? "ready" : "offline";
+              return (
+                <div className="runtime-row" key={`${api.method}-${api.path}`}>
+                  <b>{api.method}</b>
+                  <code>{api.path}</code>
+                  <span className={`api-state ${state}`}>{state}</span>
+                </div>
+              );
+            })()
           ))}
         </div>
       </section>
@@ -1643,6 +2114,7 @@ function ProjectPanel({
   groupMode,
   menuOpen,
   onArchiveAll,
+  onArchiveProject,
   onCreateProject,
   onGroupModeChange,
   onMenuOpenChange,
@@ -1660,6 +2132,7 @@ function ProjectPanel({
   language: Language;
   menuOpen: boolean;
   onArchiveAll: () => void;
+  onArchiveProject: (projectId: string) => void;
   onCreateProject: () => void;
   onGroupModeChange: (value: ProjectGroupMode) => void;
   onMenuOpenChange: (value: boolean) => void;
@@ -1799,17 +2272,28 @@ function ProjectPanel({
 
       <div className="project-list">
         {projects.map((project) => (
-          <button
-            className={`project-item ${project.id === activeProjectId ? "active" : ""}`}
-            disabled={disabled}
-            key={project.id}
-            type="button"
-            onClick={() => onSelectProject(project.id)}
-            title={project.title}
-          >
-            <MessageSquareText size={16} />
-            <span>{project.title}</span>
-          </button>
+          <div className="project-row" key={project.id}>
+            <button
+              className={`project-item ${project.id === activeProjectId ? "active" : ""}`}
+              disabled={disabled}
+              type="button"
+              onClick={() => onSelectProject(project.id)}
+              title={project.title}
+            >
+              <MessageSquareText size={16} />
+              <span>{project.title}</span>
+            </button>
+            <button
+              aria-label={`${t.archiveProject}: ${project.title}`}
+              className="project-archive-button"
+              disabled={disabled}
+              type="button"
+              onClick={() => onArchiveProject(project.id)}
+              title={t.archiveProject}
+            >
+              <Archive size={15} />
+            </button>
+          </div>
         ))}
       </div>
     </section>
@@ -1820,6 +2304,7 @@ function ControllerSettings({
   approval,
   language,
   memory,
+  model,
   openMenu,
   reasoning,
   setApproval,
@@ -1831,6 +2316,7 @@ function ControllerSettings({
   approval: ApprovalMode;
   language: Language;
   memory: MemoryLevel;
+  model: string | null;
   openMenu: MenuId;
   reasoning: ReasoningLevel;
   setApproval: (value: ApprovalMode) => void;
@@ -1872,10 +2358,9 @@ function ControllerSettings({
     <div className="codex-controls">
       <DropdownControl
         className="reasoning-control"
-        footerLabel="GPT-5.5"
         icon={<Brain size={15} />}
         id="reasoning"
-        label={`${language === "zh" ? "5.5" : "5.5"} ${reasoningOptions.find((option) => option.value === reasoning)?.label ?? ""}`}
+        label={`${model ?? (language === "zh" ? "模型" : "Model")} · ${reasoningOptions.find((option) => option.value === reasoning)?.label ?? ""}`}
         menuLabel={t.reasoning}
         onChange={setReasoning}
         onOpenChange={setOpenMenu}
@@ -1913,7 +2398,6 @@ function ControllerSettings({
 
 function DropdownControl<T extends string>({
   className,
-  footerLabel,
   icon,
   id,
   label,
@@ -1925,7 +2409,6 @@ function DropdownControl<T extends string>({
   value,
 }: {
   className?: string;
-  footerLabel?: string;
   icon: ReactNode;
   id: Exclude<MenuId, null>;
   label: string;
@@ -1963,12 +2446,6 @@ function DropdownControl<T extends string>({
               {value === option.value ? <Check size={17} /> : null}
             </button>
           ))}
-          {footerLabel ? (
-            <button className="menu-footer" type="button" onClick={() => onOpenChange(null)}>
-              <span>{footerLabel}</span>
-              <ChevronRight size={15} />
-            </button>
-          ) : null}
         </div>
       ) : null}
     </div>
@@ -2018,14 +2495,22 @@ function ThreadMessageCard({
 
   return (
     <article className={`thread-message ${message.kind}-message ${message.status ?? ""}`} id={message.id}>
-      <div className="message-avatar">{message.kind === "controller" ? <Bot size={17} /> : <Sparkles size={17} />}</div>
+      <div className="message-avatar"><Bot size={17} /></div>
       <div className="message-bubble">
         <header>
           <div>
             <strong>{title}</strong>
             {stage ? <small>{stageMeta[stage].agent}</small> : null}
           </div>
-          <span className={`state-chip ${message.status ?? "queued"}`}>{statusLabel[language][message.status ?? "queued"]}</span>
+          <div className="message-status-group">
+            <MessageRuntime
+              active={message.status === "running" || message.status === "validating"}
+              createdAt={message.createdAt}
+              durationMs={message.durationMs ?? message.response?.metadata.duration_ms ?? undefined}
+              language={language}
+            />
+            <span className={`state-chip ${message.status ?? "queued"}`}>{statusLabel[language][message.status ?? "queued"]}</span>
+          </div>
         </header>
 
         {message.body ? <p className="message-copy">{message.body}</p> : null}
@@ -2497,34 +2982,35 @@ function StateTreeModal({
   activeStage,
   language,
   onClose,
-  setActiveStage,
+  onSelectStage,
   stages,
   t,
 }: {
   activeStage: StageId;
   language: Language;
   onClose: () => void;
-  setActiveStage: (stage: StageId) => void;
+  onSelectStage: (stage: StageId) => void;
   stages: StageRun[];
   t: (typeof copy)[Language];
 }) {
-  const nodes = useMemo<FlowNode[]>(
+  const [selectedNodeId, setSelectedNodeId] = useState<string>(activeStage);
+  const treeLayout = useMemo(
     () => {
       const nextNodes: FlowNode[] = [];
       const layout = {
-        artifactHeight: 72,
-        artifactX: 378,
-        detailHeight: 82,
-        detailX: 730,
-        laneGap: 18,
-        minLaneHeight: 264,
-        rowGap: 104,
-        stageHeight: 96,
-        stageX: 64,
+        artifactHeight: 96,
+        artifactX: 270,
+        detailHeight: 104,
+        detailX: 520,
+        laneGap: 24,
+        minLaneHeight: 184,
+        rowGap: 118,
+        stageHeight: 110,
+        stageX: 24,
       };
-      let cursorY = 30;
+      let cursorY = 34;
       const getRowY = (laneTop: number, laneHeight: number, rowIndex: number, totalRows: number, nodeHeight: number) => {
-        const blockHeight = (totalRows - 1) * layout.rowGap;
+        const blockHeight = Math.max(0, totalRows - 1) * layout.rowGap;
         return laneTop + laneHeight / 2 - blockHeight / 2 + rowIndex * layout.rowGap - nodeHeight / 2;
       };
 
@@ -2532,14 +3018,17 @@ function StateTreeModal({
         const artifacts = stageMeta[stage.id].allowedWrites;
         const details = stage.output ? getStageExpansionNodes(stage, language) : [];
         const rowCount = Math.max(1, artifacts.length, details.length);
-        const laneHeight = Math.max(layout.minLaneHeight, rowCount * layout.rowGap + 20);
+        const laneHeight = Math.max(
+          layout.minLaneHeight,
+          (rowCount - 1) * layout.rowGap + Math.max(layout.artifactHeight, layout.detailHeight) + 42,
+        );
         const stageY = cursorY + laneHeight / 2 - layout.stageHeight / 2;
         nextNodes.push({
           id: stage.id,
           type: "flowNode",
           position: { x: layout.stageX, y: stageY },
           data: {
-            active: stage.id === activeStage,
+            active: selectedNodeId === stage.id,
             kind: "stage",
             lang: language,
             stage: stage.id,
@@ -2550,12 +3039,14 @@ function StateTreeModal({
         });
 
         artifacts.forEach((field, fieldIndex) => {
+          const nodeId = `${stage.id}:artifact:${field}`;
           nextNodes.push({
-            id: `${stage.id}:${field}`,
+            id: nodeId,
             type: "flowNode",
             position: { x: layout.artifactX, y: getRowY(cursorY, laneHeight, fieldIndex, artifacts.length, layout.artifactHeight) },
             data: {
-              active: false,
+              active: selectedNodeId === nodeId,
+              artifactKey: field,
               kind: "artifact",
               lang: language,
               stage: stage.id,
@@ -2567,12 +3058,15 @@ function StateTreeModal({
         });
 
         details.forEach((node, nodeIndex) => {
+          const nodeId = `${stage.id}:detail:${node.id}`;
           nextNodes.push({
-            id: `${stage.id}:detail:${node.id}`,
+            id: nodeId,
             type: "flowNode",
             position: { x: layout.detailX, y: getRowY(cursorY, laneHeight, nodeIndex, details.length, layout.detailHeight) },
             data: {
-              active: false,
+              active: selectedNodeId === nodeId,
+              artifactKey: node.sourceArtifact,
+              detailId: node.id,
               kind: "detail",
               lang: language,
               stage: stage.id,
@@ -2585,10 +3079,11 @@ function StateTreeModal({
 
         cursorY += laneHeight + layout.laneGap;
       });
-      return nextNodes;
+      return { canvasHeight: cursorY + 28, nodes: nextNodes };
     },
-    [activeStage, language, stages],
+    [language, selectedNodeId, stages],
   );
+  const nodes = treeLayout.nodes;
 
   const edges = useMemo<Edge[]>(
     () => {
@@ -2607,7 +3102,7 @@ function StateTreeModal({
           id: `${stage.id}->${field}`,
           source: stage.id,
           sourceHandle: "right",
-          target: `${stage.id}:${field}`,
+          target: `${stage.id}:artifact:${field}`,
           targetHandle: "left",
           animated: stage.status === "running" || stage.status === "validating",
           className: stage.status === "passed" ? "flow-edge-passed branch-flow-edge" : "flow-edge branch-flow-edge",
@@ -2616,7 +3111,7 @@ function StateTreeModal({
         const expansionEdges = stage.output
           ? getStageExpansionNodes(stage, language).map((node) => ({
               id: `${stage.id}:expansion:${node.id}`,
-              source: `${stage.id}:${node.sourceArtifact}`,
+              source: `${stage.id}:artifact:${node.sourceArtifact}`,
               sourceHandle: "right",
               target: `${stage.id}:detail:${node.id}`,
               targetHandle: "left",
@@ -2631,6 +3126,21 @@ function StateTreeModal({
     [language, stages],
   );
 
+  const selectedNode = nodes.find((node) => node.id === selectedNodeId) ?? nodes.find((node) => node.id === activeStage) ?? nodes[0];
+  const selectedStage = stages.find((stage) => stage.id === selectedNode?.data.stage) ?? stages[0];
+  const selectedPayload = (selectedStage.output?.payload ?? {}) as Record<string, unknown>;
+  const inspectorData = selectedNode?.data.kind === "stage"
+    ? {
+        input: selectedStage.input,
+        output: selectedStage.output,
+        review: selectedStage.review,
+      }
+    : selectedNode?.data.artifactKey
+      ? selectedPayload[selectedNode.data.artifactKey]
+        ?? (selectedNode.data.artifactKey === "reviews" ? selectedStage.review : null)
+        ?? selectedStage.output
+      : selectedStage.output;
+
   return (
     <div className="modal-backdrop">
       <section className="tree-modal">
@@ -2644,24 +3154,45 @@ function StateTreeModal({
             {t.close}
           </button>
         </div>
-        <div className="tree-canvas">
-          <ReactFlow
-            edges={edges}
-            fitView
-            fitViewOptions={{ padding: 0.12 }}
-            maxZoom={1.2}
-            minZoom={0.25}
-            nodes={nodes}
-            nodeTypes={flowNodeTypes}
-            nodesDraggable={false}
-            onNodeClick={(_, node) => {
-              if (typeof node.data.stage === "string") setActiveStage(node.data.stage as StageId);
-            }}
-            proOptions={{ hideAttribution: true }}
-          >
-            <Background color="#d8dee7" gap={22} size={1} />
-            <Controls position="bottom-right" showInteractive={false} />
-          </ReactFlow>
+        <div className="tree-body">
+          <div className="tree-canvas-scroll">
+            <div className="tree-canvas" style={{ height: treeLayout.canvasHeight }}>
+            <ReactFlow
+              edges={edges}
+              defaultViewport={{ x: 0, y: 0, zoom: 1 }}
+              nodes={nodes}
+              nodeTypes={flowNodeTypes}
+              nodesConnectable={false}
+              nodesDraggable={false}
+              onNodeClick={(_, node) => {
+                setSelectedNodeId(node.id);
+                if (typeof node.data.stage !== "string") return;
+                const stage = node.data.stage as StageId;
+                onSelectStage(stage);
+              }}
+              panOnDrag={false}
+              proOptions={{ hideAttribution: true }}
+              zoomOnDoubleClick={false}
+              zoomOnPinch={false}
+              zoomOnScroll={false}
+            >
+              <Background color="#d8dee7" gap={22} size={1} />
+            </ReactFlow>
+            </div>
+          </div>
+          <aside className="tree-inspector">
+            <div className="tree-inspector-heading">
+              <span>{selectedNode?.data.kind === "stage" ? (language === "zh" ? "阶段详情" : "Stage details") : language === "zh" ? "节点详情" : "Node details"}</span>
+              <strong>{selectedNode?.data.title ?? stageLabel[language][selectedStage.id]}</strong>
+              <small>{stageLabel[language][selectedStage.id]} · {statusLabel[language][selectedStage.status]}</small>
+            </div>
+            <p>{selectedNode?.data.subtitle ?? stagePurpose[language][selectedStage.id]}</p>
+            <div className="tree-inspector-meta">
+              <span>{language === "zh" ? "执行单元" : "Executor"}</span>
+              <strong>{stageMeta[selectedStage.id].agent}</strong>
+            </div>
+            <pre>{JSON.stringify(inspectorData ?? null, null, 2)}</pre>
+          </aside>
         </div>
       </section>
     </div>
@@ -2746,6 +3277,53 @@ function getMessageTitle(message: ThreadMessage, language: Language) {
 
 function formatTime(value: string) {
   return new Date(value).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function formatRuntime(durationMs: number, language: Language) {
+  const totalSeconds = Math.max(0, Math.floor(durationMs / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (language === "zh") {
+    if (hours) return `${hours}小时${minutes}分${seconds}秒`;
+    if (minutes) return `${minutes}分${seconds}秒`;
+    return `${seconds}秒`;
+  }
+  if (hours) return `${hours}h ${minutes}m ${seconds}s`;
+  if (minutes) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+function MessageRuntime({
+  active,
+  createdAt,
+  durationMs,
+  language,
+}: {
+  active: boolean;
+  createdAt: string;
+  durationMs?: number;
+  language: Language;
+}) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [active]);
+
+  const startedAt = Date.parse(createdAt);
+  const elapsed = active && Number.isFinite(startedAt) ? now - startedAt : durationMs;
+  if (elapsed == null) return null;
+  return (
+    <span className={`message-runtime ${active ? "active" : ""} ${elapsed >= 120_000 ? "long" : ""}`}>
+      <Clock3 size={12} />
+      {active
+        ? language === "zh" ? `已运行 ${formatRuntime(elapsed, language)}` : `Running ${formatRuntime(elapsed, language)}`
+        : language === "zh" ? `用时 ${formatRuntime(elapsed, language)}` : `Took ${formatRuntime(elapsed, language)}`}
+    </span>
+  );
 }
 
 function arrayValue(value: unknown): unknown[] {

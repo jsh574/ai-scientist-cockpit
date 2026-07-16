@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -19,6 +20,7 @@ from .contracts import (
     HumanReviewRequest,
     LegacyStageRunRequest,
     StageRunRequest,
+    TaskArchiveRequest,
     TaskCreateRequest,
 )
 from .orchestrator import OrchestrationError, Orchestrator
@@ -61,15 +63,43 @@ def _http_error(exc: Exception) -> HTTPException:
 def health() -> dict[str, Any]:
     sources = settings.source_status()
     agent_sources = {key: value for key, value in sources.items() if key in REAL_AGENT_STAGES}
+    ready_agent_count = sum(1 for item in agent_sources.values() if item.get("ready"))
     return {
-        "status": "ok" if all(item["available"] for item in agent_sources.values()) else "degraded",
+        "status": "ok" if ready_agent_count == len(agent_sources) else "degraded",
         "version": app.version,
         "protocol_version": "1.0",
-        "model": "qwen3.7-max",
+        "model": os.getenv("QWEN_MODEL") or os.getenv("LLM_MODEL") or "qwen3.7-max",
         "max_iterations": settings.max_iterations,
+        "ready_agent_count": ready_agent_count,
         "real_agent_stages": sorted(REAL_AGENT_STAGES),
         "workflow": list(STAGE_ORDER),
         "sources": sources,
+        "capabilities": {
+            "tasks": True,
+            "task_archive": True,
+            "task_start": True,
+            "stage_run": True,
+            "reviews": True,
+            "feedback": True,
+            "versions": True,
+            "artifacts": True,
+            "attachments": True,
+            "events": True,
+            "export": True,
+        },
+        "attachments": {
+            "max_bytes": settings.attachment_max_bytes,
+            "allowed_extensions": [".txt", ".md", ".csv", ".json"],
+        },
+        "llm": {
+            "timeout_seconds": float(os.getenv("LLM_TIMEOUT_SECONDS", "120")),
+            "max_retries": int(os.getenv("LLM_MAX_RETRIES", "0")),
+            "thinking_enabled": os.getenv("QWEN_ENABLE_THINKING", "false").lower()
+            == "true",
+            "knowledge_max_attempts": int(
+                os.getenv("KNOWLEDGE_LLM_MAX_ATTEMPTS", "1")
+            ),
+        },
         "mcp": {"server": "backend.mcp_server", "transport": "stdio"},
     }
 
@@ -102,14 +132,61 @@ def create_task(request: TaskCreateRequest) -> dict[str, Any]:
 
 
 @app.get("/api/tasks")
-def list_tasks() -> dict[str, Any]:
-    return {"tasks": artifacts.list_tasks()}
+def list_tasks(include_archived: bool = False) -> dict[str, Any]:
+    return {"tasks": artifacts.list_tasks(include_archived=include_archived)}
 
 
 @app.get("/api/tasks/{task_id}")
 def get_task(task_id: str) -> dict[str, Any]:
     try:
         return orchestrator.get_task(task_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@app.post("/api/tasks/{task_id}/archive")
+def archive_task(task_id: str, request: TaskArchiveRequest) -> dict[str, Any]:
+    try:
+        manifest = artifacts.set_archived(task_id, request.archived)
+        return {"task_id": task_id, "manifest": manifest}
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@app.get("/api/tasks/{task_id}/attachments")
+def list_task_attachments(task_id: str) -> dict[str, Any]:
+    try:
+        return {"task_id": task_id, "attachments": artifacts.list_attachments(task_id)}
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@app.post("/api/tasks/{task_id}/attachments")
+async def upload_task_attachments(
+    task_id: str,
+    files: list[UploadFile] = File(...),
+) -> dict[str, Any]:
+    try:
+        if not artifacts.task_exists(task_id):
+            raise ArtifactError("Task does not exist")
+        uploaded = []
+        context = artifacts.load_context(task_id)
+        for upload in files:
+            filename = upload.filename or ""
+            content = await upload.read(settings.attachment_max_bytes + 1)
+            if len(content) > settings.attachment_max_bytes:
+                raise ArtifactError(
+                    f"Attachment exceeds {settings.attachment_max_bytes} bytes: {filename}"
+                )
+            item, context = artifacts.add_attachment(
+                task_id,
+                filename,
+                content,
+                upload.content_type,
+                context_char_limit=settings.attachment_context_chars,
+            )
+            uploaded.append(item)
+        return {"task_id": task_id, "attachments": uploaded, "task_context": context}
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -195,6 +272,9 @@ async def apply_feedback(task_id: str, request: FeedbackRequest) -> dict[str, An
             request.comment,
             rerun_downstream=request.rerun_downstream,
             execute=request.execute,
+            mode=request.mode,
+            reasoning_level=request.reasoning_level,
+            memory_level=request.memory_level,
         )
     except Exception as exc:
         raise _http_error(exc) from exc

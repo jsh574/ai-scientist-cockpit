@@ -35,7 +35,7 @@ class ProjectLLMClient:
 
     mock = False
 
-    def __init__(self) -> None:
+    def __init__(self, task_context: dict[str, Any] | None = None) -> None:
         try:
             from openai import OpenAI
         except ImportError as exc:
@@ -57,13 +57,33 @@ class ProjectLLMClient:
             or "https://dashscope.aliyuncs.com/compatible-mode/v1"
         ).rstrip("/")
         self.model = os.getenv("QWEN_MODEL") or os.getenv("LLM_MODEL") or "qwen3.7-max"
-        self.max_tokens = int(os.getenv("LLM_MAX_TOKENS", "8192"))
-        self.enable_thinking = os.getenv("QWEN_ENABLE_THINKING", "false").lower() == "true"
+        user_input = (task_context or {}).get("user_input") or {}
+        constraints = user_input.get("user_constraints") or {}
+        self.background_context = str(user_input.get("question_description") or "").strip()
+        self.reasoning_level = str(constraints.get("reasoning_level") or "high")
+        configured_max_tokens = int(os.getenv("LLM_MAX_TOKENS", "8192"))
+        token_limits = {
+            "low": 2048,
+            "medium": 4096,
+            "high": 6144,
+            "ultra": configured_max_tokens,
+        }
+        self.max_tokens = min(configured_max_tokens, token_limits.get(self.reasoning_level, configured_max_tokens))
+        env_thinking = os.getenv("QWEN_ENABLE_THINKING", "false").lower() == "true"
+        self.enable_thinking = env_thinking and self.reasoning_level in {"high", "ultra"}
         self.client = OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
             timeout=float(os.getenv("LLM_TIMEOUT_SECONDS", "120")),
-            max_retries=1,
+            max_retries=int(os.getenv("LLM_MAX_RETRIES", "0")),
+        )
+
+    def _with_background_context(self, user_prompt: str) -> str:
+        if not self.background_context or self.background_context in user_prompt:
+            return user_prompt
+        return (
+            f"{user_prompt}\n\n[Task background and uploaded attachment context]\n"
+            f"{self.background_context}"
         )
 
     def _complete(self, system_prompt: str, user_prompt: str, temperature: float) -> str:
@@ -71,7 +91,7 @@ class ProjectLLMClient:
             model=self.model,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": self._with_background_context(user_prompt)},
             ],
             response_format={"type": "json_object"},
             temperature=temperature,
@@ -697,6 +717,8 @@ def failure_response(
         payload[payload_key] = []
     if stage == "knowledge_integration":
         payload.update(evidence_cards=[], knowledge_gaps=[])
+    issue = f"{type(error).__name__}: {error}"
+    timed_out = "timeout" in issue.lower() or "timed out" in issue.lower()
     return {
         "metadata": {
             "task_id": str(task_context.get("task_id") or ""),
@@ -711,8 +733,12 @@ def failure_response(
             "overall_score": 0.0,
             "threshold": 0.75,
             "dimension_scores": {},
-            "issues": [f"{type(error).__name__}: {error}"],
-            "suggestions": ["检查 Agent 路径、Python 依赖、模型密钥和上游字段后重试。"],
+            "issues": [issue],
+            "suggestions": [
+                "降低推理强度、减少知识检索或规划候选数，或调整 LLM_TIMEOUT_SECONDS 后重试。"
+                if timed_out
+                else "检查 Agent 路径、Python 依赖、模型密钥和上游字段后重试。"
+            ],
         },
     }
 
@@ -781,7 +807,7 @@ class AgentRegistry:
         self, task_context: dict[str, Any], feedback: str | None
     ) -> dict[str, Any]:
         module = _load_package(self.settings.problem_agent_root, "problem_understanding.agent")
-        agent = module.ProblemUnderstandingAgent(llm=ProjectLLMClient())
+        agent = module.ProblemUnderstandingAgent(llm=ProjectLLMClient(task_context))
         raw = agent.run(
             task_context.get("user_input") or {},
             version=int(task_context.get("iteration") or 1),
@@ -840,10 +866,13 @@ class AgentRegistry:
             "question_card": knowledge_question_card(task_context.get("question_card") or {}),
         }
         agent = package.KnowledgeIntegrationAgent(
-            llm_client=ProjectLLMClient(),
+            llm_client=ProjectLLMClient(task_context),
             literature_clients=_literature_clients(
                 self.settings.knowledge_agent_root, task_context
             ),
+        )
+        agent.llm_client.max_attempts = max(
+            1, int(os.getenv("KNOWLEDGE_LLM_MAX_ATTEMPTS", "1"))
         )
         search_policy = {
             "max_queries": int(os.getenv("KNOWLEDGE_MAX_QUERIES", "3")),
@@ -874,7 +903,7 @@ class AgentRegistry:
             max_retries=int(os.getenv("HYPOTHESIS_MAX_RETRIES", "1")),
         )
         agent = module.HypothesisGenerationAgent(config=config)
-        agent.call_llm = ProjectLLMClient().generate_text
+        agent.call_llm = ProjectLLMClient(task_context).generate_text
         request = hypothesis_request(task_context)
         if feedback:
             request["user_constraints"] = {
@@ -912,7 +941,10 @@ class AgentRegistry:
         dify_client = _load_package(self.settings.planning_agent_root, "planning_agent.dify_client")
         raw = service.run_planning_agent(
             planning_request(task_context),
-            dify_client=ProjectPlanningWorkflowClient(workflow_error=dify_client.DifyWorkflowError),
+            dify_client=ProjectPlanningWorkflowClient(
+                llm=ProjectLLMClient(task_context),
+                workflow_error=dify_client.DifyWorkflowError,
+            ),
             max_packages=int(os.getenv("PLANNING_MAX_HYPOTHESES", "2")),
             max_parallel_calls=int(os.getenv("PLANNING_MAX_PARALLEL_CALLS", "1")),
         )

@@ -75,6 +75,8 @@ class Orchestrator:
             "domain_preference": "auto",
             "max_hypotheses": 5,
             "output_detail_level": "standard",
+            "reasoning_level": "high",
+            "memory_level": "medium",
             **request.user_constraints,
         }
         context: dict[str, Any] = {
@@ -200,14 +202,50 @@ class Orchestrator:
         )
         return merged
 
+    @staticmethod
+    def _feedback_with_memory(
+        context: dict[str, Any], stage: str, feedback: str | None
+    ) -> str | None:
+        constraints = (context.get("user_input") or {}).get("user_constraints") or {}
+        memory_level = str(constraints.get("memory_level") or "medium")
+        if memory_level == "low":
+            return feedback
+
+        feedback_events = [
+            item
+            for item in context.get("feedback_events") or []
+            if isinstance(item, dict)
+        ]
+        reviews = [
+            item
+            for item in context.get("reviews") or []
+            if isinstance(item, dict) and item.get("stage") == stage
+        ]
+        event_limit = 2 if memory_level == "medium" else 8
+        review_limit = 1 if memory_level == "medium" else 4
+        history: list[str] = []
+        for item in feedback_events[-event_limit:]:
+            summary = str(item.get("input_summary") or "").strip()
+            target = (item.get("target") or {}).get("stage")
+            if summary:
+                history.append(f"Feedback for {target or 'workflow'}: {summary}")
+        for item in reviews[-review_limit:]:
+            issues = [str(issue) for issue in item.get("issues") or [] if str(issue).strip()]
+            if issues:
+                history.append(f"Review issues for {stage}: {'; '.join(issues)}")
+
+        parts = [part for part in (feedback, *history) if part]
+        return "\n\n".join(parts)[:12000] or None
+
     def run_stage(self, task_id: str, stage: str, feedback: str | None = None) -> dict[str, Any]:
         spec = get_agent_spec(stage)
         with self._task_lock(task_id):
             context = self.artifacts.load_context(task_id)
             iteration = int(context.get("iteration") or 1)
+            effective_feedback = self._feedback_with_memory(context, stage, feedback)
             stage_input = slice_context(context, spec)
-            if feedback:
-                stage_input["feedback"] = feedback
+            if effective_feedback:
+                stage_input["feedback"] = effective_feedback
             self.artifacts.set_stage_status(task_id, stage, "running")
             self.artifacts.write_stage_input(task_id, stage, iteration, stage_input)
             self._event(task_id, "stage_started", f"{stage} started.", stage)
@@ -215,7 +253,7 @@ class Orchestrator:
             raw = (
                 self._built_in_final_review(context)
                 if stage == "final_review"
-                else self.registry.run(stage, context, feedback)
+                else self.registry.run(stage, context, effective_feedback)
             )
             self.artifacts.write_stage_output(task_id, stage, iteration, raw)
             response, review = self.review_gate.evaluate(raw, context, spec)
@@ -393,10 +431,24 @@ class Orchestrator:
         task_id: str,
         target_stage: str,
         comment: str,
+        *,
+        mode: str | None = None,
+        reasoning_level: str | None = None,
+        memory_level: str | None = None,
     ) -> dict[str, Any]:
         get_agent_spec(target_stage)
         with self._task_lock(task_id):
             context = self.artifacts.load_context(task_id)
+            if mode is not None:
+                context["mode"] = mode
+            user_input = dict(context.get("user_input") or {})
+            constraints = dict(user_input.get("user_constraints") or {})
+            if reasoning_level is not None:
+                constraints["reasoning_level"] = reasoning_level
+            if memory_level is not None:
+                constraints["memory_level"] = memory_level
+            user_input["user_constraints"] = constraints
+            context["user_input"] = user_input
             iteration = int(context.get("iteration") or 1) + 1
             if iteration > self.max_iterations:
                 raise OrchestrationError(
@@ -424,7 +476,7 @@ class Orchestrator:
                 context,
                 stage=target_stage,
                 trigger="human_feedback",
-                changed_fields=["iteration", "feedback_events"],
+                changed_fields=["mode", "user_input.user_constraints", "iteration", "feedback_events"],
             )
             self.artifacts.update_manifest(task_id, iteration=iteration)
             self._event(
@@ -444,8 +496,18 @@ class Orchestrator:
         *,
         rerun_downstream: bool = True,
         execute: bool = True,
+        mode: str | None = None,
+        reasoning_level: str | None = None,
+        memory_level: str | None = None,
     ) -> dict[str, Any]:
-        context = self.record_feedback(task_id, target_stage, comment)
+        context = self.record_feedback(
+            task_id,
+            target_stage,
+            comment,
+            mode=mode,
+            reasoning_level=reasoning_level,
+            memory_level=memory_level,
+        )
         if not execute:
             return {"status": "feedback_recorded", "task_context": context}
 

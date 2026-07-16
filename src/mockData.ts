@@ -82,6 +82,8 @@ const baseUserInput = {
     domain_preference: "biomedicine",
     max_hypotheses: 5,
     output_detail_level: "standard" as const,
+    reasoning_level: "high" as const,
+    memory_level: "medium" as const,
   },
 };
 
@@ -875,8 +877,18 @@ export const artifactItems: ArtifactItem[] = [
 
 export const apiSpecs: ApiSpec[] = [
   {
+    method: "GET",
+    path: "/api/tasks",
+    capability: "tasks",
+    owner: "TaskContext Manager",
+    status: "ready",
+    writes: "none",
+    description: "恢复未归档项目列表。",
+  },
+  {
     method: "POST",
     path: "/api/tasks",
+    capability: "tasks",
     owner: "TaskContext Manager",
     status: "ready",
     writes: "manifest.json, task_context.latest.json",
@@ -884,7 +896,35 @@ export const apiSpecs: ApiSpec[] = [
   },
   {
     method: "POST",
+    path: "/api/tasks/{task_id}/archive",
+    capability: "task_archive",
+    owner: "TaskContext Manager",
+    status: "ready",
+    writes: "manifest.json",
+    description: "归档或恢复项目。",
+  },
+  {
+    method: "GET",
+    path: "/api/tasks/{task_id}/attachments",
+    capability: "attachments",
+    owner: "Artifact Service",
+    status: "ready",
+    writes: "none",
+    description: "列出任务已持久化的附件。",
+  },
+  {
+    method: "POST",
+    path: "/api/tasks/{task_id}/attachments",
+    capability: "attachments",
+    owner: "Artifact Service",
+    status: "ready",
+    writes: "attachments/, task_context.latest.json",
+    description: "上传文本背景材料并注入任务上下文。",
+  },
+  {
+    method: "POST",
     path: "/api/tasks/{task_id}/start",
+    capability: "task_start",
     owner: "Workflow Orchestrator",
     status: "ready",
     writes: "events/trace.jsonl",
@@ -893,6 +933,7 @@ export const apiSpecs: ApiSpec[] = [
   {
     method: "GET",
     path: "/api/tasks/{task_id}/context",
+    capability: "tasks",
     owner: "TaskContext Manager",
     status: "ready",
     writes: "none",
@@ -901,6 +942,7 @@ export const apiSpecs: ApiSpec[] = [
   {
     method: "GET",
     path: "/api/tasks/{task_id}/stages/{stage}",
+    capability: "stage_run",
     owner: "Artifact Service",
     status: "ready",
     writes: "none",
@@ -909,6 +951,7 @@ export const apiSpecs: ApiSpec[] = [
   {
     method: "POST",
     path: "/api/tasks/{task_id}/reviews",
+    capability: "reviews",
     owner: "Review Gate",
     status: "ready",
     writes: "reviews/{stage}.review.json",
@@ -917,6 +960,7 @@ export const apiSpecs: ApiSpec[] = [
   {
     method: "GET",
     path: "/api/tasks/{task_id}/events/stream",
+    capability: "events",
     owner: "Event & Trace Logger",
     status: "ready",
     writes: "none",
@@ -925,14 +969,34 @@ export const apiSpecs: ApiSpec[] = [
   {
     method: "POST",
     path: "/api/tasks/{task_id}/feedback",
+    capability: "feedback",
     owner: "Iteration Controller",
     status: "ready",
     writes: "feedback_events, versions/",
     description: "触发反馈任务并驱动下一轮修订。",
   },
   {
+    method: "GET",
+    path: "/api/tasks/{task_id}/versions",
+    capability: "versions",
+    owner: "Version Manager",
+    status: "ready",
+    writes: "none",
+    description: "读取任务版本快照。",
+  },
+  {
+    method: "GET",
+    path: "/api/tasks/{task_id}/artifacts",
+    capability: "artifacts",
+    owner: "Artifact Service",
+    status: "ready",
+    writes: "none",
+    description: "列出任务隔离目录中的产物。",
+  },
+  {
     method: "POST",
     path: "/api/tasks/{task_id}/export",
+    capability: "export",
     owner: "Export Service",
     status: "ready",
     writes: "exports/submission_bundle.zip",
