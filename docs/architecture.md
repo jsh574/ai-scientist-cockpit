@@ -89,4 +89,4 @@ artifacts/tasks/{task_id}/
 
 JSON 文件使用同目录临时文件和原子替换写入。所有任务 ID 和相对路径都经过白名单与目录边界校验。
 
-附件仅允许 UTF-8 文本格式。文件元数据写入 `user_input.attachments`，文本摘要合并到 `user_input.question_description`。`ProjectLLMClient` 会把该背景注入所有真实模型请求的用户消息，已有相同内容时不重复注入。
+附件仅允许 UTF-8 文本格式。文件元数据写入 `user_input.attachments`，文本摘要合并到 `user_input.question_description`。OpenAI 兼容 Agent 的 `ProjectLLMClient` 会把该背景注入用户消息，已有相同内容时不重复注入；Planning Agent 使用 Dify Workflow，依赖上游结构化上下文和模块 5 输入传递背景。

@@ -87,6 +87,7 @@ class Settings:
         )
         dashscope_credential = bool(os.getenv("DASHSCOPE_API_KEY"))
         qwen_credential = bool(os.getenv("DASHSCOPE_API_KEY") or os.getenv("QWEN_API_KEY"))
+        dify_credential = bool(os.getenv("DIFY_API_URL") and os.getenv("DIFY_API_KEY"))
 
         def status(
             path: Path,
@@ -129,7 +130,8 @@ class Settings:
             "research_planning": status(
                 self.planning_agent_root,
                 credential_required=True,
-                credential_configured=any_credential,
+                credential_configured=dify_credential,
+                mode="dify_workflow",
             ),
             "artifact_service": {
                 "path": str(self.artifacts_root),

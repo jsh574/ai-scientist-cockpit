@@ -8,7 +8,6 @@ from unittest.mock import patch
 from backend.app.adapters import (
     AgentRegistry,
     ProjectLLMClient,
-    ProjectPlanningWorkflowClient,
     _load_file,
     _load_package,
     canonical_question_card,
@@ -259,11 +258,14 @@ class AdapterContractTests(unittest.TestCase):
         self.assertEqual(response["metadata"]["stage"], "evidence_mapping")
         self.assertEqual(response["payload"]["evidence_map"][0]["hypothesis_id"], "hyp_001")
 
-    def test_planning_workflow_filters_unknown_traceability_ids(self) -> None:
-        class FakePlanningLLM:
-            def generate_json(self, **_kwargs):
+    def test_planning_dify_output_reports_unknown_traceability_ids(self) -> None:
+        class FakeDifyClient:
+            configured = True
+
+            def run_workflow(self, _inputs):
                 return {
                     "plan": {
+                        "problem_statement": "测试研究问题",
                         "rationale": {
                             "logic_chain": [
                                 {
@@ -295,29 +297,38 @@ class AdapterContractTests(unittest.TestCase):
         ]
         request = planning_request(context)
         service = _load_package(Settings.from_env().planning_agent_root, "planning_agent.service")
-        client = ProjectPlanningWorkflowClient(llm=FakePlanningLLM())
         response = service.run_planning_agent(
-            request, dify_client=client, max_packages=1, max_parallel_calls=1
+            request, dify_client=FakeDifyClient(), max_packages=1, max_parallel_calls=1
         )
-        plan = response["payload"]["plans"][0]["plan"]
-        logic = plan["rationale"]["logic_chain"][0]
-        self.assertEqual(logic["evidence_ids"], ["ev_001"])
-        self.assertEqual(logic["source_ids"], ["lit_001"])
-        self.assertEqual([item["source_id"] for item in plan["references"]], ["lit_001"])
 
-    def test_registry_wraps_native_planning_payload(self) -> None:
-        class FakePlanningLLM:
-            def generate_json(self, **_kwargs):
+        self.assertEqual(response["metadata"]["status"], "partial_success")
+        self.assertFalse(response["self_review"]["passed"])
+        self.assertTrue(
+            any("unknown source" in issue or "unknown evidence" in issue for issue in response["self_review"]["issues"])
+        )
+
+    def test_registry_uses_native_planning_dify_client(self) -> None:
+        class FakeDifyClient:
+            configured = True
+
+            def __init__(self):
+                self.calls = []
+
+            def run_workflow(self, inputs):
+                self.calls.append(inputs)
                 return {"plan": {"problem_statement": "测试研究问题"}}
 
         context = self.downstream_context()
         evidence_response = AgentRegistry(Settings.from_env()).run("evidence_mapping", context)
         context["evidence_map"] = evidence_response["payload"]["evidence_map"]
-        client = ProjectPlanningWorkflowClient(llm=FakePlanningLLM())
-        with patch("backend.app.adapters.ProjectPlanningWorkflowClient", return_value=client):
+        service = _load_package(Settings.from_env().planning_agent_root, "planning_agent.service")
+        client = FakeDifyClient()
+        with patch.object(service, "DifyWorkflowClient", return_value=client):
             response = AgentRegistry(Settings.from_env()).run("research_planning", context)
+
         self.assertEqual(response["metadata"]["stage"], "research_planning")
         self.assertIn("research_plan", response["payload"])
+        self.assertTrue(client.calls)
         self.assertEqual(
             response["payload"]["research_plan"]["plans"][0]["plan"]["problem_statement"],
             "测试研究问题",
