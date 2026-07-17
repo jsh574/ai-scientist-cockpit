@@ -41,7 +41,7 @@ Copy-Item backend\.env.example backend\.env
 npm install
 ```
 
-在 `backend/.env` 中配置模型凭据。所有 Agent 默认使用 OpenAI 兼容接口和 `qwen3.7-max`，密钥文件不会被 Git 跟踪。
+在 `backend/.env` 中配置模型与 Dify 凭据。问题理解、知识整合和假设生成使用 OpenAI 兼容接口；研究计划 Agent 使用其原生 Dify Workflow 后端。密钥文件不会被 Git 跟踪。
 
 一键启动：
 

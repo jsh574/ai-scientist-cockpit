@@ -101,7 +101,7 @@ POST /api/tasks/{id}/attachments   multipart/form-data，字段名 files
 - 注入上下文的总字符数默认 30,000，可用 `ATTACHMENT_CONTEXT_CHARS` 调整。
 - 文件必须是 UTF-8 文本；服务端重新校验文件名、扩展名、编码和任务目录边界。
 - 前端先校验以改善体验，但不能替代服务端校验。
-- Artifact Service 把附件文本写入 `task_context.user_input.question_description`；`ProjectLLMClient` 再把该背景注入所有真实模型请求的用户消息，而不只是保存在任务文件中。
+- Artifact Service 把附件文本写入 `task_context.user_input.question_description`；OpenAI 兼容 Agent 的 `ProjectLLMClient` 会把该背景注入用户消息，Planning Agent 则通过上游结构化上下文和 Dify Workflow 输入获得任务背景。
 - 自动测试使用唯一标记断言附件文本实际出现在 OpenAI 兼容请求的 `messages[1].content`，用于防止“上传成功但模型看不到”的回归。
 
 ## 模型耗时与超时
