@@ -107,5 +107,6 @@ POST /api/tasks/{task_id}/export
 - [MCP 服务](docs/mcp.md)
 - [部署](docs/deployment.md)
 - [分支批次优化记录](docs/branch-optimizations/feat-product-hardening-batch-1/README.md)
+- [工作台、状态树与主题优化记录](docs/branch-optimizations/feat-workbench-state-tree-theme-batch-2/README.md)
 
 `backend/.env`、根目录 `.env`、运行 Artifact、日志、虚拟环境和构建目录均不得提交。

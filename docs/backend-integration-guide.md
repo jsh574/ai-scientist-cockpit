@@ -71,6 +71,17 @@ Content-Type: application/json
 
 反馈会先增加 iteration、写入 `feedback_events` 并创建版本，然后从目标阶段重跑。前端需要自己控制逐阶段动画时，可发送 `execute=false`，再调用阶段接口。
 
+iteration 表示反馈驱动的科研迭代批次：新任务从 1 开始，每次成功记录反馈增加 1；普通阶段执行、人工批准继续和刷新页面不增加。最大值由 `MAX_WORKFLOW_ITERATIONS` 控制。
+
+记录反馈后必须同步执行状态失效：
+
+1. 目标阶段的 task_context 写入字段恢复为空值，目标之后所有阶段的写入字段同样清空。
+2. `reviews` 删除目标阶段及下游的旧审核；历史 `versions` 和 `feedback_events` 保留用于追溯。
+3. manifest 中目标阶段设为 `retrying`，下游设为 `queued`，目标之前已通过的上游状态保持不变。
+4. `GET /api/tasks/{id}/stages/{stage}` 对 `queued`、`retrying`、`rollback`、`running` 不返回旧输出；有效输出的 input 应按输出 metadata 中的 iteration 配对读取。
+
+这条规则用于保证当前状态树和 Agent 输入不会把上一轮已失效结果误认为当前结果。历史比较必须读取 versions，不得复用当前状态接口拼接旧节点。
+
 主输入框必须遵守以下语义：
 
 1. 本地草稿没有后端 `task_id`：调用一次 `POST /api/tasks`。

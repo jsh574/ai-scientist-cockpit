@@ -237,6 +237,36 @@ class Orchestrator:
         parts = [part for part in (feedback, *history) if part]
         return "\n\n".join(parts)[:12000] or None
 
+    @staticmethod
+    def _invalidate_from_stage(
+        context: dict[str, Any], target_stage: str
+    ) -> tuple[tuple[str, ...], list[str]]:
+        empty_values: dict[str, Any] = {
+            "question_card": None,
+            "literature_cards": [],
+            "evidence_cards": [],
+            "knowledge_gaps": [],
+            "hypothesis_cards": [],
+            "evidence_map": [],
+            "research_plan": None,
+            "final_review": None,
+        }
+        start = STAGE_ORDER.index(target_stage)
+        invalidated_stages = STAGE_ORDER[start:]
+        invalidated_fields: list[str] = []
+        for stage in invalidated_stages:
+            for field in get_agent_spec(stage).writes:
+                context[field] = empty_values[field]
+                invalidated_fields.append(field)
+
+        invalidated_set = set(invalidated_stages)
+        context["reviews"] = [
+            review
+            for review in context.get("reviews") or []
+            if not isinstance(review, dict) or review.get("stage") not in invalidated_set
+        ]
+        return invalidated_stages, invalidated_fields
+
     def run_stage(self, task_id: str, stage: str, feedback: str | None = None) -> dict[str, Any]:
         spec = get_agent_spec(stage)
         with self._task_lock(task_id):
@@ -449,6 +479,9 @@ class Orchestrator:
                 constraints["memory_level"] = memory_level
             user_input["user_constraints"] = constraints
             context["user_input"] = user_input
+            invalidated_stages, invalidated_fields = self._invalidate_from_stage(
+                context, target_stage
+            )
             iteration = int(context.get("iteration") or 1) + 1
             if iteration > self.max_iterations:
                 raise OrchestrationError(
@@ -476,9 +509,26 @@ class Orchestrator:
                 context,
                 stage=target_stage,
                 trigger="human_feedback",
-                changed_fields=["mode", "user_input.user_constraints", "iteration", "feedback_events"],
+                changed_fields=[
+                    "mode",
+                    "user_input.user_constraints",
+                    "iteration",
+                    "feedback_events",
+                    "reviews",
+                    *invalidated_fields,
+                ],
             )
-            self.artifacts.update_manifest(task_id, iteration=iteration)
+            manifest = self.artifacts.read_json(task_id, "manifest.json")
+            stage_status = dict(manifest.get("stage_status") or {})
+            for stage in invalidated_stages:
+                stage_status[stage] = "retrying" if stage == target_stage else "queued"
+            self.artifacts.update_manifest(
+                task_id,
+                iteration=iteration,
+                current_stage=target_stage,
+                status="retrying",
+                stage_status=stage_status,
+            )
             self._event(
                 task_id,
                 "feedback_received",
