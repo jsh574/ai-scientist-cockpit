@@ -11,7 +11,6 @@ import {
   Activity,
   Archive,
   ArrowDown,
-  Bot,
   Brain,
   Check,
   CheckCircle2,
@@ -1463,7 +1462,20 @@ function App() {
       <aside className="control-rail">
         <div className="brand-row">
           <span className="brand-mark">
-            <Bot size={18} />
+            <img
+              alt=""
+              aria-hidden="true"
+              className="brand-logo-light"
+              draggable="false"
+              src="/brand/eurekaloop-logo-64.png"
+            />
+            <img
+              alt=""
+              aria-hidden="true"
+              className="brand-logo-dark"
+              draggable="false"
+              src="/brand/eurekaloop-logo-64-dark.png"
+            />
           </span>
           <div>
             <strong>{t.appName}</strong>
@@ -2406,7 +2418,20 @@ function ThreadMessageCard({
 
   return (
     <article className={`thread-message ${message.kind}-message ${message.status ?? ""}`} id={message.id}>
-      <div className="message-avatar"><Bot size={17} /></div>
+      <div aria-hidden="true" className="message-avatar ai-message-avatar">
+        <img
+          alt=""
+          className="brand-logo-light"
+          draggable="false"
+          src="/brand/eurekaloop-logo-64.png"
+        />
+        <img
+          alt=""
+          className="brand-logo-dark"
+          draggable="false"
+          src="/brand/eurekaloop-logo-64-dark.png"
+        />
+      </div>
       <div className="message-bubble">
         <header>
           <div>
