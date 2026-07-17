@@ -108,6 +108,66 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(constraints["reasoning_level"], "ultra")
         self.assertEqual(constraints["memory_level"], "high")
 
+    def test_feedback_invalidates_target_and_downstream_results(self) -> None:
+        context = self.create("task_invalidation")
+        context.update(
+            {
+                "question_card": {"core_question": "upstream question"},
+                "literature_cards": [{"literature_id": "lit_001"}],
+                "evidence_cards": [{"evidence_id": "ev_001"}],
+                "knowledge_gaps": [{"gap_id": "gap_001"}],
+                "hypothesis_cards": [{"hypothesis_id": "hyp_001"}],
+                "evidence_map": [{"hypothesis_id": "hyp_001"}],
+                "research_plan": {"plan_id": "plan_001"},
+                "final_review": {"overall_score": 0.9},
+                "reviews": [
+                    {"stage": "question_understanding", "decision": "accept"},
+                    {"stage": "hypothesis_generation", "decision": "accept"},
+                    {"stage": "research_planning", "decision": "accept"},
+                ],
+            }
+        )
+        self.artifacts.save_context(context["task_id"], context)
+        self.artifacts.update_manifest(
+            context["task_id"],
+            status="completed",
+            current_stage="completed",
+            stage_status={
+                "question_understanding": "passed",
+                "knowledge_integration": "passed",
+                "hypothesis_generation": "passed",
+                "evidence_mapping": "passed",
+                "research_planning": "passed",
+                "final_review": "completed",
+            },
+        )
+
+        updated = self.orchestrator.record_feedback(
+            context["task_id"],
+            "hypothesis_generation",
+            "Generate a narrower hypothesis.",
+        )
+
+        self.assertEqual(updated["iteration"], 2)
+        self.assertIsNotNone(updated["question_card"])
+        self.assertEqual(len(updated["literature_cards"]), 1)
+        self.assertEqual(updated["hypothesis_cards"], [])
+        self.assertEqual(updated["evidence_map"], [])
+        self.assertIsNone(updated["research_plan"])
+        self.assertIsNone(updated["final_review"])
+        self.assertEqual(
+            [review["stage"] for review in updated["reviews"]],
+            ["question_understanding"],
+        )
+
+        manifest = self.artifacts.read_json(context["task_id"], "manifest.json")
+        self.assertEqual(manifest["iteration"], 2)
+        self.assertEqual(manifest["current_stage"], "hypothesis_generation")
+        self.assertEqual(manifest["stage_status"]["knowledge_integration"], "passed")
+        self.assertEqual(manifest["stage_status"]["hypothesis_generation"], "retrying")
+        self.assertEqual(manifest["stage_status"]["evidence_mapping"], "queued")
+        self.assertEqual(manifest["stage_status"]["final_review"], "queued")
+
     def test_memory_level_controls_feedback_history(self) -> None:
         context = self.create("task_memory")
         context["feedback_events"] = [

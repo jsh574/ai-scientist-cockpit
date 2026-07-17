@@ -67,7 +67,9 @@ Review Gate 在合并上下文前执行：
 - 已有 `task_id` 后，主输入框只提交指定阶段的反馈，不得再次创建任务。
 - 页面刷新通过 `GET /api/tasks` 恢复未归档任务，再读取 context、events、attachments 和六阶段详情。
 - 单个旧格式任务恢复失败时，其余任务继续载入，错误原因显示在系统页。
-- PC 完整状态树一次展开六阶段主干、全部 Artifact 和已有 Agent 输出摘要，使用固定节点尺寸和纵向滚动保持文字可读；完整输入、输出、审核和 JSON 在右侧详情检查器中展示。
+- PC 完整状态树一次展开六阶段主干、当前有效 Artifact 和 Agent 输出摘要，按“阶段主干 -> 写入对象 -> 返回摘要”的阶段带展示；节点标注产出来源 iteration，完整输入、输出、审核和 JSON 在右侧检查器中展示。
+- 反馈回退会使目标阶段及其下游结果失效：前端立即清空对应 StageRun，后端同时清空 task_context 字段和旧审核、重置 manifest 状态。状态树不得用旧 `latest.output.json` 填充 queued/retrying/running 节点。
+- 亮色与暗色主题由根节点 `data-theme` 和 CSS 语义变量控制，用户选择保存在浏览器本地；任务数据和主题偏好互不耦合。
 
 ## Artifact 布局
 

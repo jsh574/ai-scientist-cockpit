@@ -242,13 +242,27 @@ def task_stage_detail(task_id: str, stage: str) -> dict[str, Any]:
             "review": None,
         }
         iteration = int(manifest.get("iteration") or 1)
-        for key, path in {
-            "input": f"stages/{stage}/i{iteration:03d}.input.json",
-            "output": f"stages/{stage}/latest.output.json",
-            "review": f"reviews/{stage}.latest.review.json",
-        }.items():
+        status = str(result["status"])
+        output_is_valid = status not in {"queued", "retrying", "rollback", "running"}
+        output: dict[str, Any] | None = None
+        if output_is_valid:
             with suppress(ArtifactError):
-                result[key] = artifacts.read_json(task_id, path)
+                output = artifacts.read_json(task_id, f"stages/{stage}/latest.output.json")
+                result["output"] = output
+            with suppress(ArtifactError):
+                result["review"] = artifacts.read_json(
+                    task_id, f"reviews/{stage}.latest.review.json"
+                )
+
+        output_iteration = (
+            int(((output or {}).get("metadata") or {}).get("iteration") or iteration)
+            if output_is_valid
+            else iteration
+        )
+        with suppress(ArtifactError):
+            result["input"] = artifacts.read_json(
+                task_id, f"stages/{stage}/i{output_iteration:03d}.input.json"
+            )
         return result
     except Exception as exc:
         raise _http_error(exc) from exc

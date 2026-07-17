@@ -1,5 +1,4 @@
 import {
-  Background,
   Handle,
   Position,
   ReactFlow,
@@ -12,32 +11,27 @@ import {
   Activity,
   Archive,
   ArrowDown,
-  Bot,
   Brain,
   Check,
   CheckCircle2,
   ChevronDown,
-  ChevronRight,
   Clock3,
   FilePlus2,
   FileJson,
   Globe2,
-  GripVertical,
   HelpCircle,
-  ListFilter,
   Loader2,
   LockKeyhole,
   MessageSquareText,
-  MoreHorizontal,
+  Moon,
   Paperclip,
-  PanelLeft,
   Plus,
-  PlusCircle,
   RotateCcw,
   Send,
   Server,
   SlidersHorizontal,
   Sparkles,
+  Sun,
   Upload,
   X,
 } from "lucide-react";
@@ -89,9 +83,7 @@ type ApprovalMode = "ask" | "assist" | "auto";
 type MemoryLevel = "low" | "medium" | "high";
 type MessageKind = "user" | "agent" | "controller";
 type MenuId = "reasoning" | "approval" | "memory" | null;
-type ProjectMenuPanel = "root" | "sidebar" | "sort" | null;
-type ProjectGroupMode = "project" | "recent" | "time" | "movedown";
-type ProjectSortMode = "manual" | "created" | "updated";
+type Theme = "light" | "dark";
 
 interface StarterQuestion {
   domain: string;
@@ -105,8 +97,10 @@ interface FlowNodeData extends Record<string, unknown> {
   active: boolean;
   artifactKey?: string;
   detailId?: string;
+  iteration?: number;
   kind: "stage" | "artifact" | "detail";
   lang: Language;
+  order?: number;
   stage?: StageId;
   status?: StageRun["status"];
   subtitle: string;
@@ -118,6 +112,14 @@ interface StateTreeDetailNode {
   sourceArtifact: string;
   subtitle: string;
   title: string;
+}
+
+interface StateTreeLane {
+  height: number;
+  id: StageId;
+  order: number;
+  status: StageRun["status"];
+  y: number;
 }
 
 interface ThreadMessage {
@@ -133,6 +135,15 @@ interface ThreadMessage {
   revisionNote?: string;
   durationMs?: number;
   createdAt: string;
+}
+
+interface MessageIndexPreview {
+  id: string;
+  index: number;
+  label: string;
+  preview: string;
+  left: number;
+  top: number;
 }
 
 interface PickerOption<T extends string> {
@@ -303,6 +314,33 @@ const stagePurpose: Record<Language, Record<StageId, string>> = {
   },
 };
 
+const artifactLabel: Record<Language, Record<string, string>> = {
+  zh: {
+    question_card: "科学问题卡",
+    literature_cards: "文献卡片",
+    evidence_cards: "证据卡片",
+    knowledge_gaps: "知识空白",
+    hypothesis_cards: "候选假设",
+    evidence_map: "证据图谱",
+    reviews: "评审结论",
+    research_plan: "研究计划",
+    final_review: "总控审核",
+    versions: "版本快照",
+  },
+  en: {
+    question_card: "Question card",
+    literature_cards: "Literature cards",
+    evidence_cards: "Evidence cards",
+    knowledge_gaps: "Knowledge gaps",
+    hypothesis_cards: "Hypotheses",
+    evidence_map: "Evidence map",
+    reviews: "Review verdict",
+    research_plan: "Research plan",
+    final_review: "Final review",
+    versions: "Version snapshot",
+  },
+};
+
 const statusLabel: Record<Language, Record<string, string>> = {
   zh: {
     queued: "等待",
@@ -346,22 +384,16 @@ const copy = {
     newTask: "新建项目",
     projects: "项目",
     newProject: "创建新项目",
-    archiveAll: "归档所有聊天",
     archiveProject: "归档项目",
-    organizeSidebar: "整理侧边栏",
-    sortBy: "排序条件",
-    groupByProject: "按项目",
-    recentProjects: "近期项目",
-    timeOrder: "按时间顺序",
-    moveDown: "下移",
-    manualSort: "手动排序",
-    createdTime: "创建时间",
-    recentUpdated: "最近更新",
+    lightTheme: "白天模式",
+    darkTheme: "黑夜模式",
+    switchToLightTheme: "切换到白天模式",
+    switchToDarkTheme: "切换到黑夜模式",
     stateTree: "状态树",
     fullTree: "完整可视化状态树",
     close: "退出",
     progress: "进度",
-    iteration: "轮次",
+    iteration: "迭代轮次",
     currentStage: "当前阶段",
     reasoning: "推理",
     approval: "访问权限",
@@ -409,22 +441,16 @@ const copy = {
     newTask: "New project",
     projects: "Projects",
     newProject: "New project",
-    archiveAll: "Archive all chats",
     archiveProject: "Archive project",
-    organizeSidebar: "Organize sidebar",
-    sortBy: "Sort by",
-    groupByProject: "By project",
-    recentProjects: "Recent projects",
-    timeOrder: "By time",
-    moveDown: "Move down",
-    manualSort: "Manual",
-    createdTime: "Created",
-    recentUpdated: "Recently updated",
+    lightTheme: "Light theme",
+    darkTheme: "Dark theme",
+    switchToLightTheme: "Switch to light theme",
+    switchToDarkTheme: "Switch to dark theme",
     stateTree: "State tree",
     fullTree: "Full visual state tree",
     close: "Close",
     progress: "Progress",
-    iteration: "Round",
+    iteration: "Iteration",
     currentStage: "Current stage",
     reasoning: "Reasoning",
     approval: "Access",
@@ -518,6 +544,21 @@ function normalizeRemoteStageStatus(status: TaskStageDetail["status"]): StageRun
     return status;
   }
   return status === "retry" ? "revision_required" : "queued";
+}
+
+function invalidateStageRuns(stages: StageRun[], targetIndex: number, nextContext: TaskContext) {
+  return stages.map((stage, index) =>
+    index < targetIndex
+      ? stage
+      : {
+          ...stage,
+          status: index === targetIndex ? "retrying" as const : "queued" as const,
+          duration: "0.0s",
+          input: createStageInput(stage.id, nextContext),
+          output: null,
+          review: null,
+        },
+  );
 }
 
 function projectMessagesFromRemote(
@@ -639,17 +680,21 @@ function deriveProjectTitle(project: ProjectSession, messages: ThreadMessage[], 
   return project.title;
 }
 
+function getInitialTheme(): Theme {
+  if (typeof window === "undefined") return "light";
+  const saved = window.localStorage.getItem("eurekaloop-theme");
+  if (saved === "light" || saved === "dark") return saved;
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
 function App() {
   const [language, setLanguage] = useState<Language>("zh");
+  const [theme, setTheme] = useState<Theme>(getInitialTheme);
   const [page, setPage] = useState<PageId>("workbench");
   const [reasoning, setReasoning] = useState<ReasoningLevel>("ultra");
   const [approval, setApproval] = useState<ApprovalMode>("assist");
   const [memory, setMemory] = useState<MemoryLevel>("medium");
   const [openMenu, setOpenMenu] = useState<MenuId>(null);
-  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
-  const [projectSubmenu, setProjectSubmenu] = useState<ProjectMenuPanel>(null);
-  const [projectGroupMode, setProjectGroupMode] = useState<ProjectGroupMode>("project");
-  const [projectSortMode, setProjectSortMode] = useState<ProjectSortMode>("manual");
   const [projects, setProjects] = useState<ProjectSession[]>(() => [createProjectSession(1, "hybrid", "zh")]);
   const [activeProjectId, setActiveProjectId] = useState(() => projects[0].id);
   const [context, setContext] = useState<TaskContext>(() => projects[0].context);
@@ -691,16 +736,12 @@ function App() {
   const maxIterations = health?.max_iterations ?? 10;
   const readyAgentCount = health?.ready_agent_count ?? 0;
   const activeProject = projects.find((project) => project.id === activeProjectId) ?? projects[0];
-  const sortedProjects = useMemo(() => {
-    const list = [...projects];
-    if (projectSortMode === "created" || projectGroupMode === "time") {
-      list.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
-    }
-    if (projectSortMode === "updated" || projectGroupMode === "recent") {
-      list.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
-    }
-    return list;
-  }, [projectGroupMode, projectSortMode, projects]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.style.colorScheme = theme;
+    window.localStorage.setItem("eurekaloop-theme", theme);
+  }, [theme]);
 
   const refreshRuntimeData = useCallback(async () => {
     if (!hasSubmittedQuestion) return;
@@ -878,31 +919,7 @@ function App() {
     setActiveProjectId(nextProject.id);
     hydrateProject(nextProject);
     setPage("workbench");
-    setProjectMenuOpen(false);
-    setProjectSubmenu(null);
   }, [hydrateProject, language, projects.length, runMode, running]);
-
-  const archiveAllProjects = useCallback(async () => {
-    if (running) return;
-    setRuntimeError("");
-    try {
-      await Promise.all(
-        projects
-          .filter((project) => project.hasSubmittedQuestion)
-          .map((project) => archiveTask(project.context.task_id)),
-      );
-      const fresh = createProjectSession(1, runMode, language);
-      setProjects([fresh]);
-      setActiveProjectId(fresh.id);
-      hydrateProject(fresh);
-      setPage("workbench");
-    } catch (error) {
-      setRuntimeError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setProjectMenuOpen(false);
-      setProjectSubmenu(null);
-    }
-  }, [hydrateProject, language, projects, runMode, running]);
 
   const archiveProject = useCallback(async (projectId: string) => {
     if (running) return;
@@ -1327,7 +1344,8 @@ function App() {
       setFeedbackDrafts((current) => ({ ...current, [sourceMessageId]: "" }));
       setReviewStage(null);
       setPendingIndex(null);
-      updateStage(stage, { status: "retrying", review: createReviewRecord(stage, "retry") });
+      setActiveStage(stage);
+      setStages((current) => invalidateStageRuns(current, index, rerunContext));
       appendEvent(
         systemGenerated ? "stage_auto_revision_requested" : "stage_retry_requested",
         systemGenerated
@@ -1354,7 +1372,6 @@ function App() {
       reasoning,
       runMode,
       running,
-      updateStage,
       versions,
     ],
   );
@@ -1404,17 +1421,7 @@ function App() {
     setReviewStage(null);
     setPendingIndex(null);
     setActiveStage(targetStage);
-    setStages((current) =>
-      current.map((stage, index) =>
-        index < targetIndex
-          ? stage
-          : {
-              ...stage,
-              status: index === targetIndex ? "retrying" : "queued",
-              review: index === targetIndex ? createReviewRecord(targetStage, "retry") : null,
-            },
-      ),
-    );
+    setStages((current) => invalidateStageRuns(current, targetIndex, rerunContext));
     appendEvent(
       "project_feedback_submitted",
       `修改意见已发送至${stageLabel.zh[targetStage]}，不会创建新任务。`,
@@ -1452,10 +1459,23 @@ function App() {
 
   return (
     <div className="app-shell">
-      <aside className={`control-rail ${projectMenuOpen ? "menu-open" : ""}`}>
+      <aside className="control-rail">
         <div className="brand-row">
           <span className="brand-mark">
-            <Bot size={18} />
+            <img
+              alt=""
+              aria-hidden="true"
+              className="brand-logo-light"
+              draggable="false"
+              src="/brand/eurekaloop-logo-64.png"
+            />
+            <img
+              alt=""
+              aria-hidden="true"
+              className="brand-logo-dark"
+              draggable="false"
+              src="/brand/eurekaloop-logo-64-dark.png"
+            />
           </span>
           <div>
             <strong>{t.appName}</strong>
@@ -1466,20 +1486,10 @@ function App() {
         <ProjectPanel
           activeProjectId={activeProject.id}
           disabled={running}
-          groupMode={projectGroupMode}
-          language={language}
-          menuOpen={projectMenuOpen}
-          onArchiveAll={() => void archiveAllProjects()}
           onArchiveProject={(projectId) => void archiveProject(projectId)}
           onCreateProject={createNewProject}
-          onGroupModeChange={setProjectGroupMode}
-          onMenuOpenChange={setProjectMenuOpen}
           onSelectProject={selectProject}
-          onSortModeChange={setProjectSortMode}
-          onSubmenuChange={setProjectSubmenu}
-          projects={sortedProjects}
-          sortMode={projectSortMode}
-          submenu={projectSubmenu}
+          projects={projects}
           t={t}
         />
 
@@ -1499,6 +1509,16 @@ function App() {
           <button className="language-button" type="button" onClick={() => setLanguage(language === "zh" ? "en" : "zh")}>
             <Globe2 size={15} />
             {language === "zh" ? "EN" : "中文"}
+          </button>
+          <button
+            aria-label={theme === "dark" ? t.switchToLightTheme : t.switchToDarkTheme}
+            className="theme-button"
+            title={theme === "dark" ? t.switchToLightTheme : t.switchToDarkTheme}
+            type="button"
+            onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}
+          >
+            {theme === "dark" ? <Moon size={15} /> : <Sun size={15} />}
+            {theme === "dark" ? t.darkTheme : t.lightTheme}
           </button>
         </nav>
 
@@ -1535,13 +1555,15 @@ function App() {
           </div>
           <div className="meter-grid">
             <StatusMetric label={t.progress} value={`${progress}%`} />
-            <StatusMetric label={t.iteration} value={`R${context.iteration}/${maxIterations}`} />
+            <StatusMetric
+              label={t.iteration}
+              title={language === "zh"
+                ? "初始任务为第 1 轮；每次提交反馈并回退重跑时增加 1 轮。"
+                : "The initial task is iteration 1; each feedback-driven rerun adds one iteration."}
+              value={`${context.iteration}/${maxIterations}`}
+            />
           </div>
           {latestEvent ? <p className="latest-event">{latestEvent}</p> : null}
-          <button className="ghost-button" type="button" onClick={createNewProject}>
-            <FilePlus2 size={15} />
-            {t.newTask}
-          </button>
         </section>
       </aside>
 
@@ -1752,6 +1774,8 @@ function App() {
       {treeOpen ? (
         <StateTreeModal
           activeStage={activeStage}
+          context={context}
+          iteration={context.iteration}
           language={language}
           onClose={() => setTreeOpen(false)}
           onSelectStage={(stage) => {
@@ -1936,7 +1960,7 @@ function SystemPage({
 
       <div className="runtime-metrics">
         <StatusMetric label={zh ? "当前阶段" : "Current stage"} value={context.current_stage} />
-        <StatusMetric label={zh ? "迭代" : "Iteration"} value={`R${context.iteration}/${maxIterations}`} />
+        <StatusMetric label={zh ? "迭代轮次" : "Iteration"} value={`${context.iteration}/${maxIterations}`} />
         <StatusMetric label={zh ? "版本" : "Versions"} value={String(versions.length)} />
         <StatusMetric label={zh ? "事件" : "Events"} value={String(events.length)} />
       </div>
@@ -2074,6 +2098,21 @@ function previewValue(value: unknown) {
 }
 
 function MessageIndexRail({ language, messages }: { language: Language; messages: ThreadMessage[] }) {
+  const [preview, setPreview] = useState<MessageIndexPreview | null>(null);
+
+  const showPreview = (message: ThreadMessage, index: number, element: HTMLButtonElement) => {
+    const rect = element.getBoundingClientRect();
+    const width = Math.min(320, window.innerWidth - 32);
+    setPreview({
+      id: message.id,
+      index,
+      label: getMessageTitle(message, language),
+      preview: getMessageIndexPreview(message, language),
+      left: Math.min(rect.right + 12, window.innerWidth - width - 12),
+      top: Math.min(Math.max(rect.top - 18, 12), window.innerHeight - 118),
+    });
+  };
+
   return (
     <aside className="message-index" aria-label={language === "zh" ? "消息索引" : "Message index"}>
       <div className="index-stack">
@@ -2081,193 +2120,77 @@ function MessageIndexRail({ language, messages }: { language: Language; messages
           const label = getMessageTitle(message, language);
           return (
             <button
+              aria-describedby={preview?.id === message.id ? `message-index-preview-${message.id}` : undefined}
               aria-label={label}
               className={`index-tick ${message.kind} ${message.status ?? ""}`}
               key={message.id}
               type="button"
+              onBlur={() => setPreview(null)}
+              onFocus={(event) => showPreview(message, index, event.currentTarget)}
+              onMouseEnter={(event) => showPreview(message, index, event.currentTarget)}
+              onMouseLeave={() => setPreview(null)}
               onClick={() => document.getElementById(message.id)?.scrollIntoView({ behavior: "smooth", block: "center" })}
             >
-              <span />
-              <strong>{String(index + 1).padStart(2, "0")}</strong>
-              <em>{label}</em>
+              <span aria-hidden="true" />
             </button>
           );
         })}
       </div>
+      {preview && typeof document !== "undefined"
+        ? createPortal(
+            <div
+              className="message-index-preview"
+              id={`message-index-preview-${preview.id}`}
+              role="tooltip"
+              style={{ left: preview.left, top: preview.top }}
+            >
+              <div>
+                <b>{String(preview.index + 1).padStart(2, "0")}</b>
+                <strong>{preview.label}</strong>
+              </div>
+              <p>{preview.preview}</p>
+            </div>,
+            document.body,
+          )
+        : null}
     </aside>
   );
-}
-
-const projectMenuWidth = 244;
-const projectMenuGap = 8;
-const viewportMargin = 12;
-
-function clampMenuPosition(value: number, width: number) {
-  if (typeof window === "undefined") return value;
-  const max = Math.max(viewportMargin, window.innerWidth - width - viewportMargin);
-  return Math.min(Math.max(value, viewportMargin), max);
 }
 
 function ProjectPanel({
   activeProjectId,
   disabled,
-  groupMode,
-  menuOpen,
-  onArchiveAll,
   onArchiveProject,
   onCreateProject,
-  onGroupModeChange,
-  onMenuOpenChange,
   onSelectProject,
-  onSortModeChange,
-  onSubmenuChange,
   projects,
-  sortMode,
-  submenu,
   t,
 }: {
   activeProjectId: string;
   disabled: boolean;
-  groupMode: ProjectGroupMode;
-  language: Language;
-  menuOpen: boolean;
-  onArchiveAll: () => void;
   onArchiveProject: (projectId: string) => void;
   onCreateProject: () => void;
-  onGroupModeChange: (value: ProjectGroupMode) => void;
-  onMenuOpenChange: (value: boolean) => void;
   onSelectProject: (projectId: string) => void;
-  onSortModeChange: (value: ProjectSortMode) => void;
-  onSubmenuChange: (value: ProjectMenuPanel) => void;
   projects: ProjectSession[];
-  sortMode: ProjectSortMode;
-  submenu: ProjectMenuPanel;
   t: (typeof copy)[Language];
 }) {
-  const menuTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const [menuPosition, setMenuPosition] = useState({ left: 0, top: 0 });
-
-  useEffect(() => {
-    if (!menuOpen) return;
-
-    const updateMenuPosition = () => {
-      const triggerRect = menuTriggerRef.current?.getBoundingClientRect();
-      if (triggerRect) {
-        setMenuPosition({
-          left: clampMenuPosition(triggerRect.right - projectMenuWidth + 4, projectMenuWidth),
-          top: triggerRect.bottom + projectMenuGap,
-        });
-      }
-    };
-
-    updateMenuPosition();
-    window.addEventListener("resize", updateMenuPosition);
-    window.addEventListener("scroll", updateMenuPosition, true);
-    return () => {
-      window.removeEventListener("resize", updateMenuPosition);
-      window.removeEventListener("scroll", updateMenuPosition, true);
-    };
-  }, [menuOpen]);
-
-  const menuLayer =
-    menuOpen && typeof document !== "undefined"
-      ? createPortal(
-          <div className="project-menu" style={{ left: menuPosition.left, top: menuPosition.top }}>
-            <button type="button" onClick={onArchiveAll}>
-              <Archive size={16} />
-              <span>{t.archiveAll}</span>
-            </button>
-            <button
-              className={submenu === "sidebar" ? "hovered" : ""}
-              type="button"
-              onClick={() => onSubmenuChange(submenu === "sidebar" ? null : "sidebar")}
-            >
-              <PanelLeft size={16} />
-              <span>{t.organizeSidebar}</span>
-              <ChevronRight size={16} />
-            </button>
-            <button
-              className={submenu === "sort" ? "hovered" : ""}
-              type="button"
-              onClick={() => onSubmenuChange(submenu === "sort" ? null : "sort")}
-            >
-              <ListFilter size={16} />
-              <span>{t.sortBy}</span>
-              <ChevronRight size={16} />
-            </button>
-            {submenu === "sidebar" ? (
-              <div className="project-submenu sidebar-submenu">
-                <button type="button" onClick={() => onGroupModeChange("project")}>
-                  <MessageSquareText size={16} />
-                  <span>{t.groupByProject}</span>
-                  {groupMode === "project" ? <Check size={17} /> : null}
-                </button>
-                <button type="button" onClick={() => onGroupModeChange("recent")}>
-                  <Clock3 size={16} />
-                  <span>{t.recentProjects}</span>
-                  {groupMode === "recent" ? <Check size={17} /> : null}
-                </button>
-                <button type="button" onClick={() => onGroupModeChange("time")}>
-                  <Clock3 size={16} />
-                  <span>{t.timeOrder}</span>
-                  {groupMode === "time" ? <Check size={17} /> : null}
-                </button>
-                <button type="button" onClick={() => onGroupModeChange("movedown")}>
-                  <ArrowDown size={16} />
-                  <span>{t.moveDown}</span>
-                  {groupMode === "movedown" ? <Check size={17} /> : null}
-                </button>
-              </div>
-            ) : null}
-            {submenu === "sort" ? (
-              <div className="project-submenu sort-submenu">
-                <button type="button" onClick={() => onSortModeChange("manual")}>
-                  <GripVertical size={16} />
-                  <span>{t.manualSort}</span>
-                  {sortMode === "manual" ? <Check size={17} /> : null}
-                </button>
-                <button type="button" onClick={() => onSortModeChange("created")}>
-                  <PlusCircle size={16} />
-                  <span>{t.createdTime}</span>
-                  {sortMode === "created" ? <Check size={17} /> : null}
-                </button>
-                <button type="button" onClick={() => onSortModeChange("updated")}>
-                  <SlidersHorizontal size={16} />
-                  <span>{t.recentUpdated}</span>
-                  {sortMode === "updated" ? <Check size={17} /> : null}
-                </button>
-              </div>
-            ) : null}
-          </div>,
-          document.body,
-        )
-      : null;
-
   return (
     <section className="project-panel">
       <div className="project-titlebar">
-        <button className="project-title-button" type="button" onClick={() => onSubmenuChange(submenu === "root" ? null : "root")}>
-          <span>{t.projects}</span>
-          <ChevronDown size={15} />
-        </button>
+        <div className="project-title-label">{t.projects}</div>
         <div className="project-actions">
           <button
-            aria-label={t.organizeSidebar}
-            className={`icon-quiet ${menuOpen ? "active" : ""}`}
-            ref={menuTriggerRef}
+            aria-label={t.newProject}
+            className="icon-quiet"
+            disabled={disabled}
+            title={t.newTask}
             type="button"
-            onClick={() => {
-              onMenuOpenChange(!menuOpen);
-              onSubmenuChange(null);
-            }}
+            onClick={onCreateProject}
           >
-            <MoreHorizontal size={17} />
-          </button>
-          <button aria-label={t.newProject} className="icon-quiet" disabled={disabled} type="button" onClick={onCreateProject}>
             <FilePlus2 size={17} />
+            <span aria-hidden="true" className="icon-tooltip">{t.newTask}</span>
           </button>
         </div>
-        {menuLayer}
       </div>
 
       <div className="project-list">
@@ -2495,7 +2418,20 @@ function ThreadMessageCard({
 
   return (
     <article className={`thread-message ${message.kind}-message ${message.status ?? ""}`} id={message.id}>
-      <div className="message-avatar"><Bot size={17} /></div>
+      <div aria-hidden="true" className="message-avatar ai-message-avatar">
+        <img
+          alt=""
+          className="brand-logo-light"
+          draggable="false"
+          src="/brand/eurekaloop-logo-64.png"
+        />
+        <img
+          alt=""
+          className="brand-logo-dark"
+          draggable="false"
+          src="/brand/eurekaloop-logo-64-dark.png"
+        />
+      </div>
       <div className="message-bubble">
         <header>
           <div>
@@ -2766,9 +2702,9 @@ function BulletList({ label, values }: { label: string; values: unknown[] }) {
   );
 }
 
-function StatusMetric({ label, value }: { label: string; value: string }) {
+function StatusMetric({ label, title, value }: { label: string; title?: string; value: string }) {
   return (
-    <div className="status-metric">
+    <div className="status-metric" title={title}>
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
@@ -2792,9 +2728,14 @@ function percentPreview(value: unknown) {
   return score > 0 ? `${Math.round(score * 100)}%` : "--";
 }
 
-function getStageArtifactSummary(stage: StageRun, field: string, language: Language) {
+function getStageArtifactSummary(stage: Pick<StageRun, "output">, field: string, language: Language) {
   const payload = (stage.output?.payload ?? {}) as Record<string, unknown>;
   if (!stage.output) return language === "zh" ? "等待该模块输出后写入 task_context" : "Waiting for this module output";
+  if (stage.output.metadata.status === "failed") {
+    const reason = stage.output.self_review.issues[0]
+      ?? (language === "zh" ? "模块执行失败，未写入本阶段产物。" : "The module failed and did not write this artifact.");
+    return trimPreview(language === "zh" ? `本轮未写入：${reason}` : `Not written in this iteration: ${reason}`, 118);
+  }
 
   if (field === "question_card") {
     const card = payload.question_card as Record<string, unknown> | undefined;
@@ -2980,6 +2921,8 @@ function getStageExpansionNodes(stage: StageRun, language: Language): StateTreeD
 
 function StateTreeModal({
   activeStage,
+  context,
+  iteration,
   language,
   onClose,
   onSelectStage,
@@ -2987,6 +2930,8 @@ function StateTreeModal({
   t,
 }: {
   activeStage: StageId;
+  context: TaskContext;
+  iteration: number;
   language: Language;
   onClose: () => void;
   onSelectStage: (stage: StageId) => void;
@@ -2997,40 +2942,47 @@ function StateTreeModal({
   const treeLayout = useMemo(
     () => {
       const nextNodes: FlowNode[] = [];
+      const lanes: StateTreeLane[] = [];
       const layout = {
-        artifactHeight: 96,
-        artifactX: 270,
-        detailHeight: 104,
-        detailX: 520,
-        laneGap: 24,
-        minLaneHeight: 184,
-        rowGap: 118,
-        stageHeight: 110,
-        stageX: 24,
+        artifactHeight: 82,
+        artifactX: 302,
+        detailHeight: 88,
+        detailX: 558,
+        laneGap: 16,
+        minLaneHeight: 148,
+        rowGap: 100,
+        stageHeight: 96,
+        stageX: 42,
       };
-      let cursorY = 34;
+      let cursorY = 24;
       const getRowY = (laneTop: number, laneHeight: number, rowIndex: number, totalRows: number, nodeHeight: number) => {
         const blockHeight = Math.max(0, totalRows - 1) * layout.rowGap;
         return laneTop + laneHeight / 2 - blockHeight / 2 + rowIndex * layout.rowGap - nodeHeight / 2;
       };
 
-      stages.forEach((stage) => {
+      stages.forEach((stage, stageIndex) => {
         const artifacts = stageMeta[stage.id].allowedWrites;
-        const details = stage.output ? getStageExpansionNodes(stage, language) : [];
+        const details = stage.output && stage.output.metadata.status !== "failed"
+          ? getStageExpansionNodes(stage, language)
+          : [];
         const rowCount = Math.max(1, artifacts.length, details.length);
         const laneHeight = Math.max(
           layout.minLaneHeight,
-          (rowCount - 1) * layout.rowGap + Math.max(layout.artifactHeight, layout.detailHeight) + 42,
+          (rowCount - 1) * layout.rowGap + Math.max(layout.artifactHeight, layout.detailHeight) + 34,
         );
         const stageY = cursorY + laneHeight / 2 - layout.stageHeight / 2;
+        const outputIteration = stage.output?.metadata.iteration ?? iteration;
+        lanes.push({ height: laneHeight, id: stage.id, order: stageIndex + 1, status: stage.status, y: cursorY });
         nextNodes.push({
           id: stage.id,
           type: "flowNode",
           position: { x: layout.stageX, y: stageY },
           data: {
             active: selectedNodeId === stage.id,
+            iteration: outputIteration,
             kind: "stage",
             lang: language,
+            order: stageIndex + 1,
             stage: stage.id,
             status: stage.status,
             subtitle: stagePurpose[language][stage.id],
@@ -3047,12 +2999,13 @@ function StateTreeModal({
             data: {
               active: selectedNodeId === nodeId,
               artifactKey: field,
+              iteration: outputIteration,
               kind: "artifact",
               lang: language,
               stage: stage.id,
               status: stage.status,
               subtitle: getStageArtifactSummary(stage, field, language),
-              title: field,
+              title: artifactLabel[language][field] ?? field,
             },
           });
         });
@@ -3067,6 +3020,7 @@ function StateTreeModal({
               active: selectedNodeId === nodeId,
               artifactKey: node.sourceArtifact,
               detailId: node.id,
+              iteration: outputIteration,
               kind: "detail",
               lang: language,
               stage: stage.id,
@@ -3079,9 +3033,9 @@ function StateTreeModal({
 
         cursorY += laneHeight + layout.laneGap;
       });
-      return { canvasHeight: cursorY + 28, nodes: nextNodes };
+      return { canvasHeight: cursorY + 16, lanes, nodes: nextNodes };
     },
-    [language, selectedNodeId, stages],
+    [iteration, language, selectedNodeId, stages],
   );
   const nodes = treeLayout.nodes;
 
@@ -3094,7 +3048,7 @@ function StateTreeModal({
         target: stageOrder[index + 1],
         targetHandle: "top",
         animated: stages[index].status === "running" || stages[index].status === "validating",
-        className: stages[index].status === "passed" ? "flow-edge-passed vertical-flow-edge" : "flow-edge vertical-flow-edge",
+        className: stages[index].status === "passed" ? "flow-edge-passed sequence-flow-edge" : "flow-edge sequence-flow-edge",
         type: "smoothstep",
       }));
       const branchEdges = stages.flatMap((stage) => {
@@ -3105,17 +3059,17 @@ function StateTreeModal({
           target: `${stage.id}:artifact:${field}`,
           targetHandle: "left",
           animated: stage.status === "running" || stage.status === "validating",
-          className: stage.status === "passed" ? "flow-edge-passed branch-flow-edge" : "flow-edge branch-flow-edge",
+          className: stage.status === "passed" ? "flow-edge-passed artifact-flow-edge" : "flow-edge artifact-flow-edge",
           type: "smoothstep",
         }));
-        const expansionEdges = stage.output
+        const expansionEdges = stage.output && stage.output.metadata.status !== "failed"
           ? getStageExpansionNodes(stage, language).map((node) => ({
               id: `${stage.id}:expansion:${node.id}`,
               source: `${stage.id}:artifact:${node.sourceArtifact}`,
               sourceHandle: "right",
               target: `${stage.id}:detail:${node.id}`,
               targetHandle: "left",
-              className: "flow-edge branch-flow-edge faint-flow-edge",
+              className: "flow-edge detail-flow-edge",
               type: "smoothstep",
             }))
           : [];
@@ -3129,6 +3083,7 @@ function StateTreeModal({
   const selectedNode = nodes.find((node) => node.id === selectedNodeId) ?? nodes.find((node) => node.id === activeStage) ?? nodes[0];
   const selectedStage = stages.find((stage) => stage.id === selectedNode?.data.stage) ?? stages[0];
   const selectedPayload = (selectedStage.output?.payload ?? {}) as Record<string, unknown>;
+  const contextArtifacts = context as unknown as Record<string, unknown>;
   const inspectorData = selectedNode?.data.kind === "stage"
     ? {
         input: selectedStage.input,
@@ -3137,6 +3092,7 @@ function StateTreeModal({
       }
     : selectedNode?.data.artifactKey
       ? selectedPayload[selectedNode.data.artifactKey]
+        ?? contextArtifacts[selectedNode.data.artifactKey]
         ?? (selectedNode.data.artifactKey === "reviews" ? selectedStage.review : null)
         ?? selectedStage.output
       : selectedStage.output;
@@ -3149,14 +3105,28 @@ function StateTreeModal({
             <p>{t.stateTree}</p>
             <h2>{t.fullTree}</h2>
           </div>
-          <button className="close-button" type="button" onClick={onClose}>
-            <X size={18} />
-            {t.close}
-          </button>
+          <div className="tree-title-actions">
+            <span>{language === "zh" ? `第 ${iteration} 轮` : `Iteration ${iteration}`}</span>
+            <button className="close-button" type="button" onClick={onClose}>
+              <X size={18} />
+              {t.close}
+            </button>
+          </div>
         </div>
         <div className="tree-body">
           <div className="tree-canvas-scroll">
             <div className="tree-canvas" style={{ height: treeLayout.canvasHeight }}>
+            <div className="tree-lane-bands" aria-hidden="true">
+              {treeLayout.lanes.map((lane) => (
+                <div
+                  className={`tree-lane-band ${lane.status}`}
+                  key={lane.id}
+                  style={{ height: lane.height, top: lane.y }}
+                >
+                  <span>{String(lane.order).padStart(2, "0")}</span>
+                </div>
+              ))}
+            </div>
             <ReactFlow
               edges={edges}
               defaultViewport={{ x: 0, y: 0, zoom: 1 }}
@@ -3171,20 +3141,21 @@ function StateTreeModal({
                 onSelectStage(stage);
               }}
               panOnDrag={false}
+              preventScrolling={false}
               proOptions={{ hideAttribution: true }}
               zoomOnDoubleClick={false}
               zoomOnPinch={false}
               zoomOnScroll={false}
-            >
-              <Background color="#d8dee7" gap={22} size={1} />
-            </ReactFlow>
+            />
             </div>
           </div>
           <aside className="tree-inspector">
             <div className="tree-inspector-heading">
               <span>{selectedNode?.data.kind === "stage" ? (language === "zh" ? "阶段详情" : "Stage details") : language === "zh" ? "节点详情" : "Node details"}</span>
               <strong>{selectedNode?.data.title ?? stageLabel[language][selectedStage.id]}</strong>
-              <small>{stageLabel[language][selectedStage.id]} · {statusLabel[language][selectedStage.status]}</small>
+              <small>
+                {stageLabel[language][selectedStage.id]} · {statusLabel[language][selectedStage.status]} · R{selectedNode?.data.iteration ?? iteration}
+              </small>
             </div>
             <p>{selectedNode?.data.subtitle ?? stagePurpose[language][selectedStage.id]}</p>
             <div className="tree-inspector-meta">
@@ -3200,13 +3171,23 @@ function StateTreeModal({
 }
 
 function FlowNodeCard({ data }: NodeProps<FlowNode>) {
-  const { active, kind, lang, status, subtitle, title } = data;
+  const { active, iteration, kind, lang, order, status, subtitle, title } = data;
   return (
-    <button className={`flow-node ${kind} ${status ?? "queued"} ${active ? "active" : ""}`} type="button">
+    <button
+      aria-label={`${title} · ${status ? statusLabel[lang][status] : kind}`}
+      className={`flow-node ${kind} ${status ?? "queued"} ${active ? "active" : ""}`}
+      type="button"
+    >
       {kind === "stage" ? <Handle className="node-handle node-handle-top" id="top" position={Position.Top} type="target" /> : null}
       {kind !== "stage" ? <Handle className="node-handle node-handle-left" id="left" position={Position.Left} type="target" /> : null}
-      <span>{status ? statusLabel[lang][status] : kind}</span>
-      <strong>{title}</strong>
+      <div className="flow-node-meta">
+        <span>{status ? statusLabel[lang][status] : kind}</span>
+        {iteration ? <em>R{iteration}</em> : null}
+      </div>
+      <div className="flow-node-title">
+        {order ? <b>{String(order).padStart(2, "0")}</b> : null}
+        <strong title={title}>{title}</strong>
+      </div>
       <small>{subtitle}</small>
       {kind !== "detail" ? <Handle className="node-handle node-handle-right" id="right" position={Position.Right} type="source" /> : null}
       {kind === "stage" ? <Handle className="node-handle node-handle-bottom" id="bottom" position={Position.Bottom} type="source" /> : null}
@@ -3273,6 +3254,23 @@ function getMessageTitle(message: ThreadMessage, language: Language) {
     return stageLabel[language].final_review;
   }
   return language === "zh" ? `${stageLabel.zh[message.stage]} Agent 输出` : `${stageLabel.en[message.stage]} Agent output`;
+}
+
+function getMessageIndexPreview(message: ThreadMessage, language: Language) {
+  if (message.body) return trimPreview(message.body, 160);
+  if (message.response?.metadata.status === "failed") {
+    return trimPreview(
+      message.response.self_review.issues[0]
+        ?? (language === "zh" ? "该模块执行失败，点击跳转后查看错误详情。" : "This module failed. Open the message for details."),
+      160,
+    );
+  }
+  if (message.stage && message.response) {
+    const primaryArtifact = stageMeta[message.stage].allowedWrites[0];
+    return getStageArtifactSummary({ output: message.response }, primaryArtifact, language);
+  }
+  if (message.stage) return stagePurpose[language][message.stage];
+  return language === "zh" ? "总控调度消息" : "Controller routing message";
 }
 
 function formatTime(value: string) {
