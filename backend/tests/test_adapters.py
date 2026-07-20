@@ -252,11 +252,67 @@ class AdapterContractTests(unittest.TestCase):
     def test_evidence_mapping_agent_accepts_unified_context(self) -> None:
         settings = Settings.from_env()
         module = _load_package(settings.evidence_agent_root / "src", "evidence_mapping")
-        response = module.EvidenceMappingAgent().run_dict(
-            evidence_mapping_request(self.downstream_context())
-        )
+        with patch.dict(os.environ, {"EVIDENCE_MAPPING_MODE": "rules"}):
+            response = module.EvidenceMappingAgent().run_dict(
+                evidence_mapping_request(self.downstream_context())
+            )
         self.assertEqual(response["metadata"]["stage"], "evidence_mapping")
         self.assertEqual(response["payload"]["evidence_map"][0]["hypothesis_id"], "hyp_001")
+
+    def test_evidence_mapping_adapter_uses_llm_in_auto_mode(self) -> None:
+        settings = Settings.from_env()
+        llm_module = _load_package(
+            settings.evidence_agent_root / "src", "evidence_mapping.llm"
+        )
+        llm_output = {
+            "bindings": [
+                {
+                    "evidence_id": "ev_001",
+                    "support_direction": "support",
+                    "binding_type": "direct_support",
+                    "prediction_index": 0,
+                    "directness": 0.9,
+                    "reliability": 0.85,
+                    "sufficiency": 0.75,
+                    "applicability": 0.8,
+                    "total_score": 8.2,
+                    "recheck_note": "LLM contract test",
+                    "limitations": [],
+                }
+            ],
+            "evidence_summary": {
+                "support": "The evidence supports the hypothesis.",
+                "oppose": "No opposing evidence was found.",
+                "uncertain": "No uncertain evidence was found.",
+            },
+            "gaps": [
+                {
+                    "gap_code": "why_no_oppose",
+                    "description": "Confirm that contradictory evidence was searched.",
+                    "suggested_evidence_type": "null_result",
+                }
+            ],
+            "evidence_strength_score": 0.75,
+            "main_limitations": [],
+        }
+        with patch.dict(
+            os.environ,
+            {"DASHSCOPE_API_KEY": "test-key", "EVIDENCE_MAPPING_MODE": "auto"},
+        ), patch.object(
+            llm_module.QwenCompatibleClient,
+            "generate_json",
+            autospec=True,
+            return_value=llm_output,
+        ) as generate_json:
+            response = AgentRegistry(settings).run(
+                "evidence_mapping", self.downstream_context()
+            )
+
+        generate_json.assert_called_once()
+        self.assertEqual(response["metadata"]["status"], "success")
+        self.assertEqual(
+            response["self_review"]["dimension_scores"]["scoring_backend_llm"], 1.0
+        )
 
     def test_planning_dify_output_reports_unknown_traceability_ids(self) -> None:
         class FakeDifyClient:
@@ -319,7 +375,10 @@ class AdapterContractTests(unittest.TestCase):
                 return {"plan": {"problem_statement": "测试研究问题"}}
 
         context = self.downstream_context()
-        evidence_response = AgentRegistry(Settings.from_env()).run("evidence_mapping", context)
+        with patch.dict(os.environ, {"EVIDENCE_MAPPING_MODE": "rules"}):
+            evidence_response = AgentRegistry(Settings.from_env()).run(
+                "evidence_mapping", context
+            )
         context["evidence_map"] = evidence_response["payload"]["evidence_map"]
         service = _load_package(Settings.from_env().planning_agent_root, "planning_agent.service")
         client = FakeDifyClient()

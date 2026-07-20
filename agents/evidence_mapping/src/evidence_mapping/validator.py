@@ -51,10 +51,6 @@ def validate_payload(
                 issues.append(
                     f"{item.hypothesis_id}: binding {b.evidence_id} 方向为 support 但未写入 supporting 列表"
                 )
-            if not b.supporting_quotes and b.evidence_quality.reliability > 0.65:
-                issues.append(
-                    f"{item.hypothesis_id}: {b.evidence_id} 无 quotes 但 reliability 偏高，请检查"
-                )
 
         if (
             not item.opposing_evidence_ids

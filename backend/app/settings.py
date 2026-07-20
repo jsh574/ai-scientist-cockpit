@@ -88,6 +88,18 @@ class Settings:
         dashscope_credential = bool(os.getenv("DASHSCOPE_API_KEY"))
         qwen_credential = bool(os.getenv("DASHSCOPE_API_KEY") or os.getenv("QWEN_API_KEY"))
         dify_credential = bool(os.getenv("DIFY_API_URL") and os.getenv("DIFY_API_KEY"))
+        evidence_mapping_mode = os.getenv("EVIDENCE_MAPPING_MODE", "auto").strip().lower()
+        if evidence_mapping_mode not in {"auto", "llm", "rules"}:
+            evidence_mapping_mode = "auto"
+        evidence_mapping_status_mode = {
+            "rules": "rule_engine",
+            "llm": "model",
+            "auto": (
+                "llm_with_rule_fallback"
+                if any_credential
+                else "rule_engine_fallback"
+            ),
+        }[evidence_mapping_mode]
 
         def status(
             path: Path,
@@ -125,7 +137,9 @@ class Settings:
             ),
             "evidence_mapping": status(
                 self.evidence_agent_root / "src" / "evidence_mapping",
-                mode="rule_engine",
+                credential_required=evidence_mapping_mode == "llm",
+                credential_configured=any_credential,
+                mode=evidence_mapping_status_mode,
             ),
             "research_planning": status(
                 self.planning_agent_root,

@@ -7,4 +7,4 @@ from .agent import EvidenceMappingAgent
 from .models import AgentResponse, EvidenceMapPayload
 
 __all__ = ["EvidenceMappingAgent", "AgentResponse", "EvidenceMapPayload"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

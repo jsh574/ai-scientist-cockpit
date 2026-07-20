@@ -1,10 +1,14 @@
-"""四维证据质量评分与方向重判。
+"""四维证据质量评分与方向重判（规则引擎兜底，领域无关）。
 
 权重（数据规范 8.5）：
 - 直接性 30%
 - 可靠性 25%
 - 充分性 25%
 - 适用性 20%
+
+说明：生产路径优先走 LLM（见 llm_review.py）；本模块在无 API Key /
+强制 rules 模式 / LLM 失败时作为 fallback。关键词表仅保留跨领域通用极性词，
+不含特定病例示例用语。
 """
 
 from __future__ import annotations
@@ -48,21 +52,24 @@ OPPOSE_HINTS = (
     "no evidence",
     "consequence rather",
     "rather than a cause",
+    "refute",
+    "falsif",
 )
 
-# 注意：不要用过短词（如“支持”单独）以免命中“不支持”
 SUPPORT_HINTS = (
     "研究结果支持",
     "证据支持",
     "证实了",
     "表明了",
     "显著促进",
+    "显著提高",
+    "显著降低",
     "可减缓",
     "associated with",
     "indicate that",
     "supports the",
-    "reduced tau",
-    "promote tau",
+    "consistent with",
+    "demonstrated that",
     "加速",
     "减缓",
 )
@@ -76,6 +83,21 @@ CAUSAL_WEAK = (
     "observational",
 )
 
+# 过泛变量：过短或常见占位词，筛选候选时降权（非领域绑定）
+GENERIC_VARIABLE_STOP = {
+    "effect",
+    "outcome",
+    "result",
+    "disease",
+    "患者",
+    "结果",
+    "效应",
+    "影响",
+    "研究",
+    "data",
+    "analysis",
+}
+
 
 def split_predictions(hypothesis: HypothesisCard) -> list[str]:
     if hypothesis.predictions:
@@ -86,6 +108,21 @@ def split_predictions(hypothesis: HypothesisCard) -> list[str]:
     parts = re.split(r"[；;。\n]+", text)
     parts = [p.strip(" ，,") for p in parts if p.strip()]
     return parts or [hypothesis.statement]
+
+
+def specific_target_variables(hypothesis: HypothesisCard) -> list[str]:
+    """过滤过泛变量，保留更有区分度的目标变量。"""
+    out: list[str] = []
+    for v in hypothesis.target_variables:
+        key = v.strip()
+        if not key:
+            continue
+        if key.lower() in GENERIC_VARIABLE_STOP or key in GENERIC_VARIABLE_STOP:
+            continue
+        if len(key) <= 1:
+            continue
+        out.append(key)
+    return out or list(hypothesis.target_variables)
 
 
 def _tokens(text: str) -> set[str]:
@@ -108,7 +145,6 @@ def _tokens(text: str) -> set[str]:
 def _overlap_score(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
-    # 短概念直接子串命中
     al, bl = a.lower(), b.lower()
     if len(b) <= 12 and b.lower() in al:
         return 1.0
@@ -150,15 +186,15 @@ def recheck_direction(
 
     oppose_hit = _hit_any(text, OPPOSE_HINTS)
     support_hit = _hit_any(text, SUPPORT_HINTS)
-    # 若同时命中“不支持”类，优先反对
-    if _hit_any(text, ("不支持", "反对", "rather than a cause", "consequence rather")):
+    if _hit_any(text, ("不支持", "反对", "rather than a cause", "consequence rather", "refute")):
         oppose_hit = True
         support_hit = False
 
     var_overlap = 0.0
-    if hypothesis.target_variables:
+    vars_ = specific_target_variables(hypothesis)
+    if vars_:
         var_overlap = max(
-            (_overlap_score(evidence.claim, v) for v in hypothesis.target_variables),
+            (_overlap_score(evidence.claim, v) for v in vars_),
             default=0.0,
         )
         var_overlap = max(
@@ -166,7 +202,7 @@ def recheck_direction(
             max(
                 (
                     _overlap_score(" ".join(evidence.related_concepts), v)
-                    for v in hypothesis.target_variables
+                    for v in vars_
                 ),
                 default=0.0,
             ),
@@ -198,7 +234,6 @@ def recheck_direction(
         )
         return SupportDirection.SUPPORT, btype, "文本含支持信号，独立改判为 support"
 
-    # 无明确极性：按主题相关程度给 uncertain / support(弱)
     if topical >= 0.22:
         if _hit_any(text, CAUSAL_WEAK) or _hit_any(
             text, ("缺少", "不足", "有限", "limited", "unclear")
@@ -228,7 +263,6 @@ def score_quality(
     binding_type: BindingType,
     pred_score: float,
 ) -> EvidenceQuality:
-    # 直接性
     if binding_type in (BindingType.DIRECT_SUPPORT, BindingType.DIRECT_OPPOSE):
         directness = 0.85 + 0.15 * min(pred_score, 1.0)
     elif binding_type in (BindingType.INDIRECT_SUPPORT, BindingType.INDIRECT_OPPOSE):
@@ -238,15 +272,11 @@ def score_quality(
     else:
         directness = 0.1
 
-    # 可靠性
-    reliability = 0.4
-    if evidence.quotes:
-        reliability += 0.25
-    else:
-        reliability -= 0.15  # 无 quotes 降权
+    # 上游模块 2 当前不产出 quotes，可靠性不按 quotes 奖惩，改看文献可追溯性/类型/样本量
+    reliability = 0.5
     if literature:
         if literature.doi or literature.url:
-            reliability += 0.15
+            reliability += 0.2
         if literature.literature_type in {"meta_analysis", "rct", "systematic_review"}:
             reliability += 0.15
         elif literature.literature_type in {"review", "cohort"}:
@@ -257,24 +287,47 @@ def score_quality(
             reliability += 0.1
         elif evidence.sample_size >= 100:
             reliability += 0.05
+    if evidence.method_note or evidence.claim:
+        reliability += 0.1
     reliability = min(max(reliability, 0.0), 1.0)
-    if not evidence.quotes:
-        reliability = min(reliability, 0.65)
 
-    # 充分性：单条证据本身给中等分，后续由集合层面再调
     sufficiency = 0.45 + 0.2 * evidence.confidence
     if evidence.method_note:
         sufficiency += 0.1
     sufficiency = min(sufficiency, 1.0)
 
-    # 适用性
-    applicability = 0.5
+    # 领域无关适用性：人源/临床 vs 动物/体外，不做国家/病例偏好
+    applicability = 0.55
     if evidence.population_or_model:
-        # 简单启发：含中国/亚洲/人源更贴合示例场景
         pm = evidence.population_or_model.lower()
-        if any(k in pm for k in ("中国", "china", "asian", "human", "患者", "cohort")):
+        if any(
+            k in pm
+            for k in (
+                "human",
+                "patient",
+                "cohort",
+                "clinical",
+                "患者",
+                "临床",
+                "队列",
+                "participant",
+            )
+        ):
             applicability = 0.75
-        elif any(k in pm for k in ("mouse", "mice", "鼠", "cell", "细胞", "体外")):
+        elif any(
+            k in pm
+            for k in (
+                "mouse",
+                "mice",
+                "rat",
+                "鼠",
+                "cell",
+                "细胞",
+                "体外",
+                "in vitro",
+                "organoid",
+            )
+        ):
             applicability = 0.45
         else:
             applicability = 0.55
@@ -305,13 +358,20 @@ def aggregate_strength(
     """综合 strength：支持加分、反对减分、不确定弱影响。"""
     if not bindings:
         return 0.0
-    score = 0.5
+    score = 0.55
+    support_n = 0
+    oppose_n = 0
     for direction, quality in bindings:
         w = quality.total_score / 10.0
         if direction == SupportDirection.SUPPORT:
-            score += 0.18 * w
+            score += 0.22 * w
+            support_n += 1
         elif direction == SupportDirection.OPPOSE:
-            score -= 0.20 * w
+            score -= 0.18 * w
+            oppose_n += 1
         elif direction == SupportDirection.UNCERTAIN:
-            score -= 0.05 * w
+            score -= 0.03 * w
+    # 有支持、反对不多时给温和下限，避免「已绑定仍只有 0.3x」
+    if support_n >= 1 and oppose_n <= support_n:
+        score = max(score, 0.42 + 0.04 * min(support_n, 3))
     return round(min(max(score, 0.0), 1.0), 3)

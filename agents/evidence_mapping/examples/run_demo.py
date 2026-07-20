@@ -24,6 +24,13 @@ def main() -> None:
         json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
+    backend = out["self_review"]["dimension_scores"].get("scoring_backend_llm", 0)
+    mode = "llm" if backend >= 1.0 else "rules(fallback or no-key)"
+    print(f"=== scoring mode: {mode} (config={agent.scoring_mode}) ===")
+    print(
+        "提示：配置 DASHSCOPE_API_KEY / QWEN_API_KEY / LLM_API_KEY 后默认走 LLM；"
+        "也可设 EVIDENCE_MAPPING_MODE=rules 强制规则兜底。"
+    )
     print("=== metadata ===")
     print(json.dumps(out["metadata"], ensure_ascii=False, indent=2))
     print("\n=== self_review ===")

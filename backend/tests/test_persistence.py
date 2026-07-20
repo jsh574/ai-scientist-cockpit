@@ -227,7 +227,12 @@ class PersistenceTests(unittest.TestCase):
 
         with patch.dict(
             os.environ,
-            {"DASHSCOPE_API_KEY": "", "QWEN_API_KEY": "", "LLM_API_KEY": ""},
+            {
+                "DASHSCOPE_API_KEY": "",
+                "QWEN_API_KEY": "",
+                "LLM_API_KEY": "",
+                "EVIDENCE_MAPPING_MODE": "auto",
+            },
         ):
             status = settings.source_status()
 
@@ -236,6 +241,32 @@ class PersistenceTests(unittest.TestCase):
         self.assertFalse(status["knowledge_integration"]["ready"])
         self.assertFalse(status["hypothesis_generation"]["ready"])
         self.assertTrue(status["evidence_mapping"]["ready"])
+        self.assertFalse(status["evidence_mapping"]["credential_configured"])
+        self.assertEqual(
+            status["evidence_mapping"]["mode"], "rule_engine_fallback"
+        )
+
+        with patch.dict(
+            os.environ,
+            {"DASHSCOPE_API_KEY": "test-key", "EVIDENCE_MAPPING_MODE": "auto"},
+        ):
+            auto_status = settings.source_status()["evidence_mapping"]
+        self.assertTrue(auto_status["ready"])
+        self.assertEqual(auto_status["mode"], "llm_with_rule_fallback")
+
+        with patch.dict(
+            os.environ,
+            {
+                "DASHSCOPE_API_KEY": "",
+                "QWEN_API_KEY": "",
+                "LLM_API_KEY": "",
+                "EVIDENCE_MAPPING_MODE": "llm",
+            },
+        ):
+            llm_status = settings.source_status()["evidence_mapping"]
+        self.assertFalse(llm_status["ready"])
+        self.assertTrue(llm_status["credential_required"])
+        self.assertEqual(llm_status["mode"], "model")
 
 
 if __name__ == "__main__":
