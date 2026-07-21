@@ -1,11 +1,14 @@
 {
-  "protocol_version": "1.0",
+  "protocol_version": "1.1",
   "response_schema": "../schemas/agent_response.schema.json",
   "agents": [
     {
       "agent_id": "question_understanding_agent",
       "stage": "question_understanding",
       "entrypoint": "problem_understanding.problem_understanding.agent:ProblemUnderstandingAgent",
+      "schema_version": "node_spec_v1",
+      "interruptible": false,
+      "retry_policy": {"max_attempts": 1, "backoff_seconds": 0, "retry_on": ["review_gate_retry"]},
       "reads": ["task_id", "iteration", "user_input"],
       "writes": ["question_card"]
     },
@@ -13,6 +16,9 @@
       "agent_id": "knowledge_integration_agent",
       "stage": "knowledge_integration",
       "entrypoint": "knowledge_integration.knowledge_integration_agent:KnowledgeIntegrationAgent",
+      "schema_version": "node_spec_v1",
+      "interruptible": false,
+      "retry_policy": {"max_attempts": 1, "backoff_seconds": 0, "retry_on": ["review_gate_retry"]},
       "reads": ["task_id", "iteration", "question_card", "user_input"],
       "writes": ["literature_cards", "evidence_cards", "knowledge_gaps"]
     },
@@ -20,6 +26,9 @@
       "agent_id": "hypothesis_generation_agent",
       "stage": "hypothesis_generation",
       "entrypoint": "hypothesis_generation.hypothesis_generation_agent:HypothesisGenerationAgent",
+      "schema_version": "node_spec_v1",
+      "interruptible": false,
+      "retry_policy": {"max_attempts": 1, "backoff_seconds": 0, "retry_on": ["review_gate_retry"]},
       "reads": ["task_id", "iteration", "question_card", "evidence_cards", "knowledge_gaps", "user_input"],
       "writes": ["hypothesis_cards"]
     },
@@ -27,6 +36,9 @@
       "agent_id": "evidence_mapping_agent",
       "stage": "evidence_mapping",
       "entrypoint": "evidence_mapping.src.evidence_mapping:EvidenceMappingAgent",
+      "schema_version": "node_spec_v1",
+      "interruptible": false,
+      "retry_policy": {"max_attempts": 1, "backoff_seconds": 0, "retry_on": ["review_gate_retry"]},
       "reads": ["task_id", "iteration", "hypothesis_cards", "evidence_cards", "literature_cards"],
       "writes": ["evidence_map"]
     },
@@ -34,6 +46,9 @@
       "agent_id": "research_planning_agent",
       "stage": "research_planning",
       "entrypoint": "planning.planning_agent.service:run_planning_agent",
+      "schema_version": "node_spec_v1",
+      "interruptible": false,
+      "retry_policy": {"max_attempts": 1, "backoff_seconds": 0, "retry_on": ["review_gate_retry"]},
       "reads": ["task_id", "iteration", "question_card", "hypothesis_cards", "evidence_map", "evidence_cards", "literature_cards", "knowledge_gaps", "user_input"],
       "writes": ["research_plan"]
     }

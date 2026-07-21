@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -61,6 +62,19 @@ class ArtifactService:
         return path
 
     @staticmethod
+    def _replace_with_retry(source: str, destination: Path) -> None:
+        delay = 0.02
+        for attempt in range(8):
+            try:
+                os.replace(source, destination)
+                return
+            except PermissionError:
+                if attempt == 7:
+                    raise
+                time.sleep(delay)
+                delay *= 2
+
+    @staticmethod
     def _atomic_write(path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -69,7 +83,7 @@ class ArtifactService:
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_name, path)
+            ArtifactService._replace_with_retry(temp_name, path)
         finally:
             if os.path.exists(temp_name):
                 os.unlink(temp_name)
@@ -83,7 +97,7 @@ class ArtifactService:
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_name, path)
+            ArtifactService._replace_with_retry(temp_name, path)
         finally:
             if os.path.exists(temp_name):
                 os.unlink(temp_name)
@@ -299,6 +313,149 @@ class ArtifactService:
         path = self.write_json(task_id, f"reviews/{stage}.i{iteration:03d}.review.json", value)
         self.write_json(task_id, f"reviews/{stage}.latest.review.json", value)
         return path
+
+    def begin_node_run(
+        self,
+        task_id: str,
+        stage: str,
+        iteration: int,
+        stage_input: dict[str, Any],
+    ) -> str:
+        self.validate_id(stage, "stage")
+        node_run_id = f"node_{uuid4().hex[:12]}"
+        manifest = self.read_json(task_id, "manifest.json")
+        self.write_json(
+            task_id,
+            f"stages/{stage}/runs/{node_run_id}/metadata.json",
+            {
+                "schema_version": "node_run_v1",
+                "node_run_id": node_run_id,
+                "workflow_run_id": manifest.get("active_run_id"),
+                "task_id": task_id,
+                "node_id": stage,
+                "stage": stage,
+                "iteration": iteration,
+                "status": "running",
+                "started_at": utc_now(),
+                "finished_at": None,
+            },
+        )
+        self.write_json(
+            task_id,
+            f"stages/{stage}/runs/{node_run_id}/input.json",
+            stage_input,
+        )
+        return node_run_id
+
+    def finish_node_run(
+        self,
+        task_id: str,
+        stage: str,
+        node_run_id: str,
+        *,
+        status: str,
+        output: dict[str, Any] | None = None,
+        review: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        self.validate_id(stage, "stage")
+        self.validate_id(node_run_id, "node_run_id")
+        metadata_path = f"stages/{stage}/runs/{node_run_id}/metadata.json"
+        metadata = self.read_json(task_id, metadata_path)
+        metadata.update(
+            status=status,
+            error=error,
+            finished_at=utc_now(),
+        )
+        self.write_json(task_id, metadata_path, metadata)
+        if output is not None:
+            self.write_json(
+                task_id,
+                f"stages/{stage}/runs/{node_run_id}/output.json",
+                output,
+            )
+        if review is not None:
+            self.write_json(
+                task_id,
+                f"stages/{stage}/runs/{node_run_id}/review.json",
+                review,
+            )
+        return metadata
+
+    def list_node_runs(self, task_id: str, stage: str) -> list[dict[str, Any]]:
+        self.validate_id(stage, "stage")
+        root = self._resolve(task_id, f"stages/{stage}/runs")
+        if not root.is_dir():
+            return []
+        records: list[dict[str, Any]] = []
+        for path in root.glob("node_*/metadata.json"):
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                records.append(value)
+        return sorted(
+            records,
+            key=lambda item: str(item.get("started_at") or ""),
+            reverse=True,
+        )
+
+    def get_node_run(
+        self, task_id: str, stage: str, node_run_id: str
+    ) -> dict[str, Any]:
+        self.validate_id(stage, "stage")
+        self.validate_id(node_run_id, "node_run_id")
+        base = f"stages/{stage}/runs/{node_run_id}"
+        result = {
+            "metadata": self.read_json(task_id, f"{base}/metadata.json"),
+            "input": self.read_json(task_id, f"{base}/input.json"),
+            "output": None,
+            "review": None,
+        }
+        for key in ("output", "review"):
+            path = self._resolve(task_id, f"{base}/{key}.json")
+            if path.is_file():
+                result[key] = json.loads(path.read_text(encoding="utf-8"))
+        return result
+
+    def list_stage_history(
+        self, task_id: str, stages: tuple[str, ...] | list[str]
+    ) -> list[dict[str, Any]]:
+        stage_order = {stage: index for index, stage in enumerate(stages)}
+        history: list[dict[str, Any]] = []
+        for stage in stages:
+            seen_iterations: set[int] = set()
+            for metadata in self.list_node_runs(task_id, stage):
+                iteration = int(metadata.get("iteration") or 1)
+                if iteration in seen_iterations:
+                    continue
+                detail = self.get_node_run(
+                    task_id, stage, str(metadata["node_run_id"])
+                )
+                if detail.get("output") is None:
+                    continue
+                seen_iterations.add(iteration)
+                history.append(detail)
+        return sorted(
+            history,
+            key=lambda item: (
+                int((item.get("metadata") or {}).get("iteration") or 1),
+                stage_order.get(str((item.get("metadata") or {}).get("stage")), 999),
+            ),
+        )
+
+    def node_run_diff(
+        self, task_id: str, stage: str, left: str, right: str
+    ) -> dict[str, Any]:
+        left_value = self.get_node_run(task_id, stage, left).get("output") or {}
+        right_value = self.get_node_run(task_id, stage, right).get("output") or {}
+        left_flat = self._flatten(left_value)
+        right_flat = self._flatten(right_value)
+        keys = sorted(set(left_flat) | set(right_flat))
+        changes = [
+            {"path": key, "before": left_flat.get(key), "after": right_flat.get(key)}
+            for key in keys
+            if left_flat.get(key) != right_flat.get(key)
+        ]
+        return {"left": left, "right": right, "change_count": len(changes), "changes": changes}
 
     def latest_stage_output(self, task_id: str, stage: str) -> dict[str, Any]:
         value = self.read_json(task_id, f"stages/{stage}/latest.output.json")

@@ -4,9 +4,11 @@ import json
 import os
 import re
 import sys
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Any
 
 from planning_agent.env import ensure_dotenv_loaded
@@ -35,6 +37,7 @@ class DifyWorkflowClient:
         response_mode: str | None = None,
         event_handler: StreamEventHandler | None = None,
         show_progress: bool | None = None,
+        cancellation_checker: Callable[[], None] | None = None,
     ) -> None:
         ensure_dotenv_loaded()
         self.api_url = (api_url or os.getenv("DIFY_API_URL", "")).rstrip("/")
@@ -44,6 +47,7 @@ class DifyWorkflowClient:
         self.response_mode = response_mode or os.getenv("DIFY_RESPONSE_MODE", "blocking")
         progress_enabled = _env_bool("DIFY_SHOW_PROGRESS", False) if show_progress is None else show_progress
         self.event_handler = event_handler or (_StreamProgressPrinter() if progress_enabled else None)
+        self.cancellation_checker = cancellation_checker
 
     @property
     def configured(self) -> bool:
@@ -72,9 +76,12 @@ class DifyWorkflowClient:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 if self.response_mode == "streaming":
-                    response_data = _read_streaming_response(response, self.event_handler)
+                    response_data = _read_streaming_response(
+                        response, self.event_handler, self.cancellation_checker
+                    )
                 else:
-                    raw = response.read().decode("utf-8")
+                    with _cancellation_watch(response, self.cancellation_checker):
+                        raw = response.read().decode("utf-8")
                     response_data = _parse_response_json(raw)
         except urllib.error.HTTPError as exc:
             detail = _http_error_detail(exc)
@@ -91,28 +98,66 @@ class DifyWorkflowClient:
 
 
 def _read_streaming_response(
-    response: Any, event_handler: StreamEventHandler | None = None
+    response: Any,
+    event_handler: StreamEventHandler | None = None,
+    cancellation_checker: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     last_event: dict[str, Any] | None = None
-    for raw_line in response:
-        line = raw_line.decode("utf-8", errors="replace").strip()
-        if not line or not line.startswith("data:"):
-            continue
-        data_text = line.removeprefix("data:").strip()
-        if data_text == "[DONE]":
-            break
-        try:
-            event = json.loads(data_text)
-        except json.JSONDecodeError:
-            continue
-        last_event = event
-        if event_handler:
-            event_handler(event)
-        if event.get("event") in {"workflow_finished", "workflow_failed"}:
-            return event
+    with _cancellation_watch(response, cancellation_checker):
+        for raw_line in response:
+            if cancellation_checker:
+                cancellation_checker()
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line or not line.startswith("data:"):
+                continue
+            data_text = line.removeprefix("data:").strip()
+            if data_text == "[DONE]":
+                break
+            try:
+                event = json.loads(data_text)
+            except json.JSONDecodeError:
+                continue
+            last_event = event
+            if event_handler:
+                event_handler(event)
+            if event.get("event") in {"workflow_finished", "workflow_failed"}:
+                return event
     if last_event:
         return last_event
     raise DifyWorkflowError("Dify streaming response ended without workflow result.")
+
+
+@contextmanager
+def _cancellation_watch(
+    response: Any, cancellation_checker: Callable[[], None] | None
+):
+    if cancellation_checker is None:
+        yield
+        return
+    stopped = threading.Event()
+    cancelled = threading.Event()
+
+    def watch() -> None:
+        while not stopped.wait(0.1):
+            try:
+                cancellation_checker()
+            except BaseException:
+                cancelled.set()
+                try:
+                    response.close()
+                except Exception:
+                    pass
+                return
+
+    thread = threading.Thread(target=watch, name="dify-cancel-watch", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        thread.join(timeout=0.3)
+        if cancelled.is_set():
+            cancellation_checker()
 
 
 def _parse_response_json(raw: str) -> dict[str, Any]:

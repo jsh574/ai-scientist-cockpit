@@ -8,10 +8,40 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 RunMode = Literal["auto", "manual", "hybrid"]
 AgentStatus = Literal["success", "partial_success", "failed"]
 ReviewDecision = Literal["accept", "human_review", "retry", "rollback", "fail"]
+NodeEventKind = Literal[
+    "queued",
+    "started",
+    "progress",
+    "partial_output",
+    "final_output",
+    "review",
+    "pause_requested",
+    "paused",
+    "resumed",
+    "cancel_requested",
+    "cancelled",
+    "completed",
+    "human_review",
+    "retry",
+    "interrupted",
+    "failed",
+]
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+class ModelPolicy(BaseModel):
+    provider: str = "dashscope"
+    model: str = "qwen3.7-max"
+    reasoning: Literal["low", "medium", "high", "ultra"] = "high"
+    temperature: float = Field(default=0.2, ge=0, le=2)
+    max_tokens: int = Field(default=6144, ge=256, le=131072)
+    timeout_seconds: float = Field(default=120, gt=0, le=3600)
+    max_retries: int = Field(default=0, ge=0, le=10)
+    response_format: Literal["json_object", "text"] = "json_object"
+    thinking_enabled: bool = False
 
 
 class AgentMetadata(BaseModel):
@@ -71,6 +101,7 @@ class TaskCreateRequest(BaseModel):
     mode: RunMode = "auto"
     original_question: str = Field(min_length=3, max_length=10_000)
     user_constraints: dict[str, Any] = Field(default_factory=dict)
+    model_policy: ModelPolicy | None = None
 
     @field_validator("task_id")
     @classmethod
@@ -109,6 +140,52 @@ class FeedbackRequest(BaseModel):
 
 class TaskArchiveRequest(BaseModel):
     archived: bool = True
+
+
+class WorkflowStartRequest(BaseModel):
+    start_stage: str = "question_understanding"
+    feedback: str | None = Field(default=None, max_length=20_000)
+
+
+class RunInstructionRequest(BaseModel):
+    comment: str = Field(min_length=1, max_length=20_000)
+    target_stage: str | None = None
+    action: Literal["append", "pause_modify"] = "append"
+
+
+class ControllerRouteRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=20_000)
+    execute: bool = True
+
+
+class PlanEvaluationRequest(BaseModel):
+    user_score: int = Field(ge=1, le=5)
+    comment: str = Field(min_length=1, max_length=20_000)
+    problem_type: str | None = None
+    execute: bool = True
+
+
+class NodeExecuteRequest(BaseModel):
+    mode: Literal["only", "to", "from"] = "only"
+    input_override: dict[str, Any] = Field(default_factory=dict)
+    feedback: str | None = Field(default=None, max_length=20_000)
+    validate_only: bool = False
+
+
+class NodeEvent(BaseModel):
+    schema_version: Literal["node_event_v1"] = "node_event_v1"
+    event_id: str
+    task_id: str
+    run_id: str
+    node_id: str
+    stage: str | None = None
+    sequence: int = Field(ge=1)
+    kind: NodeEventKind
+    message: str
+    progress: float | None = Field(default=None, ge=0, le=1)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    operation: Literal["append", "replace"] = "append"
+    created_at: str = Field(default_factory=utc_now)
 
 
 class TaskEvent(BaseModel):

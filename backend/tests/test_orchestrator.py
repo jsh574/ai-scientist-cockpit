@@ -4,9 +4,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from backend.app.agent_protocol import AGENT_SPECS
+from backend.app.agent_protocol import AGENT_SPECS, STAGE_ORDER
 from backend.app.artifact_service import ArtifactError, ArtifactService
 from backend.app.contracts import HumanReviewRequest, TaskCreateRequest
+from backend.app.controller_assistant import ControllerAssistant
 from backend.app.orchestrator import Orchestrator
 from backend.app.review_gate import ReviewGate
 
@@ -143,7 +144,12 @@ class OrchestratorTests(unittest.TestCase):
         latest = self.artifacts.load_context(context["task_id"])
         self.assertEqual(latest["current_stage"], "completed")
         self.assertEqual(len(latest["versions"]), 6)
-        self.assertTrue(latest["final_review"]["passed"])
+        self.assertFalse(latest["final_review"]["passed"])
+        self.assertLess(latest["final_review"]["overall_score"], 0.78)
+        self.assertEqual(
+            set(latest["final_review"]["dimension_scores"]),
+            set(ControllerAssistant.review_weights),
+        )
         self.assertGreaterEqual(len(self.artifacts.read_events(context["task_id"])), 13)
         artifact_paths = {
             item["path"] for item in self.artifacts.list_artifacts(context["task_id"])
@@ -165,6 +171,30 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(accepted["status"], "passed")
         self.assertIsNotNone(accepted["task_context"]["question_card"])
 
+    def test_final_review_is_persisted_before_human_review(self) -> None:
+        context = self.create()
+        for stage in AGENT_SPECS:
+            if stage == "final_review":
+                break
+            result = self.orchestrator.run_stage(context["task_id"], stage)
+            self.assertEqual(result["status"], "passed")
+
+        latest = self.artifacts.load_context(context["task_id"])
+        latest["mode"] = "hybrid"
+        self.artifacts.save_context(context["task_id"], latest)
+
+        result = self.orchestrator.run_stage(context["task_id"], "final_review")
+        persisted = self.artifacts.load_context(context["task_id"])
+
+        self.assertEqual(result["status"], "human_review")
+        self.assertEqual(persisted["current_stage"], "human_review")
+        self.assertIsNotNone(persisted["final_review"])
+        self.assertLess(persisted["final_review"]["overall_score"], 0.78)
+        self.assertIn(
+            "final_review",
+            self.artifacts.latest_stage_output(context["task_id"], "final_review")["payload"],
+        )
+
     def test_feedback_creates_new_iteration_and_version(self) -> None:
         context = self.create()
         self.orchestrator.run_from(context["task_id"])
@@ -178,6 +208,31 @@ class OrchestratorTests(unittest.TestCase):
         latest = self.artifacts.load_context(context["task_id"])
         self.assertEqual(len(latest["feedback_events"]), 1)
         self.assertGreaterEqual(len(latest["versions"]), 8)
+
+    def test_stage_history_keeps_one_output_per_iteration(self) -> None:
+        context = self.create()
+        self.orchestrator.run_from(context["task_id"])
+        self.orchestrator.apply_feedback(
+            context["task_id"],
+            "research_planning",
+            "Tighten the experiment design.",
+            rerun_downstream=False,
+        )
+        self.orchestrator.run_from(context["task_id"], "research_planning")
+
+        history = self.artifacts.list_stage_history(
+            context["task_id"], list(STAGE_ORDER)
+        )
+        identities = [
+            (item["metadata"]["iteration"], item["metadata"]["stage"])
+            for item in history
+        ]
+
+        self.assertEqual(len(identities), len(set(identities)))
+        self.assertIn((1, "research_planning"), identities)
+        self.assertIn((2, "research_planning"), identities)
+        self.assertIn((1, "final_review"), identities)
+        self.assertIn((2, "final_review"), identities)
 
     def test_operator_can_continue_after_quality_gate_retry(self) -> None:
         self.orchestrator.registry = BorderlineHypothesisRegistry()
@@ -220,6 +275,104 @@ class OrchestratorTests(unittest.TestCase):
         diff = self.artifacts.version_diff(context["task_id"], left, second["version_id"])
         self.assertGreater(diff["change_count"], 0)
         self.assertIn("iteration", {item["path"] for item in diff["changes"]})
+
+    def test_node_run_history_preserves_input_output_and_review(self) -> None:
+        context = self.create()
+        result = self.orchestrator.run_stage(
+            context["task_id"], "question_understanding"
+        )
+
+        runs = self.artifacts.list_node_runs(
+            context["task_id"], "question_understanding"
+        )
+        self.assertEqual(len(runs), 1)
+        detail = self.artifacts.get_node_run(
+            context["task_id"],
+            "question_understanding",
+            result["node_run_id"],
+        )
+        self.assertEqual(detail["metadata"]["status"], "passed")
+        self.assertEqual(detail["input"]["task_id"], context["task_id"])
+        self.assertIsNotNone(detail["output"])
+        self.assertIsNotNone(detail["review"])
+
+    def test_namespaced_agent_extensions_survive_context_merge(self) -> None:
+        from backend.app.agent_protocol import get_agent_spec, merge_payload, slice_context
+
+        context = self.create()
+        spec = get_agent_spec("question_understanding")
+        merged = merge_payload(
+            context,
+            spec,
+            {
+                "question_card": {"core_question": "test"},
+                "extensions": {"diagnostic_trace": "trace-1"},
+            },
+        )
+
+        self.assertEqual(
+            merged["extensions"][spec.agent_id]["diagnostic_trace"], "trace-1"
+        )
+        sliced = slice_context(merged, spec)
+        self.assertEqual(sliced["extensions"]["diagnostic_trace"], "trace-1")
+
+    def test_operator_override_is_audited_without_replacing_source_context(self) -> None:
+        context = self.create()
+        original = context["user_input"]
+        override = {
+            "user_input": {
+                **original,
+                "original_question": "Operator override question",
+            }
+        }
+        result = self.orchestrator.run_stage(
+            context["task_id"],
+            "question_understanding",
+            input_override=override,
+        )
+        detail = self.artifacts.get_node_run(
+            context["task_id"],
+            "question_understanding",
+            result["node_run_id"],
+        )
+        stored_context = self.artifacts.load_context(context["task_id"])
+
+        self.assertEqual(
+            detail["input"]["user_input"]["original_question"],
+            "Operator override question",
+        )
+        self.assertEqual(
+            stored_context["user_input"]["original_question"],
+            original["original_question"],
+        )
+        overrides = [
+            artifact
+            for artifact in self.artifacts.list_artifacts(context["task_id"])
+            if artifact["path"].startswith("operator_overrides/")
+        ]
+        self.assertEqual(len(overrides), 1)
+
+    def test_node_run_diff_compares_persisted_outputs(self) -> None:
+        context = self.create()
+        first = self.artifacts.begin_node_run(
+            context["task_id"], "question_understanding", 1, {"value": 1}
+        )
+        second = self.artifacts.begin_node_run(
+            context["task_id"], "question_understanding", 1, {"value": 2}
+        )
+        self.artifacts.finish_node_run(
+            context["task_id"], "question_understanding", first,
+            status="passed", output={"payload": {"score": 1}},
+        )
+        self.artifacts.finish_node_run(
+            context["task_id"], "question_understanding", second,
+            status="passed", output={"payload": {"score": 2}},
+        )
+        diff = self.artifacts.node_run_diff(
+            context["task_id"], "question_understanding", first, second
+        )
+        self.assertEqual(diff["change_count"], 1)
+        self.assertEqual(diff["changes"][0]["path"], "payload.score")
 
 
 if __name__ == "__main__":

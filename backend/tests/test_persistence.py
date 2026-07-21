@@ -268,6 +268,26 @@ class PersistenceTests(unittest.TestCase):
         self.assertTrue(llm_status["credential_required"])
         self.assertEqual(llm_status["mode"], "model")
 
+    def test_atomic_write_retries_transient_windows_permission_error(self) -> None:
+        destination = self.root / "atomic-retry.json"
+        real_replace = os.replace
+        attempts = {"count": 0}
+
+        def flaky_replace(source, target):
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise PermissionError(5, "Access is denied", str(target))
+            real_replace(source, target)
+
+        with patch(
+            "backend.app.artifact_service.os.replace",
+            side_effect=flaky_replace,
+        ):
+            ArtifactService._atomic_write(destination, '{"ok": true}\n')
+
+        self.assertEqual(attempts["count"], 3)
+        self.assertEqual(destination.read_text(encoding="utf-8"), '{"ok": true}\n')
+
 
 if __name__ == "__main__":
     unittest.main()

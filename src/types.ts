@@ -259,9 +259,13 @@ export interface ResearchPlan {
 export interface FinalReview {
   passed: boolean;
   overall_score: number;
+  dimension_scores?: Record<string, number>;
   strengths: string[];
   weaknesses: string[];
+  suggestions?: string[];
+  agents_to_rerun?: StageId[];
   revision_required: boolean;
+  review_source?: "controller_agent" | "rubric_fallback";
 }
 
 export interface VersionRecord {
@@ -312,6 +316,21 @@ export interface TaskContext {
   reviews: ReviewRecord[];
   versions: VersionRecord[];
   feedback_events: FeedbackEvent[];
+  extensions?: Record<string, Record<string, unknown>>;
+  model_policy?: {
+    provider: string;
+    model: string;
+    reasoning: "low" | "medium" | "high" | "ultra";
+    temperature: number;
+    max_tokens: number;
+    timeout_seconds: number;
+    max_retries: number;
+    response_format: "json_object" | "text";
+    thinking_enabled: boolean;
+  };
+  plan_evaluations?: Array<Record<string, unknown>>;
+  iteration_plans?: Array<Record<string, unknown>>;
+  controller_routes?: Array<Record<string, unknown>>;
 }
 
 export interface AgentResponse<TPayload = Record<string, unknown>> {
@@ -381,6 +400,17 @@ export interface EventLog {
   type: string;
   stage?: StageId | "final_review" | "feedback_revision";
   message: string;
+  data?: {
+    schema_version?: "node_event_v1";
+    run_id?: string;
+    node_id?: string;
+    sequence?: number;
+    kind?: string;
+    progress?: number | null;
+    payload?: Record<string, unknown>;
+    operation?: "append" | "replace";
+    [key: string]: unknown;
+  };
   created_at: string;
 }
 

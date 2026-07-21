@@ -10,7 +10,7 @@ import type {
 } from "./types";
 
 const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
-const useRealAgents = import.meta.env.VITE_ENABLE_REAL_AGENTS !== "false";
+export const usesRealAgents = import.meta.env.VITE_ENABLE_REAL_AGENTS !== "false";
 
 export interface HealthStatus {
   status: "ok" | "degraded";
@@ -37,6 +37,11 @@ export interface HealthStatus {
     max_retries: number;
     thinking_enabled: boolean;
     knowledge_max_attempts: number;
+  };
+  model_policy?: {
+    supported_fields: string[];
+    dify_supported_fields: string[];
+    dify_unsupported_fields: string[];
   };
   mcp: { server: string; transport: string };
 }
@@ -78,6 +83,109 @@ export interface RemoteAttachment {
   created_at: string;
 }
 
+export type WorkflowRunStatus =
+  | "queued"
+  | "running"
+  | "pausing"
+  | "paused"
+  | "cancelling"
+  | "cancelled"
+  | "human_review"
+  | "retry"
+  | "interrupted"
+  | "failed"
+  | "completed";
+
+export interface WorkflowRun {
+  schema_version: "workflow_run_v1";
+  run_id: string;
+  task_id: string;
+  iteration_id: number;
+  status: WorkflowRunStatus;
+  start_stage: StageId;
+  current_node: string;
+  current_stage: StageId;
+  cancel_requested: boolean;
+  pause_requested: boolean;
+  sequence: number;
+  node_results: Array<{
+    node_id: string;
+    stage: StageId;
+    status: string;
+    completed_at: string;
+  }>;
+  pending_instructions: Array<{
+    instruction_id: string;
+    comment: string;
+    target_stage: StageId | null;
+    action: "append" | "pause_modify";
+    status: string;
+    created_at: string;
+  }>;
+  error: string | null;
+  created_at: string;
+  started_at: string | null;
+  updated_at: string;
+  finished_at: string | null;
+}
+
+export interface NodeRunSummary {
+  schema_version: "node_run_v1";
+  node_run_id: string;
+  workflow_run_id: string | null;
+  task_id: string;
+  node_id: StageId;
+  stage: StageId;
+  iteration: number;
+  status: string;
+  error?: string | null;
+  started_at: string;
+  finished_at: string | null;
+}
+
+export interface NodeRunDetail {
+  metadata: NodeRunSummary;
+  input: Record<string, unknown>;
+  output: AgentResponse | null;
+  review: ReviewRecord | null;
+}
+
+export interface TaskStageHistoryEntry extends TaskStageDetail {
+  iteration: number;
+  node_run_id: string;
+  started_at: string;
+  finished_at: string | null;
+}
+
+export interface NodeValidation {
+  task_id: string;
+  node_id: StageId;
+  valid: boolean;
+  missing_fields: string[];
+  input: Record<string, unknown>;
+  would_invalidate: string[];
+}
+
+export interface ControllerRoute {
+  schema_version: "controller_route_v1";
+  intent: "explain" | "modify" | "rerun_agent" | "compare_versions" | "retrieve_more" | "cancel" | "status_query";
+  target_stage: StageId | null;
+  reason: string;
+  optimized_instruction: string;
+  answer: string;
+}
+
+export interface IterationPlan {
+  schema_version: "iteration_plan_v1";
+  problem_type: string;
+  agents_to_rerun: StageId[];
+  artifacts_to_keep: string[];
+  artifacts_to_invalidate: string[];
+  instructions_by_agent: Partial<Record<StageId, string>>;
+  must_regenerate_plan: boolean;
+  reason: string;
+}
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${apiBaseUrl}${path}`, init);
   const body = await response.json().catch(() => null);
@@ -111,7 +219,7 @@ function failedResponse(stage: StageId, context: TaskContext, error: unknown): A
 }
 
 export async function createTask(context: TaskContext): Promise<TaskContext> {
-  if (!useRealAgents) return context;
+  if (!usesRealAgents) return context;
   const result = await requestJson<{ task_id: string; task_context: TaskContext }>("/api/tasks", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -119,6 +227,7 @@ export async function createTask(context: TaskContext): Promise<TaskContext> {
       mode: context.mode,
       original_question: context.user_input.original_question,
       user_constraints: context.user_input.user_constraints,
+      model_policy: context.model_policy,
     }),
   });
   return result.task_context;
@@ -149,6 +258,175 @@ export async function fetchTaskEvents(taskId: string): Promise<EventLog[]> {
     `/api/tasks/${encodeURIComponent(taskId)}/events`,
   );
   return result.events;
+}
+
+export async function fetchTaskStageHistory(taskId: string): Promise<TaskStageHistoryEntry[]> {
+  const result = await requestJson<{ history: TaskStageHistoryEntry[] }>(
+    `/api/tasks/${encodeURIComponent(taskId)}/stage-history`,
+  );
+  return result.history;
+}
+
+export async function startWorkflowRun(
+  taskId: string,
+  startStage: StageId = "question_understanding",
+  feedback?: string,
+): Promise<WorkflowRun> {
+  const result = await requestJson<{ task_id: string; run: WorkflowRun }>(
+    `/api/tasks/${encodeURIComponent(taskId)}/start`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ start_stage: startStage, feedback }),
+    },
+  );
+  return result.run;
+}
+
+export async function fetchWorkflowRun(runId: string): Promise<WorkflowRun> {
+  return requestJson(`/api/runs/${encodeURIComponent(runId)}`);
+}
+
+export async function fetchTaskRuns(taskId: string): Promise<WorkflowRun[]> {
+  const result = await requestJson<{ task_id: string; runs: WorkflowRun[] }>(
+    `/api/tasks/${encodeURIComponent(taskId)}/runs`,
+  );
+  return result.runs;
+}
+
+export async function fetchNodeRuns(taskId: string, nodeId: StageId): Promise<NodeRunSummary[]> {
+  const result = await requestJson<{ runs: NodeRunSummary[] }>(
+    `/api/tasks/${encodeURIComponent(taskId)}/nodes/${encodeURIComponent(nodeId)}/runs`,
+  );
+  return result.runs;
+}
+
+export async function fetchNodeRun(
+  taskId: string,
+  nodeId: StageId,
+  nodeRunId: string,
+): Promise<NodeRunDetail> {
+  return requestJson(
+    `/api/tasks/${encodeURIComponent(taskId)}/nodes/${encodeURIComponent(nodeId)}/runs/${encodeURIComponent(nodeRunId)}`,
+  );
+}
+
+export async function validateNodeInput(taskId: string, nodeId: StageId): Promise<NodeValidation> {
+  return requestJson(
+    `/api/tasks/${encodeURIComponent(taskId)}/nodes/${encodeURIComponent(nodeId)}/validate`,
+    { method: "POST" },
+  );
+}
+
+export async function executeNode(
+  taskId: string,
+  nodeId: StageId,
+  mode: "only" | "to" | "from",
+  inputOverride: Record<string, unknown>,
+): Promise<{ run?: WorkflowRun; result?: StageExecutionResult }> {
+  return requestJson(
+    `/api/tasks/${encodeURIComponent(taskId)}/nodes/${encodeURIComponent(nodeId)}/execute`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode, input_override: inputOverride }),
+    },
+  );
+}
+
+export async function fetchNodeRunDiff(
+  taskId: string,
+  nodeId: StageId,
+  left: string,
+  right: string,
+): Promise<VersionDiffResult> {
+  const query = new URLSearchParams({ left, right });
+  return requestJson(
+    `/api/tasks/${encodeURIComponent(taskId)}/nodes/${encodeURIComponent(nodeId)}/runs-diff?${query}`,
+  );
+}
+
+async function controlWorkflowRun(
+  runId: string,
+  action: "pause" | "resume" | "cancel",
+): Promise<WorkflowRun> {
+  return requestJson(`/api/runs/${encodeURIComponent(runId)}/${action}`, {
+    method: "POST",
+  });
+}
+
+export const pauseWorkflowRun = (runId: string) => controlWorkflowRun(runId, "pause");
+export const resumeWorkflowRun = (runId: string) => controlWorkflowRun(runId, "resume");
+export const cancelWorkflowRun = (runId: string) => controlWorkflowRun(runId, "cancel");
+
+export async function queueRunInstruction(
+  runId: string,
+  comment: string,
+  targetStage?: StageId,
+  action: "append" | "pause_modify" = "append",
+): Promise<WorkflowRun> {
+  return requestJson(`/api/runs/${encodeURIComponent(runId)}/instructions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ comment, target_stage: targetStage, action }),
+  });
+}
+
+export async function routeControllerMessage(
+  taskId: string,
+  message: string,
+  execute = true,
+): Promise<{ route: ControllerRoute; task_context: TaskContext; run: WorkflowRun | null }> {
+  return requestJson<{ route: ControllerRoute; task_context: TaskContext; run: WorkflowRun | null }>(
+    `/api/tasks/${encodeURIComponent(taskId)}/controller/route`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message, execute }),
+    },
+  );
+}
+
+export async function evaluateResearchPlan(
+  taskId: string,
+  userScore: number,
+  comment: string,
+): Promise<{ iteration_plan: IterationPlan; task_context: TaskContext; run: WorkflowRun | null }> {
+  return requestJson(`/api/tasks/${encodeURIComponent(taskId)}/plan-evaluations`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_score: userScore, comment, execute: true }),
+  });
+}
+
+export async function finishTaskIteration(taskId: string): Promise<TaskContext> {
+  const result = await requestJson<{ task_id: string; task_context: TaskContext }>(
+    `/api/tasks/${encodeURIComponent(taskId)}/iterations/finish`,
+    { method: "POST" },
+  );
+  return result.task_context;
+}
+
+export function subscribeTaskEvents(
+  taskId: string,
+  onEvent: (event: EventLog) => void,
+  onConnectionChange?: (connected: boolean) => void,
+  after = 0,
+): () => void {
+  const query = new URLSearchParams({ follow: "true", after: String(after) });
+  const source = new EventSource(
+    `${apiBaseUrl}/api/tasks/${encodeURIComponent(taskId)}/events/stream?${query}`,
+  );
+  source.onopen = () => onConnectionChange?.(true);
+  source.onmessage = (message) => {
+    try {
+      onEvent(JSON.parse(message.data) as EventLog);
+    } catch {
+      return;
+    }
+  };
+  source.onerror = () => onConnectionChange?.(false);
+  return () => source.close();
 }
 
 export async function archiveTask(taskId: string, archived = true): Promise<TaskManifest> {
@@ -187,7 +465,7 @@ export async function executeStage(
   context: TaskContext,
   feedback?: string,
 ): Promise<StageExecutionResult> {
-  if (!useRealAgents) {
+  if (!usesRealAgents) {
     return {
       task_id: context.task_id,
       stage,
@@ -223,7 +501,7 @@ export async function submitHumanReview(
   decision: "accept" | "retry" | "rollback",
   comment: string,
 ): Promise<{ status: string; review?: ReviewRecord; task_context?: TaskContext }> {
-  if (!useRealAgents) return { status: decision === "accept" ? "passed" : decision };
+  if (!usesRealAgents) return { status: decision === "accept" ? "passed" : decision };
   return requestJson(`/api/tasks/${encodeURIComponent(taskId)}/reviews`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -241,7 +519,7 @@ export async function recordFeedback(
     memoryLevel: TaskContext["user_input"]["user_constraints"]["memory_level"];
   },
 ): Promise<TaskContext | null> {
-  if (!useRealAgents) return null;
+  if (!usesRealAgents) return null;
   const result = await requestJson<{ task_context: TaskContext }>(
     `/api/tasks/${encodeURIComponent(taskId)}/feedback`,
     {

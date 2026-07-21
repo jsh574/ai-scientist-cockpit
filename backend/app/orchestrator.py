@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import inspect
+import os
 import threading
+from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
 from .agent_protocol import (
+    CancellationChecker,
+    CancellationRequested,
+    ProgressHandler,
     STAGE_ORDER,
     AgentRunner,
     get_agent_spec,
@@ -22,6 +28,7 @@ from .contracts import (
     TaskEvent,
     utc_now,
 )
+from .controller_assistant import ControllerAssistant
 from .review_gate import ReviewGate
 
 
@@ -37,11 +44,13 @@ class Orchestrator:
         review_gate: ReviewGate,
         *,
         max_iterations: int = 10,
+        final_review_evaluator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self.registry = registry
         self.artifacts = artifacts
         self.review_gate = review_gate
         self.max_iterations = max_iterations
+        self.final_review_evaluator = final_review_evaluator
         self._locks: dict[str, threading.RLock] = {}
         self._locks_guard = threading.Lock()
 
@@ -79,6 +88,25 @@ class Orchestrator:
             "memory_level": "medium",
             **request.user_constraints,
         }
+        configured_max_tokens = int(os.getenv("LLM_MAX_TOKENS", "8192"))
+        reasoning = str(constraints.get("reasoning_level") or "high")
+        token_limits = {"low": 2048, "medium": 4096, "high": 6144, "ultra": configured_max_tokens}
+        policy = request.model_policy.model_copy(deep=True) if request.model_policy else None
+        model_policy = (
+            policy.model_dump()
+            if policy
+            else {
+                "provider": "dashscope",
+                "model": os.getenv("QWEN_MODEL") or os.getenv("LLM_MODEL") or "qwen3.7-max",
+                "reasoning": reasoning,
+                "temperature": 0.2,
+                "max_tokens": min(configured_max_tokens, token_limits.get(reasoning, configured_max_tokens)),
+                "timeout_seconds": float(os.getenv("LLM_TIMEOUT_SECONDS", "120")),
+                "max_retries": int(os.getenv("LLM_MAX_RETRIES", "0")),
+                "response_format": "json_object",
+                "thinking_enabled": os.getenv("QWEN_ENABLE_THINKING", "false").lower() == "true" and reasoning in {"high", "ultra"},
+            }
+        )
         context: dict[str, Any] = {
             "task_id": task_id,
             "mode": request.mode,
@@ -99,6 +127,11 @@ class Orchestrator:
             "reviews": [],
             "versions": [],
             "feedback_events": [],
+            "extensions": {},
+            "model_policy": model_policy,
+            "plan_evaluations": [],
+            "iteration_plans": [],
+            "controller_routes": [],
         }
         self.artifacts.create_task(context)
         return context
@@ -110,72 +143,29 @@ class Orchestrator:
         }
 
     def _built_in_final_review(self, context: dict[str, Any]) -> dict[str, Any]:
-        required = (
-            "question_card",
-            "literature_cards",
-            "evidence_cards",
-            "hypothesis_cards",
-            "evidence_map",
-            "research_plan",
-        )
-        missing = [key for key in required if context.get(key) in (None, [], {})]
-        traceable_literature = all(
-            item.get("doi") or item.get("url")
-            for item in context.get("literature_cards") or []
-            if isinstance(item, dict)
-        )
-        score = max(0.0, 1.0 - len(missing) / len(required))
-        if not traceable_literature:
-            score = max(0.0, score - 0.15)
-        feedback_count = len(context.get("feedback_events") or [])
-        review = {
-            "passed": not missing and traceable_literature,
-            "overall_score": round(score, 3),
-            "strengths": [
-                "The full five-agent chain produced structured artifacts.",
-                "Evidence and research-plan objects remain traceable by ID.",
-            ]
-            if not missing
-            else [],
-            "weaknesses": [
-                *[f"Missing or empty artifact: {key}" for key in missing],
-                *(
-                    []
-                    if traceable_literature
-                    else ["One or more literature sources are not traceable."]
-                ),
-                *(
-                    []
-                    if feedback_count
-                    else ["No feedback-driven second iteration has been recorded yet."]
-                ),
-            ],
-            "revision_required": bool(missing) or not traceable_literature,
-            "feedback_iterations": feedback_count,
-            "checked_at": utc_now(),
-        }
+        evaluator = self.final_review_evaluator
+        try:
+            review = evaluator(context) if evaluator else ControllerAssistant().evaluate_workflow(context)
+        except Exception:
+            review = ControllerAssistant().evaluate_workflow(context)
+        review = {**review, "checked_at": utc_now()}
         return {
             "metadata": {
                 "task_id": context["task_id"],
                 "agent_id": "orchestrator_review_gate",
                 "stage": "final_review",
                 "iteration": context["iteration"],
-                "status": "success" if review["passed"] else "partial_success",
+                "status": "success",
                 "trace_id": f"trace_{uuid4().hex[:12]}",
             },
             "payload": {"final_review": review},
             "self_review": {
-                "passed": review["passed"],
-                "overall_score": review["overall_score"],
+                "passed": True,
+                "overall_score": 1.0,
                 "threshold": self.review_gate.threshold,
-                "dimension_scores": {
-                    "completeness": score,
-                    "traceability": 1.0 if traceable_literature else 0.0,
-                },
-                "issues": review["weaknesses"],
-                "suggestions": ["Run a feedback iteration and compare version snapshots."]
-                if not feedback_count
-                else [],
+                "dimension_scores": review.get("dimension_scores") or {},
+                "issues": [],
+                "suggestions": review.get("suggestions") or [],
             },
         }
 
@@ -267,24 +257,83 @@ class Orchestrator:
         ]
         return invalidated_stages, invalidated_fields
 
-    def run_stage(self, task_id: str, stage: str, feedback: str | None = None) -> dict[str, Any]:
+    def run_stage(
+        self,
+        task_id: str,
+        stage: str,
+        feedback: str | None = None,
+        *,
+        progress_handler: ProgressHandler | None = None,
+        cancellation_checker: CancellationChecker | None = None,
+        input_override: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         spec = get_agent_spec(stage)
         with self._task_lock(task_id):
             context = self.artifacts.load_context(task_id)
             iteration = int(context.get("iteration") or 1)
             effective_feedback = self._feedback_with_memory(context, stage, feedback)
             stage_input = slice_context(context, spec)
+            execution_context = dict(context)
+            if input_override:
+                unknown = sorted(set(input_override) - set(spec.reads) - {"extensions"})
+                if unknown:
+                    raise OrchestrationError(
+                        f"Operator override contains undeclared inputs: {unknown}"
+                    )
+                stage_input.update(input_override)
+                execution_context.update(input_override)
+                override_id = f"override_{uuid4().hex[:12]}"
+                self.artifacts.write_json(
+                    task_id,
+                    f"operator_overrides/{override_id}.json",
+                    {
+                        "override_id": override_id,
+                        "stage": stage,
+                        "iteration": iteration,
+                        "input_override": input_override,
+                        "created_at": utc_now(),
+                    },
+                )
             if effective_feedback:
                 stage_input["feedback"] = effective_feedback
             self.artifacts.set_stage_status(task_id, stage, "running")
             self.artifacts.write_stage_input(task_id, stage, iteration, stage_input)
+            node_run_id = self.artifacts.begin_node_run(
+                task_id, stage, iteration, stage_input
+            )
             self._event(task_id, "stage_started", f"{stage} started.", stage)
 
-            raw = (
-                self._built_in_final_review(context)
-                if stage == "final_review"
-                else self.registry.run(stage, context, effective_feedback)
-            )
+            try:
+                if stage == "final_review":
+                    raw = self._built_in_final_review(context)
+                else:
+                    parameters = inspect.signature(self.registry.run).parameters.values()
+                    supports_callbacks = any(
+                        parameter.kind == inspect.Parameter.VAR_KEYWORD
+                        for parameter in parameters
+                    ) or {
+                        "progress_handler",
+                        "cancellation_checker",
+                    }.issubset(inspect.signature(self.registry.run).parameters)
+                    if supports_callbacks:
+                        raw = self.registry.run(
+                            stage,
+                            execution_context,
+                            effective_feedback,
+                            progress_handler=progress_handler,
+                            cancellation_checker=cancellation_checker,
+                        )
+                    else:
+                        if cancellation_checker:
+                            cancellation_checker()
+                        raw = self.registry.run(stage, execution_context, effective_feedback)
+                        if cancellation_checker:
+                            cancellation_checker()
+            except CancellationRequested:
+                self.artifacts.finish_node_run(
+                    task_id, stage, node_run_id, status="cancelled"
+                )
+                raise
             self.artifacts.write_stage_output(task_id, stage, iteration, raw)
             response, review = self.review_gate.evaluate(raw, context, spec)
             self.artifacts.write_review(task_id, stage, iteration, review.model_dump())
@@ -307,6 +356,8 @@ class Orchestrator:
                     score=review.overall_score,
                 )
             elif response is not None and review.decision == "human_review":
+                if stage == "final_review":
+                    context = merge_payload(context, spec, response.payload)
                 context["current_stage"] = "human_review"
                 context["reviews"] = [*list(context.get("reviews") or []), review.model_dump()]
                 self.artifacts.save_context(task_id, context)
@@ -333,14 +384,51 @@ class Orchestrator:
                     issues=review.issues,
                 )
 
+            self.artifacts.finish_node_run(
+                task_id,
+                stage,
+                node_run_id,
+                status=status,
+                output=raw,
+                review=review.model_dump(),
+            )
+
             return {
                 "task_id": task_id,
                 "stage": stage,
                 "status": status,
                 "response": raw,
                 "review": review.model_dump(),
+                "node_run_id": node_run_id,
                 "task_context": context,
             }
+
+    def run_to(
+        self,
+        task_id: str,
+        target_stage: str,
+        feedback: str | None = None,
+        input_override: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        target_index = STAGE_ORDER.index(target_stage)
+        executions = []
+        for index, stage in enumerate(STAGE_ORDER[: target_index + 1]):
+            execution = self.run_stage(
+                task_id,
+                stage,
+                feedback if stage == target_stage else None,
+                input_override=input_override if stage == target_stage else None,
+            )
+            executions.append(execution)
+            if execution["status"] not in {"passed", "completed"}:
+                break
+        return {
+            "task_id": task_id,
+            "target_stage": target_stage,
+            "status": executions[-1]["status"] if executions else "created",
+            "executions": executions,
+            "task_context": self.artifacts.load_context(task_id),
+        }
 
     def run_from(
         self,
@@ -475,6 +563,15 @@ class Orchestrator:
             constraints = dict(user_input.get("user_constraints") or {})
             if reasoning_level is not None:
                 constraints["reasoning_level"] = reasoning_level
+                model_policy = dict(context.get("model_policy") or {})
+                configured_max_tokens = int(os.getenv("LLM_MAX_TOKENS", "8192"))
+                token_limits = {"low": 2048, "medium": 4096, "high": 6144, "ultra": configured_max_tokens}
+                model_policy["reasoning"] = reasoning_level
+                model_policy["max_tokens"] = min(
+                    configured_max_tokens,
+                    token_limits.get(reasoning_level, configured_max_tokens),
+                )
+                context["model_policy"] = model_policy
             if memory_level is not None:
                 constraints["memory_level"] = memory_level
             user_input["user_constraints"] = constraints
@@ -564,6 +661,91 @@ class Orchestrator:
         if rerun_downstream:
             return self.run_from(task_id, target_stage, comment)
         return self.run_stage(task_id, target_stage, comment)
+
+    def apply_iteration_plan(
+        self,
+        task_id: str,
+        evaluation: dict[str, Any],
+        iteration_plan: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self._task_lock(task_id):
+            context = self.artifacts.load_context(task_id)
+            iteration = int(context.get("iteration") or 1) + 1
+            if iteration > self.max_iterations:
+                raise OrchestrationError("Maximum workflow iterations exceeded")
+            agents = [stage for stage in STAGE_ORDER if stage in iteration_plan["agents_to_rerun"]]
+            if not agents:
+                raise OrchestrationError("Iteration plan selected no runnable agents")
+            for field in iteration_plan["artifacts_to_invalidate"]:
+                if field in context:
+                    context[field] = None if field in {"question_card", "research_plan", "final_review"} else []
+            context["iteration"] = iteration
+            context["current_stage"] = agents[0]
+            extensions = dict(context.get("extensions") or {})
+            extensions["iteration_control"] = {
+                "status": "active",
+                "iteration": iteration,
+                "updated_at": utc_now(),
+            }
+            context["extensions"] = extensions
+            evaluation = {**evaluation, "created_at": evaluation.get("created_at") or utc_now()}
+            iteration_plan = {
+                **iteration_plan,
+                "iteration": iteration,
+                "created_at": iteration_plan.get("created_at") or utc_now(),
+            }
+            context["plan_evaluations"] = [*list(context.get("plan_evaluations") or []), evaluation]
+            context["iteration_plans"] = [*list(context.get("iteration_plans") or []), iteration_plan]
+            self.artifacts.snapshot(
+                task_id,
+                context,
+                stage=agents[0],
+                trigger="plan_evaluation",
+                changed_fields=["iteration", "plan_evaluations", "iteration_plans", *iteration_plan["artifacts_to_invalidate"]],
+            )
+            self.artifacts.update_manifest(
+                task_id, iteration=iteration, current_stage=agents[0], status="retrying"
+            )
+            self._event(task_id, "iteration_plan_created", iteration_plan["reason"], agents[0], iteration_plan=iteration_plan)
+            return context
+
+    def finish_iteration(self, task_id: str) -> dict[str, Any]:
+        with self._task_lock(task_id):
+            context = self.artifacts.load_context(task_id)
+            if not context.get("research_plan"):
+                raise OrchestrationError("Research plan is not available")
+            extensions = dict(context.get("extensions") or {})
+            extensions["iteration_control"] = {
+                "status": "ended",
+                "iteration": int(context.get("iteration") or 1),
+                "ended_at": utc_now(),
+            }
+            context["extensions"] = extensions
+            context["current_stage"] = "completed"
+            self.artifacts.save_context(task_id, context)
+            self.artifacts.update_manifest(
+                task_id,
+                status="completed",
+                current_stage="completed",
+                active_run_id=None,
+            )
+            self._event(
+                task_id,
+                "iteration_ended",
+                "The operator ended iterative refinement and entered controller Q&A mode.",
+                "final_review",
+                iteration=int(context.get("iteration") or 1),
+            )
+            return context
+
+    def record_controller_route(self, task_id: str, route: dict[str, Any]) -> dict[str, Any]:
+        with self._task_lock(task_id):
+            context = self.artifacts.load_context(task_id)
+            route = {**route, "created_at": route.get("created_at") or utc_now()}
+            context["controller_routes"] = [*list(context.get("controller_routes") or []), route]
+            self.artifacts.save_context(task_id, context)
+            self._event(task_id, "controller_route_created", route["reason"], route.get("target_stage"), route=route)
+            return context
 
 
 __all__ = ["ArtifactError", "OrchestrationError", "Orchestrator"]

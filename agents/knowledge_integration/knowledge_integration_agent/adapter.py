@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from .agent import KnowledgeIntegrationAgent
@@ -32,7 +33,18 @@ class KnowledgeIntegrationAdapter:
                 "search_policy": dict(self.default_search_policy),
             },
             "output_schema": self.output_schema,
+            "extensions": task_context.get("extensions") or {},
         }
 
-    def call(self, task_context: dict[str, Any]) -> dict[str, Any]:
-        return self.agent.run(self.build_request(task_context))
+    def call(
+        self,
+        task_context: dict[str, Any],
+        *,
+        progress_handler: Callable[[dict[str, Any]], None] | None = None,
+        cancellation_checker: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        return self.agent.run(
+            self.build_request(task_context),
+            progress_handler=progress_handler,
+            cancellation_checker=cancellation_checker,
+        )

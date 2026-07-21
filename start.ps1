@@ -16,6 +16,11 @@ if (-not (Test-Path -LiteralPath $python)) {
 $npm = (Get-Command npm.cmd -ErrorAction Stop).Source
 New-Item -ItemType Directory -Path $logs -Force | Out-Null
 
+& $npm run build
+if ($LASTEXITCODE -ne 0) {
+    throw "Frontend production build failed."
+}
+
 $backend = Start-Process `
     -FilePath $python `
     -ArgumentList @(
@@ -41,7 +46,7 @@ try {
     Write-Host "Frontend: http://${HostAddress}:${FrontendPort}"
     Write-Host "OpenAPI: http://${HostAddress}:${BackendPort}/docs"
     Write-Host "MCP: .\.venv\Scripts\python.exe -m backend.mcp_server"
-    & $npm run dev -- --host $HostAddress --port $FrontendPort
+    & $npm run preview -- --host $HostAddress --port $FrontendPort
 }
 finally {
     $backend.Refresh()

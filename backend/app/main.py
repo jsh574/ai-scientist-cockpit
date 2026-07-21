@@ -7,35 +7,55 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 
-from .adapters import REAL_AGENT_STAGES, AgentRegistry
-from .agent_protocol import AGENT_SPECS, STAGE_ORDER
+from .adapters import REAL_AGENT_STAGES, AgentRegistry, ProjectLLMClient
+from .controller_assistant import ControllerAssistant
+from .agent_protocol import AGENT_SPECS, STAGE_ORDER, slice_context
 from .artifact_service import ArtifactError, ArtifactService
 from .contracts import (
     FeedbackRequest,
+    ControllerRouteRequest,
     HumanReviewRequest,
     LegacyStageRunRequest,
+    RunInstructionRequest,
+    PlanEvaluationRequest,
+    NodeExecuteRequest,
     StageRunRequest,
     TaskArchiveRequest,
     TaskCreateRequest,
+    WorkflowStartRequest,
 )
 from .orchestrator import OrchestrationError, Orchestrator
 from .review_gate import ReviewGate
 from .settings import Settings
+from .workflow_runs import WorkflowRunError, WorkflowRunManager
 
 settings = Settings.from_env()
 registry = AgentRegistry(settings)
 artifacts = ArtifactService(settings.artifacts_root)
+controller_assistant = ControllerAssistant()
+
+
+def evaluate_final_review(context: dict[str, Any]) -> dict[str, Any]:
+    try:
+        llm_client = ProjectLLMClient(context)
+    except Exception:
+        llm_client = None
+    return controller_assistant.evaluate_workflow(context, llm_client)
+
+
 orchestrator = Orchestrator(
     registry,
     artifacts,
     ReviewGate(settings.review_threshold),
     max_iterations=settings.max_iterations,
+    final_review_evaluator=evaluate_final_review,
 )
+workflow_runs = WorkflowRunManager(orchestrator, artifacts)
 
 app = FastAPI(
     title="EurekaLoop AI Scientist",
@@ -52,7 +72,10 @@ app.add_middleware(
 
 
 def _http_error(exc: Exception) -> HTTPException:
-    if isinstance(exc, (ArtifactError, OrchestrationError, ValueError)):
+    if isinstance(
+        exc,
+        (ArtifactError, OrchestrationError, WorkflowRunError, ValueError),
+    ):
         message = str(exc)
         status = 404 if "does not exist" in message else 409
         return HTTPException(status_code=status, detail=message)
@@ -78,6 +101,15 @@ def health() -> dict[str, Any]:
             "tasks": True,
             "task_archive": True,
             "task_start": True,
+            "workflow_runs": True,
+            "workflow_pause": True,
+            "workflow_cancel": True,
+            "workflow_instructions": True,
+            "node_history": True,
+            "node_validation": True,
+            "controller_router": True,
+            "plan_evaluation": True,
+            "model_policy": True,
             "stage_run": True,
             "reviews": True,
             "feedback": True,
@@ -99,6 +131,17 @@ def health() -> dict[str, Any]:
             "knowledge_max_attempts": int(
                 os.getenv("KNOWLEDGE_LLM_MAX_ATTEMPTS", "1")
             ),
+        },
+        "model_policy": {
+            "supported_fields": [
+                "provider", "model", "reasoning", "temperature", "max_tokens",
+                "timeout_seconds", "max_retries", "response_format", "thinking_enabled",
+            ],
+            "dify_supported_fields": ["timeout_seconds"],
+            "dify_unsupported_fields": [
+                "model", "reasoning", "temperature", "max_tokens", "max_retries",
+                "response_format", "thinking_enabled",
+            ],
         },
         "mcp": {"server": "backend.mcp_server", "transport": "stdio"},
     }
@@ -191,10 +234,162 @@ async def upload_task_attachments(
         raise _http_error(exc) from exc
 
 
-@app.post("/api/tasks/{task_id}/start")
-async def start_task(task_id: str) -> dict[str, Any]:
+@app.post("/api/tasks/{task_id}/start", status_code=status.HTTP_202_ACCEPTED)
+def start_task(
+    task_id: str, request: WorkflowStartRequest | None = None
+) -> dict[str, Any]:
     try:
-        return await run_in_threadpool(orchestrator.run_from, task_id)
+        start_request = request or WorkflowStartRequest()
+        run = workflow_runs.start(
+            task_id,
+            start_stage=start_request.start_stage,
+            feedback=start_request.feedback,
+        )
+        return {"task_id": task_id, "run": run}
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@app.get("/api/tasks/{task_id}/runs")
+def list_task_runs(task_id: str) -> dict[str, Any]:
+    try:
+        return {"task_id": task_id, "runs": workflow_runs.list_for_task(task_id)}
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@app.get("/api/runs/{run_id}")
+def get_workflow_run(run_id: str) -> dict[str, Any]:
+    try:
+        return workflow_runs.get(run_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@app.post("/api/runs/{run_id}/pause")
+def pause_workflow_run(run_id: str) -> dict[str, Any]:
+    try:
+        return workflow_runs.pause(run_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@app.post("/api/runs/{run_id}/resume")
+def resume_workflow_run(run_id: str) -> dict[str, Any]:
+    try:
+        return workflow_runs.resume(run_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@app.post("/api/runs/{run_id}/cancel")
+def cancel_workflow_run(run_id: str) -> dict[str, Any]:
+    try:
+        return workflow_runs.cancel(run_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@app.post("/api/runs/{run_id}/instructions", status_code=status.HTTP_202_ACCEPTED)
+def add_run_instruction(run_id: str, request: RunInstructionRequest) -> dict[str, Any]:
+    try:
+        return workflow_runs.add_instruction(
+            run_id,
+            comment=request.comment,
+            target_stage=request.target_stage,
+            action=request.action,
+        )
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@app.post("/api/tasks/{task_id}/controller/route")
+def route_controller_message(task_id: str, request: ControllerRouteRequest) -> dict[str, Any]:
+    try:
+        context = artifacts.load_context(task_id)
+        try:
+            llm_client = ProjectLLMClient(context)
+        except Exception:
+            llm_client = None
+        route = controller_assistant.route(context, request.message, llm_client)
+        updated = orchestrator.record_controller_route(task_id, route)
+        run = None
+        if request.execute and route["intent"] == "cancel":
+            runs = workflow_runs.list_for_task(task_id)
+            active = next(
+                (
+                    item
+                    for item in runs
+                    if item["status"]
+                    in {"queued", "running", "pausing", "paused", "cancelling"}
+                ),
+                None,
+            )
+            if active:
+                run = workflow_runs.cancel(active["run_id"])
+        elif request.execute and route["intent"] in {
+            "modify",
+            "rerun_agent",
+            "retrieve_more",
+        }:
+            target = route.get("target_stage") or "research_planning"
+            updated = orchestrator.record_feedback(
+                task_id, target, route["optimized_instruction"]
+            )
+            run = workflow_runs.start(
+                task_id,
+                start_stage=target,
+                feedback=route["optimized_instruction"],
+            )
+        return {
+            "task_id": task_id,
+            "route": route,
+            "task_context": updated,
+            "run": run,
+        }
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@app.post("/api/tasks/{task_id}/plan-evaluations")
+def evaluate_research_plan(task_id: str, request: PlanEvaluationRequest) -> dict[str, Any]:
+    try:
+        context = artifacts.load_context(task_id)
+        try:
+            llm_client = ProjectLLMClient(context)
+        except Exception:
+            llm_client = None
+        evaluation, iteration_plan = controller_assistant.evaluate_plan(
+            context,
+            request.user_score,
+            request.comment,
+            request.problem_type,
+            llm_client,
+        )
+        updated = orchestrator.apply_iteration_plan(task_id, evaluation, iteration_plan)
+        run = workflow_runs.start(
+            task_id,
+            start_stage=iteration_plan["agents_to_rerun"][0],
+            feedback=request.comment,
+        ) if request.execute else None
+        return {
+            "task_id": task_id,
+            "evaluation": evaluation,
+            "iteration_plan": iteration_plan,
+            "task_context": updated,
+            "run": run,
+        }
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@app.post("/api/tasks/{task_id}/iterations/finish")
+def finish_task_iteration(task_id: str) -> dict[str, Any]:
+    try:
+        return {
+            "task_id": task_id,
+            "task_context": orchestrator.finish_iteration(task_id),
+        }
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -264,6 +459,150 @@ def task_stage_detail(task_id: str, stage: str) -> dict[str, Any]:
                 task_id, f"stages/{stage}/i{output_iteration:03d}.input.json"
             )
         return result
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@app.get("/api/tasks/{task_id}/stage-history")
+def task_stage_history(task_id: str) -> dict[str, Any]:
+    try:
+        history = artifacts.list_stage_history(task_id, list(STAGE_ORDER))
+        return {
+            "task_id": task_id,
+            "history": [
+                {
+                    "task_id": task_id,
+                    "stage": AGENT_SPECS[item["metadata"]["stage"]].as_dict(),
+                    "status": item["metadata"]["status"],
+                    "iteration": item["metadata"]["iteration"],
+                    "node_run_id": item["metadata"]["node_run_id"],
+                    "started_at": item["metadata"]["started_at"],
+                    "finished_at": item["metadata"].get("finished_at"),
+                    "input": item["input"],
+                    "output": item["output"],
+                    "review": item["review"],
+                }
+                for item in history
+            ],
+        }
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@app.get("/api/tasks/{task_id}/nodes/{node_id}/runs")
+def list_node_runs(task_id: str, node_id: str) -> dict[str, Any]:
+    try:
+        if node_id not in AGENT_SPECS:
+            raise ValueError(f"Unknown node: {node_id}")
+        return {
+            "task_id": task_id,
+            "node_id": node_id,
+            "runs": artifacts.list_node_runs(task_id, node_id),
+        }
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@app.get("/api/tasks/{task_id}/nodes/{node_id}/runs/{node_run_id}")
+def node_run_detail(
+    task_id: str, node_id: str, node_run_id: str
+) -> dict[str, Any]:
+    try:
+        if node_id not in AGENT_SPECS:
+            raise ValueError(f"Unknown node: {node_id}")
+        return artifacts.get_node_run(task_id, node_id, node_run_id)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@app.get("/api/tasks/{task_id}/nodes/{node_id}/runs-diff")
+def node_run_diff(
+    task_id: str,
+    node_id: str,
+    left: str = Query(...),
+    right: str = Query(...),
+) -> dict[str, Any]:
+    try:
+        return artifacts.node_run_diff(task_id, node_id, left, right)
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@app.post("/api/tasks/{task_id}/nodes/{node_id}/execute")
+async def execute_node(
+    task_id: str, node_id: str, request: NodeExecuteRequest
+) -> dict[str, Any]:
+    try:
+        spec = AGENT_SPECS.get(node_id)
+        if spec is None:
+            raise ValueError(f"Unknown node: {node_id}")
+        context = artifacts.load_context(task_id)
+        node_input = slice_context(context, spec)
+        node_input.update(request.input_override)
+        missing = [key for key, value in node_input.items() if value is None]
+        if request.validate_only:
+            return {
+                "task_id": task_id,
+                "node_id": node_id,
+                "valid": not missing,
+                "missing_fields": missing,
+                "input": node_input,
+            }
+        if request.mode == "from":
+            run = workflow_runs.start(
+                task_id, start_stage=node_id, feedback=request.feedback
+            )
+            return {"task_id": task_id, "mode": "from", "run": run}
+        if request.mode == "to":
+            result = await run_in_threadpool(
+                orchestrator.run_to,
+                task_id,
+                node_id,
+                request.feedback,
+                request.input_override,
+            )
+            return {"task_id": task_id, "mode": "to", "result": result}
+        result = await run_in_threadpool(
+            orchestrator.run_stage,
+            task_id,
+            node_id,
+            request.feedback,
+            input_override=request.input_override,
+        )
+        return {"task_id": task_id, "mode": "only", "result": result}
+    except Exception as exc:
+        raise _http_error(exc) from exc
+
+
+@app.post("/api/tasks/{task_id}/nodes/{node_id}/validate")
+def validate_node_input(task_id: str, node_id: str) -> dict[str, Any]:
+    try:
+        spec = AGENT_SPECS.get(node_id)
+        if spec is None:
+            raise ValueError(f"Unknown node: {node_id}")
+        context = artifacts.load_context(task_id)
+        node_input = slice_context(context, spec)
+        missing = [
+            key
+            for key, value in node_input.items()
+            if value is None or (key not in {"reviews", "versions", "feedback_events"} and value == [])
+        ]
+        downstream = STAGE_ORDER[STAGE_ORDER.index(node_id) :]
+        invalidated_fields = sorted(
+            {
+                field
+                for stage in downstream
+                for field in AGENT_SPECS[stage].writes
+            }
+        )
+        return {
+            "task_id": task_id,
+            "node_id": node_id,
+            "valid": not missing,
+            "missing_fields": missing,
+            "input": node_input,
+            "would_invalidate": invalidated_fields,
+        }
     except Exception as exc:
         raise _http_error(exc) from exc
 
@@ -346,13 +685,21 @@ def list_events(task_id: str) -> dict[str, Any]:
 
 
 @app.get("/api/tasks/{task_id}/events/stream")
-def stream_events(task_id: str, follow: bool = False) -> StreamingResponse:
+def stream_events(
+    task_id: str,
+    follow: bool = False,
+    after: int = Query(default=0, ge=0),
+) -> StreamingResponse:
     async def generate():
-        sent = 0
+        sent = after
         while True:
             events = artifacts.read_events(task_id)
-            for event in events[sent:]:
-                yield f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            for index, event in enumerate(events[sent:], start=sent + 1):
+                yield (
+                    f"id: {index}\n"
+                    f"event: message\n"
+                    f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                )
             sent = len(events)
             if not follow:
                 break

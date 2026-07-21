@@ -584,6 +584,17 @@ export function createInitialContext(mode: RunMode = "hybrid"): TaskContext {
     reviews: [],
     versions: [],
     feedback_events: [],
+    model_policy: {
+      provider: "dashscope",
+      model: "qwen3.7-max",
+      reasoning: "high",
+      temperature: 0.2,
+      max_tokens: 6144,
+      timeout_seconds: 120,
+      max_retries: 0,
+      response_format: "json_object",
+      thinking_enabled: false,
+    },
   };
 }
 

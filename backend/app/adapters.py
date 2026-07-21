@@ -14,7 +14,13 @@ from types import ModuleType
 from typing import Any
 from uuid import uuid4
 
-from .agent_protocol import AGENT_SPECS, get_agent_spec
+from .agent_protocol import (
+    AGENT_SPECS,
+    CancellationChecker,
+    CancellationRequested,
+    ProgressHandler,
+    get_agent_spec,
+)
 from .settings import Settings
 
 REAL_AGENT_STAGES = {
@@ -59,8 +65,9 @@ class ProjectLLMClient:
         self.model = os.getenv("QWEN_MODEL") or os.getenv("LLM_MODEL") or "qwen3.7-max"
         user_input = (task_context or {}).get("user_input") or {}
         constraints = user_input.get("user_constraints") or {}
+        policy = (task_context or {}).get("model_policy") or {}
         self.background_context = str(user_input.get("question_description") or "").strip()
-        self.reasoning_level = str(constraints.get("reasoning_level") or "high")
+        self.reasoning_level = str(policy.get("reasoning") or constraints.get("reasoning_level") or "high")
         configured_max_tokens = int(os.getenv("LLM_MAX_TOKENS", "8192"))
         token_limits = {
             "low": 2048,
@@ -68,14 +75,17 @@ class ProjectLLMClient:
             "high": 6144,
             "ultra": configured_max_tokens,
         }
-        self.max_tokens = min(configured_max_tokens, token_limits.get(self.reasoning_level, configured_max_tokens))
+        self.max_tokens = int(policy.get("max_tokens") or min(configured_max_tokens, token_limits.get(self.reasoning_level, configured_max_tokens)))
         env_thinking = os.getenv("QWEN_ENABLE_THINKING", "false").lower() == "true"
-        self.enable_thinking = env_thinking and self.reasoning_level in {"high", "ultra"}
+        self.enable_thinking = bool(policy.get("thinking_enabled", env_thinking and self.reasoning_level in {"high", "ultra"}))
+        self.model = str(policy.get("model") or self.model)
+        self.temperature = float(policy.get("temperature", 0.2))
+        self.response_format = str(policy.get("response_format") or "json_object")
         self.client = OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
-            timeout=float(os.getenv("LLM_TIMEOUT_SECONDS", "120")),
-            max_retries=int(os.getenv("LLM_MAX_RETRIES", "0")),
+            timeout=float(policy.get("timeout_seconds") or os.getenv("LLM_TIMEOUT_SECONDS", "120")),
+            max_retries=int(policy.get("max_retries", os.getenv("LLM_MAX_RETRIES", "0"))),
         )
 
     def _with_background_context(self, user_prompt: str) -> str:
@@ -93,8 +103,8 @@ class ProjectLLMClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": self._with_background_context(user_prompt)},
             ],
-            response_format={"type": "json_object"},
-            temperature=temperature,
+            response_format={"type": getattr(self, "response_format", "json_object")},
+            temperature=float(getattr(self, "temperature", temperature)),
             max_tokens=self.max_tokens,
             extra_body={"enable_thinking": self.enable_thinking},
         )
@@ -457,6 +467,9 @@ class AgentRegistry:
         stage: str,
         task_context: dict[str, Any],
         feedback: str | None = None,
+        *,
+        progress_handler: ProgressHandler | None = None,
+        cancellation_checker: CancellationChecker | None = None,
     ) -> dict[str, Any]:
         if stage not in REAL_AGENT_STAGES:
             raise AgentIntegrationError(f"No real Agent is registered for stage: {stage}")
@@ -469,7 +482,28 @@ class AgentRegistry:
         }[stage]
         started = time.perf_counter()
         try:
-            raw = runner(task_context, feedback)
+            if cancellation_checker:
+                cancellation_checker()
+            if stage == "knowledge_integration":
+                raw = runner(
+                    task_context,
+                    feedback,
+                    progress_handler,
+                    cancellation_checker,
+                )
+            elif stage == "research_planning":
+                raw = runner(
+                    task_context,
+                    feedback,
+                    progress_handler,
+                    cancellation_checker,
+                )
+            else:
+                raw = runner(task_context, feedback)
+            if cancellation_checker:
+                cancellation_checker()
+        except CancellationRequested:
+            raise
         except Exception as exc:
             raw = failure_response(task_context, stage, get_agent_spec(stage).agent_id, exc)
         metadata = raw.setdefault("metadata", {})
@@ -559,7 +593,11 @@ class AgentRegistry:
         }
 
     def _run_knowledge_integration(
-        self, task_context: dict[str, Any], _feedback: str | None
+        self,
+        task_context: dict[str, Any],
+        _feedback: str | None,
+        progress_handler: ProgressHandler | None = None,
+        cancellation_checker: CancellationChecker | None = None,
     ) -> dict[str, Any]:
         if not (os.getenv("DASHSCOPE_API_KEY") or os.getenv("QWEN_API_KEY")):
             raise AgentIntegrationError(
@@ -590,7 +628,11 @@ class AgentRegistry:
         raw = package.KnowledgeIntegrationAdapter(
             agent=agent,
             default_search_policy=search_policy,
-        ).call(adapted_context)
+        ).call(
+            adapted_context,
+            progress_handler=progress_handler,
+            cancellation_checker=cancellation_checker,
+        )
         raw["metadata"]["status"] = _status(raw.get("metadata", {}).get("status"))
         return raw
 
@@ -640,14 +682,91 @@ class AgentRegistry:
         return raw
 
     def _run_research_planning(
-        self, task_context: dict[str, Any], _feedback: str | None
+        self,
+        task_context: dict[str, Any],
+        _feedback: str | None,
+        progress_handler: ProgressHandler | None = None,
+        cancellation_checker: CancellationChecker | None = None,
     ) -> dict[str, Any]:
         service = _load_package(self.settings.planning_agent_root, "planning_agent.service")
+        current_node = {"id": "package_select"}
+        completed_plans = {"count": 0}
+
+        def emit(update: dict[str, Any]) -> None:
+            if cancellation_checker:
+                cancellation_checker()
+            if progress_handler:
+                progress_handler(update)
+
+        def service_progress(message: str) -> None:
+            hypothesis_match = re.search(r"hypothesis \d+/\d+: ([^ ]+)", message)
+            finished_match = re.search(r"hypothesis ([^:]+)", message)
+            if hypothesis_match:
+                hypothesis_id = hypothesis_match.group(1)
+                current_node["id"] = f"dify_call:{hypothesis_id}"
+                emit({
+                    "node_id": current_node["id"],
+                    "kind": "started",
+                    "message": message,
+                    "payload": {"hypothesis_id": hypothesis_id},
+                })
+                return
+            if message.startswith("Dify finished"):
+                completed_plans["count"] += 1
+                emit({
+                    "node_id": current_node["id"],
+                    "kind": "partial_output",
+                    "message": message,
+                    "payload": {"completed_plans": completed_plans["count"]},
+                    "operation": "append",
+                })
+                return
+            emit({
+                "node_id": current_node["id"],
+                "kind": "progress",
+                "message": message,
+                "payload": {"hypothesis_id": finished_match.group(1) if finished_match else None},
+            })
+
+        def dify_event(event: dict[str, Any]) -> None:
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            emit({
+                "node_id": current_node["id"],
+                "kind": "progress",
+                "message": str(event.get("event") or "Dify progress"),
+                "payload": {
+                    "event": event.get("event"),
+                    "status": data.get("status"),
+                    "node_id": data.get("node_id"),
+                    "title": data.get("title"),
+                },
+            })
+
+        emit({
+            "node_id": "package_select",
+            "kind": "started",
+            "message": "Selecting hypothesis evidence packages.",
+            "progress": 0.05,
+        })
+        client = service.DifyWorkflowClient(
+            event_handler=dify_event,
+            cancellation_checker=cancellation_checker,
+        )
         raw = service.run_planning_agent(
             planning_request(task_context),
+            dify_client=client,
             max_packages=int(os.getenv("PLANNING_MAX_HYPOTHESES", "2")),
             max_parallel_calls=int(os.getenv("PLANNING_MAX_PARALLEL_CALLS", "1")),
+            progress_handler=service_progress,
         )
+        emit({
+            "node_id": "aggregate",
+            "kind": "progress",
+            "message": "Normalizing and aggregating research plans.",
+            "progress": 0.95,
+            "payload": {"completed_plans": completed_plans["count"]},
+            "operation": "replace",
+        })
         raw["metadata"]["status"] = _status(raw.get("metadata", {}).get("status"))
         research_plan = raw.get("payload") or {}
         research_plan.setdefault("run_id", research_plan.get("task_id", ""))

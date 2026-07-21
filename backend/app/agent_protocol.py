@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from collections.abc import Callable
 from typing import Any, Protocol
 
 STAGE_ORDER = (
@@ -12,21 +13,41 @@ STAGE_ORDER = (
     "final_review",
 )
 
+ProgressHandler = Callable[[dict[str, Any]], None]
+CancellationChecker = Callable[[], None]
+
+
+class CancellationRequested(BaseException):
+    pass
+
 
 @dataclass(frozen=True)
-class AgentSpec:
+class RetryPolicy:
+    max_attempts: int = 1
+    backoff_seconds: float = 0
+    retry_on: tuple[str, ...] = ("review_gate_retry",)
+
+
+@dataclass(frozen=True)
+class NodeSpec:
     stage: str
     agent_id: str
     reads: tuple[str, ...]
     writes: tuple[str, ...]
+    schema_version: str = "node_spec_v1"
+    interruptible: bool = False
+    retry_policy: RetryPolicy = RetryPolicy()
     hybrid_review: bool = False
     description: str = ""
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {"node_id": self.stage, **asdict(self)}
 
 
-AGENT_SPECS: dict[str, AgentSpec] = {
+AgentSpec = NodeSpec
+
+
+AGENT_SPECS: dict[str, NodeSpec] = {
     "question_understanding": AgentSpec(
         stage="question_understanding",
         agent_id="question_understanding_agent",
@@ -117,6 +138,9 @@ class AgentRunner(Protocol):
         stage: str,
         task_context: dict[str, Any],
         feedback: str | None = None,
+        *,
+        progress_handler: ProgressHandler | None = None,
+        cancellation_checker: CancellationChecker | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -128,13 +152,17 @@ def get_agent_spec(stage: str) -> AgentSpec:
 
 
 def slice_context(context: dict[str, Any], spec: AgentSpec) -> dict[str, Any]:
-    return {key: context.get(key) for key in spec.reads}
+    sliced = {key: context.get(key) for key in spec.reads}
+    extensions = context.get("extensions")
+    if isinstance(extensions, dict) and isinstance(extensions.get(spec.agent_id), dict):
+        sliced["extensions"] = dict(extensions[spec.agent_id])
+    return sliced
 
 
 def merge_payload(
     context: dict[str, Any], spec: AgentSpec, payload: dict[str, Any]
 ) -> dict[str, Any]:
-    unexpected = sorted(set(payload) - set(spec.writes))
+    unexpected = sorted(set(payload) - set(spec.writes) - {"extensions"})
     if unexpected:
         raise ValueError(
             f"{spec.stage} attempted to write fields outside its contract: {unexpected}"
@@ -143,6 +171,15 @@ def merge_payload(
     for key in spec.writes:
         if key in payload:
             merged[key] = payload[key]
+    extension_payload = payload.get("extensions")
+    if extension_payload is not None:
+        if not isinstance(extension_payload, dict):
+            raise ValueError(f"{spec.stage} extensions must be an object")
+        extensions = dict(merged.get("extensions") or {})
+        namespace = dict(extensions.get(spec.agent_id) or {})
+        namespace.update(extension_payload)
+        extensions[spec.agent_id] = namespace
+        merged["extensions"] = extensions
     return merged
 
 

@@ -16,6 +16,8 @@ import {
   CheckCircle2,
   ChevronDown,
   Clock3,
+  Copy,
+  Download,
   FilePlus2,
   FileJson,
   Globe2,
@@ -25,12 +27,15 @@ import {
   MessageSquareText,
   Moon,
   Paperclip,
+  Pause,
+  Play,
   Plus,
   RotateCcw,
   Send,
   Server,
   SlidersHorizontal,
   Sparkles,
+  Square,
   Sun,
   Upload,
   X,
@@ -39,27 +44,52 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { createPortal } from "react-dom";
 import {
   archiveTask,
+  cancelWorkflowRun,
   createTask,
   executeStage,
+  evaluateResearchPlan,
+  executeNode,
   exportTaskBundle,
+  finishTaskIteration,
   fetchArtifacts,
   fetchHealthStatus,
+  fetchNodeRun,
+  fetchNodeRunDiff,
+  fetchNodeRuns,
   fetchTaskAttachments,
   fetchTaskEvents,
   fetchTaskRecord,
+  fetchTaskRuns,
   fetchTaskStage,
+  fetchTaskStageHistory,
   fetchTasks,
+  fetchWorkflowRun,
   fetchVersionDiff,
   fetchVersions,
+  pauseWorkflowRun,
+  queueRunInstruction,
   recordFeedback,
+  routeControllerMessage,
+  resumeWorkflowRun,
+  startWorkflowRun,
+  subscribeTaskEvents,
   submitHumanReview,
   uploadTaskAttachments,
+  usesRealAgents,
+  validateNodeInput,
   type HealthStatus,
+  type NodeRunDetail,
+  type NodeRunSummary,
+  type NodeValidation,
+  type ControllerRoute,
+  type IterationPlan,
   type RemoteAttachment,
   type RemoteArtifact,
   type TaskManifest,
   type TaskStageDetail,
+  type TaskStageHistoryEntry,
   type VersionDiffResult,
+  type WorkflowRun,
 } from "./agentApi";
 import {
   createInitialContext,
@@ -74,7 +104,7 @@ import {
   stageMeta,
   stageOrder,
 } from "./mockData";
-import type { AgentResponse, EventLog, ReviewRecord, RunMode, StageId, StageRun, TaskContext, UserInput, VersionRecord } from "./types";
+import type { AgentResponse, EventLog, FinalReview, ResearchPlan, ReviewRecord, RunMode, StageId, StageRun, TaskContext, UserInput, VersionRecord } from "./types";
 
 type Language = "zh" | "en";
 type PageId = "workbench" | "system" | "docs";
@@ -84,6 +114,14 @@ type MemoryLevel = "low" | "medium" | "high";
 type MessageKind = "user" | "agent" | "controller";
 type MenuId = "reasoning" | "approval" | "memory" | null;
 type Theme = "light" | "dark";
+
+const activeWorkflowStatuses = new Set([
+  "queued",
+  "running",
+  "pausing",
+  "paused",
+  "cancelling",
+]);
 
 interface StarterQuestion {
   domain: string;
@@ -127,6 +165,11 @@ interface ThreadMessage {
   kind: MessageKind;
   stage?: StageId;
   body?: string;
+  activity?: string;
+  activityNode?: string;
+  activityProgress?: number;
+  workflowRunId?: string;
+  iteration?: number;
   response?: AgentResponse | null;
   review?: ReviewRecord | null;
   status?: StageRun["status"];
@@ -170,9 +213,240 @@ interface ProjectSession {
   files: File[];
   attachments: RemoteAttachment[];
   feedbackDrafts: Record<string, string>;
+  iterationDraft: string;
+  iterationScore: number;
 }
 
 const delay = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+const eventKey = (event: EventLog) => {
+  const runId = event.data?.run_id;
+  const sequence = event.data?.sequence;
+  return runId && sequence ? `${runId}:${sequence}` : event.event_id;
+};
+
+function mentionedStage(message: string, fallback: StageId): StageId {
+  const lowered = message.toLowerCase();
+  const targets: Array<[string, StageId]> = [
+    ["@knowledge", "knowledge_integration"],
+    ["@hypothesis", "hypothesis_generation"],
+    ["@evidence", "evidence_mapping"],
+    ["@planning", "research_planning"],
+  ];
+  return targets.find(([mention]) => lowered.includes(mention))?.[1] ?? fallback;
+}
+
+function nodeEventSummary(event: EventLog, language: Language) {
+  const payload = event.data?.payload ?? {};
+  const counts = [
+    ["candidate_sources", language === "zh" ? "候选文献" : "candidates"],
+    ["verified_sources", language === "zh" ? "已验证" : "verified"],
+    ["completed_plans", language === "zh" ? "已完成计划" : "plans"],
+  ]
+    .filter(([key]) => typeof payload[key] === "number")
+    .map(([key, label]) => `${label} ${String(payload[key])}`);
+  const hypothesis = typeof payload.hypothesis_id === "string" ? payload.hypothesis_id : "";
+  return [hypothesis, ...counts].filter(Boolean).join(" · ") || event.message;
+}
+
+const nodeActivityLabel: Record<string, Record<Language, string>> = {
+  query_planning: { zh: "分析研究问题并规划检索词", en: "Analyzing the question and planning queries" },
+  source_search: { zh: "检索文献来源", en: "Searching literature sources" },
+  source_verify: { zh: "核验文献来源与标识符", en: "Verifying source identifiers" },
+  relevance_filter: { zh: "筛选与问题高度相关的文献", en: "Filtering relevant sources" },
+  literature_extract: { zh: "提取结构化文献卡片", en: "Extracting literature cards" },
+  evidence_extract: { zh: "提取可追溯证据卡片", en: "Extracting traceable evidence" },
+  gap_synthesis: { zh: "梳理现有证据中的知识空白", en: "Synthesizing knowledge gaps" },
+  quality_review: { zh: "检查知识整合结果质量", en: "Reviewing integration quality" },
+  package_select: { zh: "选择假设及其证据包", en: "Selecting hypothesis evidence packages" },
+  aggregate: { zh: "汇总并规范化研究计划", en: "Aggregating research plans" },
+  operator_instruction: { zh: "应用用户追加指令", en: "Applying the operator instruction" },
+  workflow: { zh: "执行总控工作流", en: "Running the controller workflow" },
+};
+
+const stageActivityLabel: Record<StageId, Record<Language, string>> = {
+  question_understanding: { zh: "理解并结构化研究问题", en: "Structuring the research question" },
+  knowledge_integration: { zh: "整合文献、证据与知识空白", en: "Integrating literature and evidence" },
+  hypothesis_generation: { zh: "生成候选科学假设", en: "Generating scientific hypotheses" },
+  evidence_mapping: { zh: "梳理假设与证据关系", en: "Mapping hypotheses to evidence" },
+  research_planning: { zh: "制定可执行研究方案", en: "Building executable research plans" },
+  final_review: { zh: "执行总控最终审核", en: "Running the final controller review" },
+};
+
+function getNodeActivityLabel(event: EventLog, language: Language) {
+  const nodeId = String(event.data?.node_id ?? event.stage ?? "workflow");
+  if (nodeId.startsWith("dify_call:")) {
+    const hypothesisId = nodeId.slice("dify_call:".length);
+    return language === "zh"
+      ? `调用研究规划工作流（${hypothesisId}）`
+      : `Calling the planning workflow (${hypothesisId})`;
+  }
+  if (nodeActivityLabel[nodeId]) return nodeActivityLabel[nodeId][language];
+  if (event.stage && stageOrder.includes(event.stage as StageId)) {
+    const stage = event.stage as StageId;
+    return stageActivityLabel[stage][language];
+  }
+  return language === "zh" ? "处理当前任务" : "Processing the current task";
+}
+
+function getWorkflowActivity(event: EventLog, language: Language) {
+  const label = getNodeActivityLabel(event, language);
+  const summary = nodeEventSummary(event, language);
+  const kind = event.data?.kind;
+  if (language === "en") return summary || label;
+  if (kind === "partial_output") return `${label}，已产生阶段性结果`;
+  if (event.type === "node_final_output") return `${label}已完成，正在校验输出`;
+  if (kind === "paused") return `${label}已暂停`;
+  const payload = event.data?.payload ?? {};
+  const counts = [
+    typeof payload.candidate_sources === "number" ? `候选文献 ${payload.candidate_sources} 篇` : "",
+    typeof payload.verified_sources === "number" ? `已核验 ${payload.verified_sources} 篇` : "",
+    typeof payload.completed_plans === "number" ? `已完成计划 ${payload.completed_plans} 份` : "",
+  ].filter(Boolean);
+  return counts.length ? `${label}，${counts.join("，")}` : `正在${label}`;
+}
+
+function workflowMessageStatus(event: EventLog): StageRun["status"] {
+  if (event.type === "node_final_output") return "validating";
+  if (event.type === "node_human_review") return "human_review";
+  if (event.type === "node_retry") return "revision_required";
+  if (event.type === "node_failed") return "failed";
+  return "running";
+}
+
+function messageIteration(message: ThreadMessage) {
+  return message.iteration ?? message.response?.metadata.iteration ?? 1;
+}
+
+function stageMessageId(taskId: string, iteration: number, stage: StageId) {
+  return `stage_${taskId}_i${String(iteration).padStart(3, "0")}_${stage}`;
+}
+
+function upsertStageMessage(
+  current: ThreadMessage[],
+  stage: StageId,
+  iteration: number,
+  nextMessage: ThreadMessage,
+): ThreadMessage[] {
+  const next: ThreadMessage[] = [];
+  let inserted = false;
+  current.forEach((message) => {
+    if (
+      message.kind !== "user"
+      && message.stage === stage
+      && messageIteration(message) === iteration
+    ) {
+      if (!inserted) {
+        next.push(nextMessage);
+        inserted = true;
+      }
+      return;
+    }
+    next.push(message);
+  });
+  if (!inserted) next.push(nextMessage);
+  return next;
+}
+
+function applyWorkflowEventToMessages(
+  current: ThreadMessage[],
+  event: EventLog,
+  language: Language,
+  iteration: number,
+): ThreadMessage[] {
+  const runId = event.data?.run_id;
+  if (!runId || !event.stage || !stageOrder.includes(event.stage as StageId)) return current;
+  const stage = event.stage as StageId;
+  const id = stageMessageId(event.task_id, iteration, stage);
+  const existing = current.find((message) => message.id === id)
+    ?? current.find((message) =>
+      message.kind !== "user"
+      && message.stage === stage
+      && messageIteration(message) === iteration);
+  const sameRun = existing?.workflowRunId === runId;
+  const status = workflowMessageStatus(event);
+  const createdAt = sameRun ? existing.createdAt : event.created_at;
+  const durationMs = ["failed", "human_review", "revision_required", "passed"].includes(status)
+    ? Math.max(0, Date.parse(event.created_at) - Date.parse(createdAt))
+    : sameRun ? existing?.durationMs : undefined;
+  const nextMessage: ThreadMessage = {
+    ...(existing ?? {
+      id,
+      kind: stage === "final_review" ? "controller" : "agent",
+      stage,
+      response: null,
+      review: null,
+      needsApproval: false,
+      createdAt,
+    }),
+    id,
+    iteration,
+    response: sameRun ? existing?.response ?? null : null,
+    review: sameRun ? existing?.review ?? null : null,
+    needsApproval: false,
+    createdAt,
+    status,
+    activity: getWorkflowActivity(event, language),
+    activityNode: getNodeActivityLabel(event, language),
+    activityProgress: typeof event.data?.progress === "number" ? event.data.progress : existing?.activityProgress,
+    workflowRunId: runId,
+    durationMs,
+  };
+  return upsertStageMessage(current, stage, iteration, nextMessage);
+}
+
+function applyWorkflowEventsToMessages(
+  current: ThreadMessage[],
+  events: EventLog[],
+  language: Language,
+  iteration: number,
+) {
+  return [...events]
+    .sort((left, right) => (left.data?.sequence ?? 0) - (right.data?.sequence ?? 0))
+    .reduce((messages, event) => applyWorkflowEventToMessages(messages, event, language, iteration), current);
+}
+
+function applyStageDetailToMessages(
+  current: ThreadMessage[],
+  detail: TaskStageDetail,
+  runId: string,
+  createdAt: string,
+  runIteration: number,
+): ThreadMessage[] {
+  if (!detail.output) return current;
+  const stage = detail.stage.stage;
+  const iteration = detail.output.metadata.iteration ?? runIteration;
+  const id = stageMessageId(detail.task_id, iteration, stage);
+  const existing = current.find((message) => message.id === id)
+    ?? current.find((message) =>
+      message.kind !== "user"
+      && message.stage === stage
+      && messageIteration(message) === iteration);
+  const status = normalizeRemoteStageStatus(detail.status);
+  const nextMessage: ThreadMessage = {
+    ...(existing ?? {
+      id,
+      kind: stage === "final_review" ? "controller" : "agent",
+      stage,
+      createdAt,
+    }),
+    id,
+    iteration,
+    response: detail.output,
+    review: detail.review,
+    status,
+    needsApproval: status === "human_review" && stage !== "final_review",
+    retryFromStage: status === "revision_required"
+      ? getFeedbackTargetStage(detail.output, stage)
+      : undefined,
+    durationMs: detail.output.metadata.duration_ms ?? existing?.durationMs,
+    activity: undefined,
+    activityNode: undefined,
+    activityProgress: undefined,
+    workflowRunId: runId,
+  };
+  return upsertStageMessage(current, stage, iteration, nextMessage);
+}
 
 const makeMessageId = (prefix: string) => `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 
@@ -526,6 +800,8 @@ function createProjectSession(index: number, mode: RunMode, language: Language, 
     files: [],
     attachments: [],
     feedbackDrafts: {},
+    iterationDraft: "",
+    iterationScore: 3,
   };
 }
 
@@ -564,6 +840,7 @@ function invalidateStageRuns(stages: StageRun[], targetIndex: number, nextContex
 function projectMessagesFromRemote(
   context: TaskContext,
   details: TaskStageDetail[],
+  history: TaskStageHistoryEntry[],
   language: Language,
   createdAt: string,
 ): ThreadMessage[] {
@@ -593,22 +870,92 @@ function projectMessagesFromRemote(
       createdAt: event.created_at ?? createdAt,
     });
   }
-  details.forEach((detail) => {
+  const historicalDetails: TaskStageHistoryEntry[] = history.length
+    ? history
+    : details.flatMap((detail) => detail.output
+      ? [{
+          ...detail,
+          iteration: detail.output.metadata.iteration ?? context.iteration,
+          node_run_id: `legacy_${detail.stage.stage}`,
+          started_at: createdAt,
+          finished_at: detail.review?.created_at ?? createdAt,
+        }]
+      : []);
+  historicalDetails.forEach((detail) => {
     if (!detail.output) return;
     const status = normalizeRemoteStageStatus(detail.status);
     messages.push({
-      id: `remote_stage_${context.task_id}_${detail.stage.stage}`,
+      id: stageMessageId(context.task_id, detail.iteration, detail.stage.stage),
       kind: detail.stage.stage === "final_review" ? "controller" : "agent",
       stage: detail.stage.stage,
+      iteration: detail.iteration,
       response: detail.output,
       review: detail.review,
       status,
-      needsApproval: status === "human_review",
+      needsApproval: status === "human_review" && detail.stage.stage !== "final_review",
       durationMs: detail.output.metadata.duration_ms ?? undefined,
-      createdAt: detail.review?.created_at ?? createdAt,
+      createdAt: detail.finished_at ?? detail.review?.created_at ?? detail.started_at,
     });
   });
-  return messages;
+  (context.plan_evaluations ?? []).forEach((rawEvaluation, index) => {
+    const evaluation = rawEvaluation as Record<string, unknown>;
+    const iterationPlan = (context.iteration_plans?.[index] ?? {}) as Record<string, unknown>;
+    const timestamp = String(evaluation.created_at ?? iterationPlan.created_at ?? createdAt);
+    const score = Number(evaluation.user_score ?? 0);
+    const comment = String(evaluation.comment ?? "");
+    const agents = Array.isArray(iterationPlan.agents_to_rerun)
+      ? iterationPlan.agents_to_rerun.map(String)
+      : [];
+    messages.push(
+      {
+        id: `remote_iteration_user_${context.task_id}_${index}`,
+        kind: "user",
+        body: language === "zh" ? `计划评分 ${score}/5：${comment}` : `Plan score ${score}/5: ${comment}`,
+        createdAt: timestamp,
+      },
+      {
+        id: `remote_iteration_controller_${context.task_id}_${index}`,
+        kind: "controller",
+        body: language === "zh"
+          ? `总控已进入第 ${index + 2} 轮，将重新运行：${agents.map((stage) => stageLabel.zh[stage as StageId] ?? stage).join("、")}。${String(iterationPlan.reason ?? "")}`
+          : `The controller started iteration ${index + 2} and will rerun: ${agents.join(", ")}. ${String(iterationPlan.reason ?? "")}`,
+        status: "passed",
+        createdAt: timestamp,
+      },
+    );
+  });
+  (context.controller_routes ?? []).forEach((rawRoute, index) => {
+    const route = rawRoute as Record<string, unknown>;
+    const timestamp = String(route.created_at ?? createdAt);
+    messages.push(
+      {
+        id: `remote_qa_user_${context.task_id}_${index}`,
+        kind: "user",
+        body: String(route.optimized_instruction ?? ""),
+        createdAt: timestamp,
+      },
+      {
+        id: `remote_qa_controller_${context.task_id}_${index}`,
+        kind: "controller",
+        body: String(route.answer ?? route.reason ?? ""),
+        status: "passed",
+        createdAt: timestamp,
+      },
+    );
+  });
+  const iterationControl = context.extensions?.iteration_control;
+  if (iterationControl?.status === "ended") {
+    messages.push({
+      id: `remote_iteration_ended_${context.task_id}`,
+      kind: "controller",
+      body: language === "zh"
+        ? "本项目已结束迭代。你现在可以继续针对假设、证据和研究计划向总控提问。"
+        : "Iteration has ended. You can continue asking the controller about hypotheses, evidence, and the research plan.",
+      status: "passed",
+      createdAt: String(iterationControl.ended_at ?? createdAt),
+    });
+  }
+  return messages.sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
 }
 
 async function restoreRemoteProject(
@@ -616,11 +963,12 @@ async function restoreRemoteProject(
   index: number,
   language: Language,
 ): Promise<ProjectSession> {
-  const [record, events, attachments, details] = await Promise.all([
+  const [record, events, attachments, details, history] = await Promise.all([
     fetchTaskRecord(manifest.task_id),
     fetchTaskEvents(manifest.task_id),
     fetchTaskAttachments(manifest.task_id),
     Promise.all(stageOrder.map((stage) => fetchTaskStage(manifest.task_id, stage))),
+    fetchTaskStageHistory(manifest.task_id),
   ]);
   const context = record.task_context;
   const baseStages = createInitialStages(context);
@@ -659,9 +1007,9 @@ async function restoreRemoteProject(
     updatedAt: manifest.updated_at,
     context,
     stages,
-    events,
+    events: [...events].reverse(),
     versions: context.versions,
-    messages: projectMessagesFromRemote(context, details, language, manifest.created_at),
+    messages: projectMessagesFromRemote(context, details, history, language, manifest.created_at),
     activeStage: currentStage,
     reviewStage: waitingIndex >= 0 ? stages[waitingIndex].id : null,
     pendingIndex: waitingIndex >= 0 ? waitingIndex : null,
@@ -670,6 +1018,8 @@ async function restoreRemoteProject(
     files: [],
     attachments,
     feedbackDrafts: {},
+    iterationDraft: "",
+    iterationScore: 3,
   };
 }
 
@@ -714,18 +1064,43 @@ function App() {
   const [attachments, setAttachments] = useState<RemoteAttachment[]>(() => projects[0].attachments);
   const [feedbackTarget, setFeedbackTarget] = useState<StageId>("research_planning");
   const [feedbackDrafts, setFeedbackDrafts] = useState<Record<string, string>>(() => projects[0].feedbackDrafts);
+  const [iterationDraft, setIterationDraft] = useState(() => projects[0].iterationDraft);
+  const [iterationScore, setIterationScore] = useState(() => projects[0].iterationScore);
+  const [iterationBusy, setIterationBusy] = useState(false);
   const [remoteArtifacts, setRemoteArtifacts] = useState<RemoteArtifact[]>([]);
   const [runtimeError, setRuntimeError] = useState("");
   const [versionDiff, setVersionDiff] = useState<VersionDiffResult | null>(null);
   const [health, setHealth] = useState<HealthStatus | null>(null);
+  const [activeRun, setActiveRun] = useState<WorkflowRun | null>(null);
+  const [runsByTask, setRunsByTask] = useState<Record<string, WorkflowRun | null>>({});
+  const [streamConnected, setStreamConnected] = useState(false);
   const threadEndRef = useRef<HTMLDivElement | null>(null);
   const taskIdRef = useRef(context.task_id);
+  const activeProjectIdRef = useRef(activeProjectId);
+  const runsByTaskRef = useRef<Record<string, WorkflowRun | null>>({});
+  const streamConnectedByTaskRef = useRef<Record<string, boolean>>({});
   const restoredLanguageRef = useRef<Language | null>(null);
+  const restoredTaskIdsRef = useRef<Set<string>>(new Set());
+
+  const trackWorkflowRun = useCallback((taskId: string, run: WorkflowRun | null) => {
+    runsByTaskRef.current = { ...runsByTaskRef.current, [taskId]: run };
+    setRunsByTask((current) => ({ ...current, [taskId]: run }));
+    if (taskIdRef.current === taskId) {
+      setActiveRun(run);
+      setRunning(Boolean(run && activeWorkflowStatuses.has(run.status)));
+    }
+  }, []);
 
   const t = copy[language];
   const runMode = approvalToRunMode[approval];
   const completedCount = stages.filter((stage) => stage.status === "passed").length;
   const finished = context.current_stage === "completed";
+  const iterationEnded = context.extensions?.iteration_control?.status === "ended";
+  const controllerFinalReview = context.final_review
+    ?? stages.find((stage) => stage.id === "final_review")?.output?.payload.final_review as FinalReview | undefined;
+  const iterationReviewReady = Boolean(
+    controllerFinalReview && context.research_plan && !iterationEnded && !running,
+  );
   const progress = Math.round((completedCount / stages.length) * 100);
   const currentStageLabel = finished ? statusLabel[language].completed : stageLabel[language][activeStage];
   const uploadedLabel = [...attachments.map((item) => item.name), ...files.map((file) => file.name)].join(", ") || t.noFiles;
@@ -736,6 +1111,16 @@ function App() {
   const maxIterations = health?.max_iterations ?? 10;
   const readyAgentCount = health?.ready_agent_count ?? 0;
   const activeProject = projects.find((project) => project.id === activeProjectId) ?? projects[0];
+  const liveNodeEvents = useMemo(() => {
+    if (!activeRun) return [];
+    const seen = new Set<string>();
+    return events.filter((event) => {
+      if (event.data?.run_id !== activeRun.run_id || !event.data.node_id) return false;
+      if (seen.has(event.data.node_id)) return false;
+      seen.add(event.data.node_id);
+      return true;
+    }).slice(0, 6);
+  }, [activeRun, events]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -801,6 +1186,8 @@ function App() {
               context,
               events,
               feedbackDrafts,
+              iterationDraft,
+              iterationScore,
               files,
               hasSubmittedQuestion,
               messages,
@@ -825,6 +1212,8 @@ function App() {
     files,
     hasSubmittedQuestion,
     messages,
+    iterationDraft,
+    iterationScore,
     pendingIndex,
     questionDraft,
     reviewStage,
@@ -832,7 +1221,10 @@ function App() {
     versions,
   ]);
 
-  const hydrateProject = useCallback((project: ProjectSession) => {
+  const hydrateProject = useCallback((project: ProjectSession, runOverride?: WorkflowRun | null) => {
+    const projectRun = runOverride === undefined
+      ? runsByTaskRef.current[project.context.task_id] ?? null
+      : runOverride;
     taskIdRef.current = project.context.task_id;
     setContext(project.context);
     setStages(project.stages);
@@ -852,10 +1244,15 @@ function App() {
     setApproval(project.context.mode === "manual" ? "ask" : project.context.mode === "auto" ? "auto" : "assist");
     setFeedbackTarget(project.activeStage === "final_review" ? "research_planning" : project.activeStage);
     setFeedbackDrafts(project.feedbackDrafts);
+    setIterationDraft(project.iterationDraft);
+    setIterationScore(project.iterationScore);
+    setIterationBusy(false);
     setRemoteArtifacts([]);
     setRuntimeError("");
     setVersionDiff(null);
-    setRunning(false);
+    setActiveRun(projectRun);
+    setStreamConnected(Boolean(streamConnectedByTaskRef.current[project.context.task_id]));
+    setRunning(Boolean(projectRun && activeWorkflowStatuses.has(projectRun.status)));
     setTreeOpen(false);
     setJsonOpen(null);
   }, []);
@@ -888,8 +1285,10 @@ function App() {
         }
         if (remoteProjects.length === 0) return;
         restoredLanguageRef.current = language;
+        restoredTaskIdsRef.current = new Set(remoteProjects.map((project) => project.context.task_id));
         setProjects(remoteProjects);
         setActiveProjectId(remoteProjects[0].id);
+        activeProjectIdRef.current = remoteProjects[0].id;
         hydrateProject(remoteProjects[0]);
       })
       .catch((error) => {
@@ -902,29 +1301,31 @@ function App() {
 
   const selectProject = useCallback(
     (projectId: string) => {
-      if (running || projectId === activeProjectId) return;
+      if (projectId === activeProjectId) return;
       const nextProject = projects.find((project) => project.id === projectId);
       if (!nextProject) return;
+      activeProjectIdRef.current = projectId;
       setActiveProjectId(projectId);
       hydrateProject(nextProject);
       setPage("workbench");
     },
-    [activeProjectId, hydrateProject, projects, running],
+    [activeProjectId, hydrateProject, projects],
   );
 
   const createNewProject = useCallback(() => {
-    if (running) return;
     const nextProject = createProjectSession(projects.length + 1, runMode, language);
     setProjects((current) => [...current, nextProject]);
+    activeProjectIdRef.current = nextProject.id;
     setActiveProjectId(nextProject.id);
     hydrateProject(nextProject);
     setPage("workbench");
-  }, [hydrateProject, language, projects.length, runMode, running]);
+  }, [hydrateProject, language, projects.length, runMode]);
 
   const archiveProject = useCallback(async (projectId: string) => {
-    if (running) return;
     const target = projects.find((project) => project.id === projectId);
     if (!target) return;
+    const targetRun = runsByTaskRef.current[target.context.task_id];
+    if (targetRun && activeWorkflowStatuses.has(targetRun.status)) return;
     setRuntimeError("");
     try {
       if (target.hasSubmittedQuestion) {
@@ -934,19 +1335,21 @@ function App() {
       if (remaining.length) {
         setProjects(remaining);
         if (projectId === activeProjectId) {
+          activeProjectIdRef.current = remaining[0].id;
           setActiveProjectId(remaining[0].id);
           hydrateProject(remaining[0]);
         }
       } else {
         const fresh = createProjectSession(1, runMode, language);
         setProjects([fresh]);
+        activeProjectIdRef.current = fresh.id;
         setActiveProjectId(fresh.id);
         hydrateProject(fresh);
       }
     } catch (error) {
       setRuntimeError(error instanceof Error ? error.message : String(error));
     }
-  }, [activeProjectId, hydrateProject, language, projects, runMode, running]);
+  }, [activeProjectId, hydrateProject, language, projects, runMode]);
 
   const appendEvent = useCallback(
     (type: string, messageZh: string, messageEn: string, stage?: StageId | "final_review" | "feedback_revision") => {
@@ -978,6 +1381,265 @@ function App() {
   const updateStage = useCallback((stageId: StageId, patch: Partial<StageRun>) => {
     setStages((current) => current.map((stage) => (stage.id === stageId ? { ...stage, ...patch } : stage)));
   }, []);
+
+  const monitorWorkflowRun = useCallback(
+    async (initialRun: WorkflowRun): Promise<WorkflowRun> => {
+      let currentRun = initialRun;
+      const monitoredProjectId = activeProjectIdRef.current;
+      const taskId = currentRun.task_id;
+      const isForeground = () => activeProjectIdRef.current === monitoredProjectId;
+      const updateMonitoredProject = (updater: (project: ProjectSession) => ProjectSession) => {
+        setProjects((current) => current.map((project) =>
+          project.id === monitoredProjectId || project.context.task_id === taskId
+            ? updater(project)
+            : project,
+        ));
+      };
+      const loadCompletedStage = (event: EventLog) => {
+        if (event.type !== "node_final_output" || !event.stage || !stageOrder.includes(event.stage as StageId)) {
+          return;
+        }
+        const stage = event.stage as StageId;
+        void fetchTaskStage(taskId, stage)
+          .then((detail) => {
+            const status = normalizeRemoteStageStatus(detail.status);
+            const durationMs = detail.output?.metadata.duration_ms ?? null;
+            updateMonitoredProject((project) => ({
+              ...project,
+              messages: applyStageDetailToMessages(
+                project.messages,
+                detail,
+                currentRun.run_id,
+                event.created_at,
+                currentRun.iteration_id,
+              ),
+              stages: project.stages.map((item) => item.id === stage
+                ? {
+                    ...item,
+                    status,
+                    output: detail.output,
+                    review: detail.review,
+                    duration: durationMs == null ? item.duration : `${(durationMs / 1000).toFixed(1)}s`,
+                  }
+                : item),
+            }));
+            if (!isForeground()) return;
+            setMessages((current) => applyStageDetailToMessages(
+              current,
+              detail,
+              currentRun.run_id,
+              event.created_at,
+              currentRun.iteration_id,
+            ));
+            updateStage(stage, {
+              status,
+              output: detail.output,
+              review: detail.review,
+              duration: durationMs == null ? undefined : `${(durationMs / 1000).toFixed(1)}s`,
+            });
+          })
+          .catch((error) => {
+            if (isForeground()) {
+              setRuntimeError(error instanceof Error ? error.message : String(error));
+            }
+          });
+      };
+
+      trackWorkflowRun(taskId, currentRun);
+      const existingEvents = await fetchTaskEvents(currentRun.task_id);
+      const currentRunEvents = existingEvents.filter((event) => event.data?.run_id === currentRun.run_id);
+      updateMonitoredProject((project) => {
+        const known = new Set(project.events.map(eventKey));
+        return {
+          ...project,
+          events: [
+            ...existingEvents.filter((event) => !known.has(eventKey(event))).reverse(),
+            ...project.events,
+          ],
+          messages: applyWorkflowEventsToMessages(
+            project.messages,
+            currentRunEvents,
+            language,
+            currentRun.iteration_id,
+          ),
+        };
+      });
+      if (isForeground()) {
+        setEvents((current) => {
+          const known = new Set(current.map(eventKey));
+          return [
+            ...existingEvents.filter((event) => !known.has(eventKey(event))).reverse(),
+            ...current,
+          ];
+        });
+        setMessages((current) => applyWorkflowEventsToMessages(
+          current,
+          currentRunEvents,
+          language,
+          currentRun.iteration_id,
+        ));
+      }
+      currentRunEvents.forEach(loadCompletedStage);
+      const closeStream = subscribeTaskEvents(
+        currentRun.task_id,
+        (event) => {
+          updateMonitoredProject((project) => {
+            const nextProject = project.events.some((item) => eventKey(item) === eventKey(event))
+              ? project
+              : { ...project, events: [event, ...project.events] };
+            const nextMessages = applyWorkflowEventToMessages(
+              nextProject.messages,
+              event,
+              language,
+              currentRun.iteration_id,
+            );
+            if (!event.stage || !stageOrder.includes(event.stage as StageId)) {
+              return nextMessages === nextProject.messages
+                ? nextProject
+                : { ...nextProject, messages: nextMessages };
+            }
+            const stage = event.stage as StageId;
+            const status = event.type === "node_started"
+              ? "running" as const
+              : event.type === "node_final_output"
+                ? "validating" as const
+                : null;
+            return {
+              ...nextProject,
+              activeStage: stage,
+              messages: nextMessages,
+              stages: status
+                ? nextProject.stages.map((item) => item.id === stage ? { ...item, status } : item)
+                : nextProject.stages,
+            };
+          });
+          loadCompletedStage(event);
+          if (!isForeground()) return;
+          setEvents((current) => current.some((item) => eventKey(item) === eventKey(event))
+            ? current
+            : [event, ...current]);
+          setMessages((current) => applyWorkflowEventToMessages(
+            current,
+            event,
+            language,
+            currentRun.iteration_id,
+          ));
+          if (event.stage && stageOrder.includes(event.stage as StageId)) {
+            const stage = event.stage as StageId;
+            setActiveStage(stage);
+            if (event.type === "node_started") {
+              updateStage(stage, { status: "running" });
+            } else if (event.type === "node_final_output") {
+              updateStage(stage, { status: "validating" });
+            }
+          }
+        },
+        (connected) => {
+          streamConnectedByTaskRef.current = {
+            ...streamConnectedByTaskRef.current,
+            [taskId]: connected,
+          };
+          if (isForeground()) setStreamConnected(connected);
+        },
+        existingEvents.length,
+      );
+
+      try {
+        while (activeWorkflowStatuses.has(currentRun.status)) {
+          await delay(700);
+          currentRun = await fetchWorkflowRun(currentRun.run_id);
+          trackWorkflowRun(taskId, currentRun);
+          if (stageOrder.includes(currentRun.current_stage)) {
+            updateMonitoredProject((project) => ({
+              ...project,
+              activeStage: currentRun.current_stage,
+            }));
+            if (isForeground()) setActiveStage(currentRun.current_stage);
+          }
+        }
+
+        const record = await fetchTaskRecord(currentRun.task_id);
+        const restored = await restoreRemoteProject(record.manifest, 1, language);
+        const restoredProject = { ...restored, id: monitoredProjectId };
+        updateMonitoredProject(() => restoredProject);
+        trackWorkflowRun(taskId, currentRun);
+        if (isForeground()) {
+          hydrateProject(restoredProject, currentRun);
+        }
+        if (isForeground() && currentRun.status === "failed") {
+          setRuntimeError(currentRun.error || "Workflow run failed.");
+        }
+        return currentRun;
+      } finally {
+        closeStream();
+        streamConnectedByTaskRef.current = {
+          ...streamConnectedByTaskRef.current,
+          [taskId]: false,
+        };
+        if (isForeground()) setStreamConnected(false);
+      }
+    },
+    [hydrateProject, language, trackWorkflowRun, updateStage],
+  );
+
+  useEffect(() => {
+    if (!hasSubmittedQuestion || !restoredTaskIdsRef.current.has(context.task_id)) return;
+    restoredTaskIdsRef.current.delete(context.task_id);
+    let active = true;
+    void fetchTaskRuns(context.task_id)
+      .then((runs) => {
+        if (!active) return;
+        const latestRun = runs[0] ?? null;
+        trackWorkflowRun(context.task_id, latestRun);
+        if (latestRun && activeWorkflowStatuses.has(latestRun.status)) {
+          void monitorWorkflowRun(latestRun).catch((error) => {
+            if (active) {
+              trackWorkflowRun(context.task_id, null);
+              setRuntimeError(error instanceof Error ? error.message : String(error));
+            }
+          });
+        }
+      })
+      .catch((error) => {
+        if (active) setRuntimeError(error instanceof Error ? error.message : String(error));
+      });
+    return () => {
+      active = false;
+    };
+  }, [context.task_id, hasSubmittedQuestion, monitorWorkflowRun, trackWorkflowRun]);
+
+  const pauseActiveRun = useCallback(async () => {
+    if (!activeRun || !["queued", "running"].includes(activeRun.status)) return;
+    try {
+      trackWorkflowRun(activeRun.task_id, await pauseWorkflowRun(activeRun.run_id));
+    } catch (error) {
+      setRuntimeError(error instanceof Error ? error.message : String(error));
+    }
+  }, [activeRun, trackWorkflowRun]);
+
+  const resumeActiveRun = useCallback(async () => {
+    if (!activeRun || !["pausing", "paused", "interrupted", "cancelled"].includes(activeRun.status)) return;
+    try {
+      const resumed = await resumeWorkflowRun(activeRun.run_id);
+      trackWorkflowRun(resumed.task_id, resumed);
+      if (!running) {
+        setRunning(true);
+        await monitorWorkflowRun(resumed);
+      }
+    } catch (error) {
+      setRunning(false);
+      setRuntimeError(error instanceof Error ? error.message : String(error));
+    }
+  }, [activeRun, monitorWorkflowRun, running, trackWorkflowRun]);
+
+  const cancelActiveRun = useCallback(async () => {
+    if (!activeRun || ["cancelled", "completed", "failed"].includes(activeRun.status)) return;
+    try {
+      trackWorkflowRun(activeRun.task_id, await cancelWorkflowRun(activeRun.run_id));
+    } catch (error) {
+      setRuntimeError(error instanceof Error ? error.message : String(error));
+    }
+  }, [activeRun, trackWorkflowRun]);
 
   const buildFreshTask = useCallback(
     (question: string) => {
@@ -1023,6 +1685,7 @@ function App() {
         const messageId = pushMessage({
           kind: stage === "final_review" ? "controller" : "agent",
           stage,
+          iteration: workingContext.iteration,
           status: "running",
           response: null,
           review: null,
@@ -1224,8 +1887,24 @@ function App() {
       `总控已启动：推理 ${reasoning}，权限 ${approval}，记忆 ${memory}。`,
       `Controller started: reasoning ${reasoning}, access ${approval}, memory ${memory}.`,
     );
-    await continueFrom(0, fresh, []);
-  }, [appendEvent, approval, buildFreshTask, continueFrom, files, language, memory, pushMessage, questionDraft, reasoning, running, t.controllerStarted]);
+    try {
+      if (usesRealAgents) {
+        const run = await startWorkflowRun(fresh.task_id);
+        await monitorWorkflowRun(run);
+      } else {
+        await continueFrom(0, fresh, []);
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setRuntimeError(detail);
+      setRunning(false);
+      pushMessage({
+        kind: "controller",
+        body: language === "zh" ? `工作流启动失败：${detail}` : `Workflow failed to start: ${detail}`,
+        status: "failed",
+      });
+    }
+  }, [appendEvent, approval, buildFreshTask, continueFrom, files, language, memory, monitorWorkflowRun, pushMessage, questionDraft, reasoning, running, t.controllerStarted]);
 
   const approveReview = useCallback(async (stageOverride?: StageId) => {
     const stage = stageOverride ?? reviewStage;
@@ -1284,9 +1963,32 @@ function App() {
     setVersions(nextVersions);
 
     setRunning(true);
-    await delay(260);
-    await continueFrom(resumeIndex + 1, nextContext, nextVersions);
-  }, [appendEvent, context, continueFrom, language, pendingIndex, reviewStage, running, stages, updateStage, versions]);
+    try {
+      const runs = await fetchTaskRuns(context.task_id);
+      const waitingRun = activeRun?.task_id === context.task_id
+        && ["human_review", "retry", "paused", "interrupted"].includes(activeRun.status)
+        ? activeRun
+        : runs.find((item) => ["human_review", "retry", "paused", "interrupted"].includes(item.status));
+      if (waitingRun) {
+        const resumed = await resumeWorkflowRun(waitingRun.run_id);
+        await monitorWorkflowRun(resumed);
+      } else if (usesRealAgents) {
+        const nextStage = stageOrder[resumeIndex + 1];
+        if (nextStage) {
+          const run = await startWorkflowRun(context.task_id, nextStage);
+          await monitorWorkflowRun(run);
+        } else {
+          setRunning(false);
+        }
+      } else {
+        await delay(260);
+        await continueFrom(resumeIndex + 1, nextContext, nextVersions);
+      }
+    } catch (error) {
+      setRunning(false);
+      setRuntimeError(error instanceof Error ? error.message : String(error));
+    }
+  }, [activeRun, appendEvent, context, continueFrom, language, monitorWorkflowRun, pendingIndex, reviewStage, running, stages, updateStage, versions]);
 
   const rerunStageWithFeedback = useCallback(
     async (
@@ -1304,7 +2006,6 @@ function App() {
         : feedbackDrafts[sourceMessageId]?.trim() || (language === "zh" ? "请重新检查并改进这一阶段输出。" : "Please re-check and improve this stage output.");
 
       let rerunContext = context;
-      let rerunVersions = versions;
       try {
         const recorded = await recordFeedback(context.task_id, stage, note, {
           mode: runMode,
@@ -1313,7 +2014,6 @@ function App() {
         });
         if (recorded) {
           rerunContext = recorded;
-          rerunVersions = recorded.versions;
           setContext(recorded);
           setVersions(recorded.versions);
         }
@@ -1358,28 +2058,32 @@ function App() {
       );
 
       setRunning(true);
-      await delay(320);
-      await continueFrom(index, rerunContext, rerunVersions, note);
+      try {
+        const run = await startWorkflowRun(context.task_id, stage, note);
+        await monitorWorkflowRun(run);
+      } catch (error) {
+        setRunning(false);
+        setRuntimeError(error instanceof Error ? error.message : String(error));
+      }
     },
     [
       appendEvent,
       context,
-      continueFrom,
       feedbackDrafts,
       language,
       memory,
+      monitorWorkflowRun,
       pushMessage,
       reasoning,
       runMode,
       running,
-      versions,
     ],
   );
 
   const submitProjectFeedback = useCallback(async () => {
     const typedNote = questionDraft.trim();
     if (running || (!typedNote && !files.length) || !hasSubmittedQuestion || context.current_stage === "human_review") return;
-    const targetStage = feedbackTarget;
+    const targetStage = mentionedStage(typedNote, feedbackTarget);
     const targetIndex = stageOrder.indexOf(targetStage);
     if (targetIndex < 0) return;
 
@@ -1429,17 +2133,22 @@ function App() {
       targetStage,
     );
     setRunning(true);
-    await delay(260);
-    await continueFrom(targetIndex, rerunContext, rerunContext.versions, note);
+    try {
+      const run = await startWorkflowRun(context.task_id, targetStage, note);
+      await monitorWorkflowRun(run);
+    } catch (error) {
+      setRunning(false);
+      setRuntimeError(error instanceof Error ? error.message : String(error));
+    }
   }, [
     appendEvent,
     context,
-    continueFrom,
     feedbackTarget,
     hasSubmittedQuestion,
     files,
     language,
     memory,
+    monitorWorkflowRun,
     pushMessage,
     questionDraft,
     reasoning,
@@ -1447,15 +2156,129 @@ function App() {
     running,
   ]);
 
+  const submitRunInstruction = useCallback(async () => {
+    const comment = questionDraft.trim();
+    if (!activeRun || !comment) return;
+    try {
+      const targetStage = mentionedStage(comment, feedbackTarget);
+      const updated = await queueRunInstruction(
+        activeRun.run_id,
+        comment,
+        targetStage,
+      );
+      trackWorkflowRun(updated.task_id, updated);
+      pushMessage({ kind: "user", body: comment, stage: targetStage });
+      pushMessage({
+        kind: "controller",
+        body: language === "zh"
+          ? `指令已排队，将在下一个安全节点边界应用到${stageLabel.zh[targetStage]}。`
+          : `Instruction queued for ${stageLabel.en[targetStage]} at the next safe node boundary.`,
+        status: "passed",
+      });
+      setQuestionDraft("");
+    } catch (error) {
+      setRuntimeError(error instanceof Error ? error.message : String(error));
+    }
+  }, [activeRun, feedbackTarget, language, pushMessage, questionDraft, trackWorkflowRun]);
+
+  const continueIteration = useCallback(async () => {
+    const controllerSuggestion = controllerFinalReview?.suggestions?.join("\n").trim();
+    const comment = iterationDraft.trim() || controllerSuggestion || (language === "zh"
+      ? "请根据总控评价继续优化假设、证据和研究计划。"
+      : "Continue improving the hypotheses, evidence, and research plan using the controller review.");
+    if (iterationBusy || running || !context.research_plan) return;
+    setIterationBusy(true);
+    setRuntimeError("");
+    pushMessage({
+      kind: "user",
+      body: language === "zh" ? `计划评分 ${iterationScore}/5：${comment}` : `Plan score ${iterationScore}/5: ${comment}`,
+    });
+    try {
+      const result = await evaluateResearchPlan(context.task_id, iterationScore, comment);
+      setContext(result.task_context);
+      setVersions(result.task_context.versions);
+      setIterationDraft("");
+      const firstStage = result.iteration_plan.agents_to_rerun[0] ?? "research_planning";
+      setActiveStage(firstStage);
+      setFeedbackTarget(firstStage === "final_review" ? "research_planning" : firstStage);
+      setStages((current) => invalidateStageRuns(
+        current,
+        Math.max(0, stageOrder.indexOf(firstStage)),
+        result.task_context,
+      ));
+      pushMessage({
+        kind: "controller",
+        body: language === "zh"
+          ? `总控已生成下一轮方案，将依次重新运行：${result.iteration_plan.agents_to_rerun.map((stage) => stageLabel.zh[stage]).join("、")}。${result.iteration_plan.reason}`
+          : `The controller will rerun: ${result.iteration_plan.agents_to_rerun.map((stage) => stageLabel.en[stage]).join(", ")}. ${result.iteration_plan.reason}`,
+        status: "passed",
+      });
+      if (result.run) await monitorWorkflowRun(result.run);
+    } catch (error) {
+      setRuntimeError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIterationBusy(false);
+    }
+  }, [context, controllerFinalReview, iterationBusy, iterationDraft, iterationScore, language, monitorWorkflowRun, pushMessage, running]);
+
+  const endIteration = useCallback(async () => {
+    if (iterationBusy || running || !context.research_plan) return;
+    setIterationBusy(true);
+    setRuntimeError("");
+    try {
+      const updated = await finishTaskIteration(context.task_id);
+      setContext(updated);
+      setIterationDraft("");
+      pushMessage({
+        kind: "controller",
+        body: language === "zh"
+          ? "本项目已结束迭代。你现在可以在聊天框继续询问假设、证据、研究计划或最终结论，总控只回答问题，不会自动重跑工作流。"
+          : "Iteration has ended. Ask about hypotheses, evidence, the research plan, or conclusions; the controller will answer without rerunning the workflow.",
+        status: "passed",
+      });
+    } catch (error) {
+      setRuntimeError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setIterationBusy(false);
+    }
+  }, [context, iterationBusy, language, pushMessage, running]);
+
+  const submitControllerQuestion = useCallback(async () => {
+    const question = questionDraft.trim();
+    if (!question || running) return;
+    setQuestionDraft("");
+    setRuntimeError("");
+    pushMessage({ kind: "user", body: question });
+    try {
+      const result = await routeControllerMessage(context.task_id, question, false);
+      setContext(result.task_context);
+      pushMessage({
+        kind: "controller",
+        body: result.route.answer || result.route.reason,
+        status: "passed",
+      });
+    } catch (error) {
+      setRuntimeError(error instanceof Error ? error.message : String(error));
+    }
+  }, [context.task_id, pushMessage, questionDraft, running]);
+
   const submitComposer = useCallback(() => {
-    if (hasSubmittedQuestion) {
+    if (running && activeRun) {
+      void submitRunInstruction();
+    } else if (iterationEnded) {
+      void submitControllerQuestion();
+    } else if (hasSubmittedQuestion) {
       void submitProjectFeedback();
     } else {
       void startDemo();
     }
-  }, [hasSubmittedQuestion, startDemo, submitProjectFeedback]);
+  }, [activeRun, hasSubmittedQuestion, iterationEnded, running, startDemo, submitControllerQuestion, submitProjectFeedback, submitRunInstruction]);
 
   const activeStageRun = stages.find((stage) => stage.id === activeStage) ?? stages[0];
+  const visibleMessages = iterationReviewReady
+    ? messages.filter((message) =>
+        message.stage !== "final_review" || messageIteration(message) !== context.iteration)
+    : messages;
 
   return (
     <div className="app-shell">
@@ -1485,11 +2308,11 @@ function App() {
 
         <ProjectPanel
           activeProjectId={activeProject.id}
-          disabled={running}
           onArchiveProject={(projectId) => void archiveProject(projectId)}
           onCreateProject={createNewProject}
           onSelectProject={selectProject}
           projects={projects}
+          runsByTask={runsByTask}
           t={t}
         />
 
@@ -1564,13 +2387,66 @@ function App() {
             />
           </div>
           {latestEvent ? <p className="latest-event">{latestEvent}</p> : null}
+          {activeRun ? (
+            <div className="run-monitor">
+              <div className="run-monitor-status">
+                <span>{language === "zh" ? "工作流" : "Workflow"}</span>
+                <strong>{activeRun.status}</strong>
+                <i className={streamConnected ? "connected" : "disconnected"} />
+              </div>
+              <p>
+                {activeWorkflowStatuses.has(activeRun.status)
+                  ? streamConnected
+                    ? language === "zh" ? "实时进度已连接" : "Live progress connected"
+                    : language === "zh" ? "正在重连进度流" : "Reconnecting progress stream"
+                  : language === "zh" ? "进度监听已停止" : "Progress stream stopped"}
+              </p>
+              <small title={activeRun.run_id}>{activeRun.run_id}</small>
+              {liveNodeEvents.length ? (
+                <div className="node-progress-list">
+                  {liveNodeEvents.map((event) => (
+                    <article className={event.data?.kind === "partial_output" ? "partial" : ""} key={eventKey(event)}>
+                      <div>
+                        <strong>{event.data?.node_id}</strong>
+                        <span>{event.data?.kind}</span>
+                      </div>
+                      <p>{nodeEventSummary(event, language)}</p>
+                      {typeof event.data?.progress === "number" ? (
+                        <i><b style={{ width: `${Math.round(event.data.progress * 100)}%` }} /></i>
+                      ) : null}
+                    </article>
+                  ))}
+                </div>
+              ) : null}
+              <div className="run-controls">
+                {["queued", "running"].includes(activeRun.status) ? (
+                  <button type="button" onClick={() => void pauseActiveRun()}>
+                    <Pause size={13} />
+                    {language === "zh" ? "暂停" : "Pause"}
+                  </button>
+                ) : null}
+                {["pausing", "paused", "interrupted", "cancelled"].includes(activeRun.status) ? (
+                  <button type="button" onClick={() => void resumeActiveRun()}>
+                    <Play size={13} />
+                    {language === "zh" ? "继续" : "Resume"}
+                  </button>
+                ) : null}
+                {!['cancelled', 'completed', 'failed'].includes(activeRun.status) ? (
+                  <button className="danger" type="button" onClick={() => void cancelActiveRun()}>
+                    <X size={13} />
+                    {language === "zh" ? "取消" : "Cancel"}
+                  </button>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
         </section>
       </aside>
 
       <main className="thread-shell">
         {page === "workbench" ? (
           <div className={`workbench-shell ${messages.length ? "" : "no-index"}`}>
-            {messages.length ? <MessageIndexRail language={language} messages={messages} /> : null}
+            {visibleMessages.length ? <MessageIndexRail language={language} messages={visibleMessages} /> : null}
             <div className="conversation-shell">
               <header className="thread-header">
               <div>
@@ -1599,7 +2475,25 @@ function App() {
                   health={health}
                   language={language}
                   maxIterations={maxIterations}
+                  modelPolicy={context.model_policy}
                   onConstraintChange={updateConstraints}
+                  onModelPolicyChange={(patch) => setContext((current) => ({
+                    ...current,
+                    model_policy: {
+                      ...(current.model_policy ?? {
+                        provider: "dashscope",
+                        model: health?.model ?? "qwen3.7-max",
+                        reasoning,
+                        temperature: 0.2,
+                        max_tokens: 6144,
+                        timeout_seconds: 120,
+                        max_retries: 0,
+                        response_format: "json_object",
+                        thinking_enabled: false,
+                      }),
+                      ...patch,
+                    },
+                  }))}
                   onSelectQuestion={(starter) => {
                     setQuestionDraft(starter.question[language]);
                     updateConstraints({ domain_preference: starter.domain });
@@ -1608,7 +2502,7 @@ function App() {
               ) : null}
 
               <div className="message-list">
-                {messages.map((message) => (
+                {visibleMessages.map((message) => (
                   <ThreadMessageCard
                     feedbackValue={feedbackDrafts[message.id] ?? ""}
                     key={message.id}
@@ -1637,18 +2531,33 @@ function App() {
                     t={t}
                   />
                 ))}
+                {iterationReviewReady && controllerFinalReview ? (
+                  <IterationDecisionCard
+                    busy={iterationBusy}
+                    comment={iterationDraft}
+                    finalReview={controllerFinalReview}
+                    iteration={context.iteration}
+                    language={language}
+                    maxIterations={maxIterations}
+                    onCommentChange={setIterationDraft}
+                    onContinue={() => void continueIteration()}
+                    onEnd={() => void endIteration()}
+                    onScoreChange={setIterationScore}
+                    score={iterationScore}
+                  />
+                ) : null}
                 <div ref={threadEndRef} />
               </div>
             </section>
 
             <section className="composer-shell">
               <div className="composer">
-                {hasSubmittedQuestion ? (
+                {hasSubmittedQuestion && !iterationEnded ? (
                   <label className="feedback-target">
                     <span>{language === "zh" ? "反馈目标" : "Feedback target"}</span>
                     <select
                       aria-label={language === "zh" ? "选择反馈目标模块" : "Select feedback target module"}
-                      disabled={running || context.current_stage === "human_review"}
+                      disabled={context.current_stage === "human_review"}
                       onChange={(event) => setFeedbackTarget(event.target.value as StageId)}
                       value={feedbackTarget}
                     >
@@ -1660,7 +2569,7 @@ function App() {
                 ) : null}
                 <textarea
                   aria-label={!hasSubmittedQuestion ? t.questionPlaceholder : language === "zh" ? "输入修改意见" : "Enter revision feedback"}
-                  disabled={running || context.current_stage === "human_review"}
+                  disabled={context.current_stage === "human_review" || iterationReviewReady}
                   onChange={(event) => setQuestionDraft(event.target.value)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
@@ -1670,9 +2579,17 @@ function App() {
                   }}
                   placeholder={!hasSubmittedQuestion
                     ? t.questionPlaceholder
-                    : language === "zh"
-                      ? "说明希望如何改进当前项目"
-                      : "Describe how this project should be improved"}
+                    : iterationEnded
+                      ? language === "zh"
+                        ? "询问总控：假设依据、证据关系、计划细节或最终结论"
+                        : "Ask about hypotheses, evidence, plan details, or conclusions"
+                      : iterationReviewReady
+                        ? language === "zh"
+                          ? "请先在上方总控评价卡片选择继续迭代或结束迭代"
+                          : "Choose continue or end iteration in the controller review card"
+                        : language === "zh"
+                          ? "说明希望如何改进当前项目"
+                          : "Describe how this project should be improved"}
                   value={questionDraft}
                 />
                 <div className="composer-footer">
@@ -1738,12 +2655,18 @@ function App() {
 
                   <button
                     className="send-button"
-                    disabled={running || context.current_stage === "human_review" || !composerCanSubmit}
+                    disabled={context.current_stage === "human_review" || iterationReviewReady || (!running && !composerCanSubmit)}
                     type="button"
-                    onClick={submitComposer}
-                    title={!hasSubmittedQuestion ? t.start : language === "zh" ? "发送反馈并重跑" : "Send feedback and rerun"}
+                    onClick={running ? () => void cancelActiveRun() : submitComposer}
+                    title={running
+                      ? language === "zh" ? "立即终止工作流" : "Stop workflow immediately"
+                      : !hasSubmittedQuestion
+                        ? t.start
+                        : iterationEnded
+                          ? language === "zh" ? "向总控提问" : "Ask controller"
+                          : language === "zh" ? "发送反馈并重跑" : "Send feedback and rerun"}
                   >
-                    {running ? <Loader2 className="spin" size={17} /> : <Send size={17} />}
+                    {running ? <Square fill="currentColor" size={15} /> : <Send size={17} />}
                   </button>
                 </div>
               </div>
@@ -1782,6 +2705,27 @@ function App() {
             setActiveStage(stage);
             setFeedbackTarget(stage === "final_review" ? "research_planning" : stage);
           }}
+          onNodeAction={(stage, action) => {
+            if (action === "history") {
+              setTreeOpen(false);
+              setPage("system");
+              return;
+            }
+            if (action === "pause") {
+              void pauseActiveRun();
+              return;
+            }
+            void executeNode(context.task_id, stage, action === "only" ? "only" : "from", {})
+              .then(async (result) => {
+                if (result.run) {
+                  await monitorWorkflowRun(result.run);
+                } else {
+                  const record = await fetchTaskRecord(context.task_id);
+                  hydrateProject(await restoreRemoteProject(record.manifest, 1, language));
+                }
+              })
+              .catch((error) => setRuntimeError(error instanceof Error ? error.message : String(error)));
+          }}
           stages={stages}
           t={t}
         />
@@ -1799,14 +2743,18 @@ function ResearchStarter({
   health,
   language,
   maxIterations,
+  modelPolicy,
   onConstraintChange,
+  onModelPolicyChange,
   onSelectQuestion,
 }: {
   constraints: UserInput["user_constraints"];
   health: HealthStatus | null;
   language: Language;
   maxIterations: number;
+  modelPolicy: TaskContext["model_policy"];
   onConstraintChange: (patch: Partial<UserInput["user_constraints"]>) => void;
+  onModelPolicyChange: (patch: Partial<NonNullable<TaskContext["model_policy"]>>) => void;
   onSelectQuestion: (starter: StarterQuestion) => void;
 }) {
   const zh = language === "zh";
@@ -1886,6 +2834,15 @@ function ResearchStarter({
               onChange={(event) => onConstraintChange({ max_hypotheses: Math.min(8, Math.max(1, Number(event.target.value) || 1)) })}
             />
           </label>
+          <details className="model-policy-settings">
+            <summary>{zh ? "模型高级设置" : "Advanced model settings"}</summary>
+            <label><span>Temperature</span><input min={0} max={2} step={0.1} type="number" value={modelPolicy?.temperature ?? 0.2} onChange={(event) => onModelPolicyChange({ temperature: Number(event.target.value) })} /></label>
+            <label><span>Max tokens</span><input min={256} max={131072} step={256} type="number" value={modelPolicy?.max_tokens ?? 6144} onChange={(event) => onModelPolicyChange({ max_tokens: Number(event.target.value) })} /></label>
+            <label><span>{zh ? "超时（秒）" : "Timeout (seconds)"}</span><input min={1} max={3600} type="number" value={modelPolicy?.timeout_seconds ?? 120} onChange={(event) => onModelPolicyChange({ timeout_seconds: Number(event.target.value) })} /></label>
+            <label className="model-policy-check"><input type="checkbox" checked={modelPolicy?.thinking_enabled ?? false} onChange={(event) => onModelPolicyChange({ thinking_enabled: event.target.checked })} /><span>{zh ? "启用思考模式" : "Enable thinking"}</span></label>
+            <p>{(modelPolicy?.max_tokens ?? 6144) >= 8192 || (modelPolicy?.thinking_enabled ?? false) ? (zh ? "高耗时/高成本配置" : "Higher latency/cost configuration") : (zh ? "标准耗时/成本" : "Standard latency/cost")}</p>
+            {health?.model_policy?.dify_unsupported_fields.length ? <small>Dify {zh ? "不支持统一下发" : "does not accept"}: {health.model_policy.dify_unsupported_fields.join(", ")}</small> : null}
+          </details>
         </section>
 
         <section className="runtime-summary">
@@ -2012,6 +2969,19 @@ function SystemPage({
         </div>
       </section>
 
+      <section className="runtime-section collaboration-timeline">
+        <div className="runtime-title"><h3>{zh ? "Agent 协作时间线" : "Agent collaboration timeline"}</h3><span>{events.length}</span></div>
+        <div>
+          {events.slice(0, 40).map((event) => (
+            <article key={eventKey(event)}>
+              <i />
+              <div><strong>{event.stage ? stageLabel[language][event.stage as StageId] ?? event.stage : "Controller"}</strong><p>{event.message}</p><small>{event.type} · {new Date(event.created_at).toLocaleTimeString()}</small></div>
+              {event.data?.node_id ? <code>{event.data.node_id}</code> : null}
+            </article>
+          ))}
+        </div>
+      </section>
+
       <section className="runtime-section">
         <div className="runtime-title">
           <h3>{zh ? "已上传附件" : "Uploaded attachments"}</h3>
@@ -2084,6 +3054,239 @@ function SystemPage({
     </section>
   );
 }
+
+function ControllerConsole({
+  context,
+  language,
+  onWorkflowRun,
+}: {
+  context: TaskContext;
+  language: Language;
+  onWorkflowRun: (run: WorkflowRun) => void;
+}) {
+  const zh = language === "zh";
+  const [message, setMessage] = useState("");
+  const [score, setScore] = useState(3);
+  const [route, setRoute] = useState<ControllerRoute | null>(null);
+  const [iterationPlan, setIterationPlan] = useState<IterationPlan | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  const classify = async () => {
+    if (!message.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await routeControllerMessage(context.task_id, message.trim());
+      setRoute(result.route);
+      if (result.run && !["cancelled", "cancelling"].includes(result.run.status)) {
+        onWorkflowRun(result.run);
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const iterate = async () => {
+    if (!message.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await evaluateResearchPlan(context.task_id, score, message.trim());
+      setIterationPlan(result.iteration_plan);
+      if (result.run) onWorkflowRun(result.run);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="runtime-section controller-console">
+      <div className="runtime-title"><h3>{zh ? "总控助手与计划评价" : "Controller assistant and plan evaluation"}</h3><span>Router</span></div>
+      <textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder={zh ? "提问、修改要求或计划评价" : "Ask, request a modification, or evaluate the plan"} />
+      <div className="controller-console-actions">
+        <label><span>{zh ? "计划评分" : "Plan score"}</span><input min={1} max={5} type="number" value={score} onChange={(event) => setScore(Math.min(5, Math.max(1, Number(event.target.value))))} /></label>
+        <button className="ghost-button" disabled={busy || !message.trim()} type="button" onClick={() => void classify()}>{zh ? "识别意图" : "Classify"}</button>
+        <button className="main-action" disabled={busy || !message.trim() || !context.research_plan} type="button" onClick={() => void iterate()}>{zh ? "评价并开始新一轮" : "Evaluate and iterate"}</button>
+      </div>
+      {error ? <p className="runtime-error">{error}</p> : null}
+      {route ? <div className="controller-decision"><strong>{route.intent}{route.target_stage ? ` → ${route.target_stage}` : ""}</strong><p>{route.reason}</p><small>{route.answer}</small></div> : null}
+      {iterationPlan ? <div className="controller-decision"><strong>{iterationPlan.problem_type}</strong><p>{iterationPlan.reason}</p><small>{zh ? "重跑" : "Rerun"}: {iterationPlan.agents_to_rerun.join(" → ")}</small></div> : null}
+    </section>
+  );
+}
+
+function NodeDebugger({ context, language, onWorkflowRun }: { context: TaskContext; language: Language; onWorkflowRun: (run: WorkflowRun) => void }) {
+  const zh = language === "zh";
+  const [nodeId, setNodeId] = useState<StageId>("question_understanding");
+  const [runs, setRuns] = useState<NodeRunSummary[]>([]);
+  const [detail, setDetail] = useState<NodeRunDetail | null>(null);
+  const [validation, setValidation] = useState<NodeValidation | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [mode, setMode] = useState<"only" | "to" | "from">("only");
+  const [overrideText, setOverrideText] = useState("{}");
+  const [leftRun, setLeftRun] = useState("");
+  const [rightRun, setRightRun] = useState("");
+  const [runDiff, setRunDiff] = useState<VersionDiffResult | null>(null);
+
+  const loadRuns = useCallback(async () => {
+    if (context.current_stage === "created") return;
+    setLoading(true);
+    setError("");
+    try {
+      const nextRuns = await fetchNodeRuns(context.task_id, nodeId);
+      setRuns(nextRuns);
+      setLeftRun((current) => current || nextRuns[1]?.node_run_id || "");
+      setRightRun((current) => current || nextRuns[0]?.node_run_id || "");
+      setDetail(nextRuns[0]
+        ? await fetchNodeRun(context.task_id, nodeId, nextRuns[0].node_run_id)
+        : null);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setLoading(false);
+    }
+  }, [context.current_stage, context.task_id, nodeId]);
+
+  useEffect(() => {
+    void loadRuns();
+  }, [loadRuns]);
+
+  const validate = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      setValidation(await validateNodeInput(context.task_id, nodeId));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const selectRun = async (run: NodeRunSummary) => {
+    setError("");
+    try {
+      setDetail(await fetchNodeRun(context.task_id, nodeId, run.node_run_id));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    }
+  };
+
+  const execute = async () => {
+    setError("");
+    let inputOverride: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(overrideText);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Override must be a JSON object");
+      inputOverride = parsed as Record<string, unknown>;
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+      return;
+    }
+    if (!window.confirm(zh ? "执行会生成 operator override，并可能使下游结果失效。继续吗？" : "This creates an operator override and may invalidate downstream results. Continue?")) return;
+    setLoading(true);
+    try {
+      const result = await executeNode(context.task_id, nodeId, mode, inputOverride);
+      if (result.run) onWorkflowRun(result.run);
+      await loadRuns();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const compareRuns = async () => {
+    if (!leftRun || !rightRun) return;
+    setLoading(true);
+    try {
+      setRunDiff(await fetchNodeRunDiff(context.task_id, nodeId, leftRun, rightRun));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <section className="runtime-section node-debugger">
+      <div className="runtime-title">
+        <h3>{zh ? "节点历史与校验" : "Node history and validation"}</h3>
+        <span>{runs.length} runs</span>
+      </div>
+      <div className="node-debug-toolbar">
+        <select value={nodeId} onChange={(event) => { setNodeId(event.target.value as StageId); setValidation(null); }}>
+          {stageOrder.map((stage) => <option key={stage} value={stage}>{stageLabel[language][stage]}</option>)}
+        </select>
+        <button className="ghost-button" disabled={loading || context.current_stage === "created"} type="button" onClick={() => void validate()}>
+          <CheckCircle2 size={14} />
+          {zh ? "仅校验输入" : "Validate input"}
+        </button>
+        <button className="ghost-button" disabled={loading || context.current_stage === "created"} type="button" onClick={() => void loadRuns()}>
+          <RotateCcw className={loading ? "spin" : ""} size={14} />
+          {zh ? "刷新历史" : "Refresh history"}
+        </button>
+      </div>
+      {error ? <p className="runtime-error">{error}</p> : null}
+      {validation ? (
+        <div className={`node-validation ${validation.valid ? "valid" : "invalid"}`}>
+          <strong>{validation.valid ? (zh ? "输入有效" : "Input valid") : (zh ? "输入不完整" : "Input incomplete")}</strong>
+          <p>{validation.missing_fields.length ? `${zh ? "缺少" : "Missing"}: ${validation.missing_fields.join(", ")}` : (zh ? "所有声明字段均可读取。" : "All declared inputs are readable.")}</p>
+          <small>{zh ? "重跑将影响" : "A rerun would affect"}: {validation.would_invalidate.join(", ")}</small>
+        </div>
+      ) : null}
+      <div className="node-operator-console">
+        <div>
+          <select value={mode} onChange={(event) => setMode(event.target.value as "only" | "to" | "from")}>
+            <option value="only">{zh ? "仅运行此节点" : "Run only this node"}</option>
+            <option value="to">{zh ? "运行到此节点" : "Run to this node"}</option>
+            <option value="from">{zh ? "从此节点继续" : "Continue from this node"}</option>
+          </select>
+          <button className="main-action" disabled={loading} type="button" onClick={() => void execute()}>{zh ? "执行" : "Execute"}</button>
+        </div>
+        <textarea aria-label="Operator input override JSON" value={overrideText} onChange={(event) => setOverrideText(event.target.value)} />
+      </div>
+      {runs.length >= 2 ? (
+        <div className="node-diff-controls">
+          <select value={leftRun} onChange={(event) => setLeftRun(event.target.value)}>{runs.map((run) => <option key={run.node_run_id} value={run.node_run_id}>{run.node_run_id}</option>)}</select>
+          <span>→</span>
+          <select value={rightRun} onChange={(event) => setRightRun(event.target.value)}>{runs.map((run) => <option key={run.node_run_id} value={run.node_run_id}>{run.node_run_id}</option>)}</select>
+          <button className="ghost-button" type="button" onClick={() => void compareRuns()}>{zh ? "比较输出" : "Compare outputs"}</button>
+        </div>
+      ) : null}
+      {runDiff ? <div className="node-run-diff">{runDiff.changes.slice(0, 30).map((change) => <div key={change.path}><code>{change.path}</code><span>{previewValue(change.before)}</span><b>→</b><span>{previewValue(change.after)}</span></div>)}</div> : null}
+      <div className="node-debug-grid">
+        <div className="node-run-list">
+          {runs.length ? runs.map((run) => (
+            <button className={detail?.metadata.node_run_id === run.node_run_id ? "active" : ""} key={run.node_run_id} type="button" onClick={() => void selectRun(run)}>
+              <strong>{run.node_run_id}</strong>
+              <span>i{run.iteration} · {run.status}</span>
+              <small>{new Date(run.started_at).toLocaleString()}</small>
+            </button>
+          )) : <p className="runtime-empty">{zh ? "该节点还没有执行历史。" : "This node has no run history."}</p>}
+        </div>
+        <div className="node-run-detail">
+          {detail ? (
+            <>
+              <div><strong>{detail.metadata.status}</strong><span>{detail.metadata.workflow_run_id || "standalone"}</span></div>
+              <details open><summary>Input</summary><pre>{JSON.stringify(detail.input, null, 2)}</pre></details>
+              <details><summary>Output</summary><pre>{JSON.stringify(detail.output, null, 2)}</pre></details>
+              <details><summary>Review</summary><pre>{JSON.stringify(detail.review, null, 2)}</pre></details>
+            </>
+          ) : <p className="runtime-empty">{zh ? "选择一条历史查看输入、输出和评审。" : "Select a run to inspect input, output, and review."}</p>}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+void ControllerConsole;
+void NodeDebugger;
 
 function formatBytes(size: number) {
   if (size < 1024) return `${size} B`;
@@ -2159,19 +3362,19 @@ function MessageIndexRail({ language, messages }: { language: Language; messages
 
 function ProjectPanel({
   activeProjectId,
-  disabled,
   onArchiveProject,
   onCreateProject,
   onSelectProject,
   projects,
+  runsByTask,
   t,
 }: {
   activeProjectId: string;
-  disabled: boolean;
   onArchiveProject: (projectId: string) => void;
   onCreateProject: () => void;
   onSelectProject: (projectId: string) => void;
   projects: ProjectSession[];
+  runsByTask: Record<string, WorkflowRun | null>;
   t: (typeof copy)[Language];
 }) {
   return (
@@ -2182,7 +3385,6 @@ function ProjectPanel({
           <button
             aria-label={t.newProject}
             className="icon-quiet"
-            disabled={disabled}
             title={t.newTask}
             type="button"
             onClick={onCreateProject}
@@ -2194,30 +3396,40 @@ function ProjectPanel({
       </div>
 
       <div className="project-list">
-        {projects.map((project) => (
-          <div className="project-row" key={project.id}>
-            <button
-              className={`project-item ${project.id === activeProjectId ? "active" : ""}`}
-              disabled={disabled}
-              type="button"
-              onClick={() => onSelectProject(project.id)}
-              title={project.title}
-            >
-              <MessageSquareText size={16} />
-              <span>{project.title}</span>
-            </button>
-            <button
-              aria-label={`${t.archiveProject}: ${project.title}`}
-              className="project-archive-button"
-              disabled={disabled}
-              type="button"
-              onClick={() => onArchiveProject(project.id)}
-              title={t.archiveProject}
-            >
-              <Archive size={15} />
-            </button>
-          </div>
-        ))}
+        {projects.map((project) => {
+          const projectRun = runsByTask[project.context.task_id];
+          const projectRunning = Boolean(projectRun && activeWorkflowStatuses.has(projectRun.status));
+          return (
+            <div className="project-row" key={project.id}>
+              <button
+                className={`project-item ${project.id === activeProjectId ? "active" : ""}`}
+                type="button"
+                onClick={() => onSelectProject(project.id)}
+                title={projectRun ? `${project.title} · ${projectRun.status}` : project.title}
+              >
+                <MessageSquareText size={16} />
+                <span className="project-name">{project.title}</span>
+                {projectRunning ? (
+                  <i
+                    aria-label={projectRun?.status ?? t.running}
+                    className="project-run-indicator"
+                    title={projectRun?.status ?? t.running}
+                  />
+                ) : null}
+              </button>
+              <button
+                aria-label={`${t.archiveProject}: ${project.title}`}
+                className="project-archive-button"
+                disabled={projectRunning}
+                type="button"
+                onClick={() => onArchiveProject(project.id)}
+                title={projectRunning ? t.running : t.archiveProject}
+              >
+                <Archive size={15} />
+              </button>
+            </div>
+          );
+        })}
       </div>
     </section>
   );
@@ -2375,6 +3587,204 @@ function DropdownControl<T extends string>({
   );
 }
 
+function IterationDecisionCard({
+  busy,
+  comment,
+  finalReview,
+  iteration,
+  language,
+  maxIterations,
+  onCommentChange,
+  onContinue,
+  onEnd,
+  onScoreChange,
+  score,
+}: {
+  busy: boolean;
+  comment: string;
+  finalReview: FinalReview;
+  iteration: number;
+  language: Language;
+  maxIterations: number;
+  onCommentChange: (value: string) => void;
+  onContinue: () => void;
+  onEnd: () => void;
+  onScoreChange: (value: number) => void;
+  score: number;
+}) {
+  const zh = language === "zh";
+  const weaknesses = finalReview.weaknesses ?? [];
+  const suggestions = finalReview.suggestions ?? [];
+  const dimensionLabels: Record<string, string> = zh
+    ? {
+        question_clarity: "问题清晰度",
+        evidence_quality: "证据质量",
+        hypothesis_quality: "假设质量",
+        evidence_alignment: "证据映射",
+        plan_executability: "计划可执行性",
+        reproducibility: "可复现性",
+      }
+    : {
+        question_clarity: "Question clarity",
+        evidence_quality: "Evidence quality",
+        hypothesis_quality: "Hypothesis quality",
+        evidence_alignment: "Evidence alignment",
+        plan_executability: "Plan execution",
+        reproducibility: "Reproducibility",
+      };
+  return (
+    <article className="thread-message controller-message iteration-decision-message">
+      <div aria-hidden="true" className="message-avatar ai-message-avatar">
+        <img alt="" className="brand-logo-light" draggable="false" src="/brand/eurekaloop-logo-64.png" />
+        <img alt="" className="brand-logo-dark" draggable="false" src="/brand/eurekaloop-logo-64-dark.png" />
+      </div>
+      <div className="message-bubble iteration-decision-card">
+        <header>
+          <div>
+            <strong>{zh ? `第 ${iteration} 轮总控评价` : `Controller review · iteration ${iteration}`}</strong>
+            <small>{zh ? `最多 ${maxIterations} 轮` : `${maxIterations} iterations maximum`}</small>
+          </div>
+          <span className={`state-chip ${finalReview.passed ? "passed" : "revision_required"}`}>
+            {Math.round(finalReview.overall_score * 100)} {zh ? "分" : "%"}
+          </span>
+        </header>
+        {finalReview.dimension_scores ? (
+          <div className="controller-dimension-scores">
+            {Object.entries(finalReview.dimension_scores).map(([dimension, value]) => (
+              <span key={dimension}>
+                <small>{dimensionLabels[dimension] ?? dimension}</small>
+                <strong>{Math.round(value * 100)}</strong>
+              </span>
+            ))}
+          </div>
+        ) : null}
+        <div className="controller-review-grid">
+          <div>
+            <strong>{zh ? "总控结论" : "Controller verdict"}</strong>
+            <p>{finalReview.passed
+              ? zh ? "本轮结果达到基本要求，可以结束，也可以继续精炼。" : "This round meets the baseline. End or continue refining."
+              : zh ? "本轮仍有改进空间，建议结合以下问题继续迭代。" : "This round can improve; continue using the issues below."}</p>
+          </div>
+          <div>
+            <strong>{zh ? "主要问题" : "Main issues"}</strong>
+            <ul>{(weaknesses.length ? weaknesses : [zh ? "暂无强制修改项" : "No required changes"]).map((item) => <li key={item}>{item}</li>)}</ul>
+          </div>
+          <div className="controller-agent-suggestions">
+            <strong>{zh ? "总控 Agent 改进建议" : "Controller agent suggestions"}</strong>
+            <ul>{(suggestions.length ? suggestions : [zh ? "暂无额外建议" : "No additional suggestions"]).map((item) => <li key={item}>{item}</li>)}</ul>
+          </div>
+        </div>
+        <div className="user-plan-score">
+          <span>{zh ? "你的评分" : "Your score"}</span>
+          <div>{[1, 2, 3, 4, 5].map((value) => <button className={score === value ? "active" : ""} key={value} type="button" onClick={() => onScoreChange(value)}>{value}</button>)}</div>
+        </div>
+        <textarea
+          disabled={busy}
+          onChange={(event) => onCommentChange(event.target.value)}
+          placeholder={zh ? "写下希望下一轮重点改进的内容；留空则按总控建议继续。" : "Describe what to improve next; leave blank to use controller suggestions."}
+          value={comment}
+        />
+        <div className="iteration-decision-actions">
+          <button className="ghost-button" disabled={busy} type="button" onClick={onEnd}>
+            <CheckCircle2 size={15} />
+            {zh ? "结束迭代，进入问答" : "End iteration and enter Q&A"}
+          </button>
+          <button className="main-action" disabled={busy} type="button" onClick={onContinue}>
+            <RotateCcw className={busy ? "spin" : ""} size={15} />
+            {zh ? "根据建议进入下一轮" : "Continue with suggestions"}
+          </button>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function InlineMarkdown({ text }: { text: string }) {
+  const tokens = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).filter(Boolean);
+  return (
+    <>
+      {tokens.map((token, index) => {
+        if (token.startsWith("**") && token.endsWith("**")) {
+          return <strong key={`${token}-${index}`}>{token.slice(2, -2)}</strong>;
+        }
+        if (token.startsWith("`") && token.endsWith("`")) {
+          return <code key={`${token}-${index}`}>{token.slice(1, -1)}</code>;
+        }
+        return <span key={`${token}-${index}`}>{token}</span>;
+      })}
+    </>
+  );
+}
+
+function RichMessageBody({ text }: { text: string }) {
+  const normalized = text
+    .replace(/\s+(?=\d+[.)]\s+\*\*)/g, "\n")
+    .replace(/\s+(?=(?:综上|总之|因此)[，,:：])/g, "\n\n");
+  const lines = normalized.split(/\r?\n/).map((line) => line.trim());
+  const blocks: ReactNode[] = [];
+  let lineIndex = 0;
+
+  while (lineIndex < lines.length) {
+    const line = lines[lineIndex];
+    if (!line) {
+      lineIndex += 1;
+      continue;
+    }
+
+    const heading = line.match(/^#{1,4}\s+(.+)$/);
+    if (heading) {
+      blocks.push(<h4 key={`heading-${lineIndex}`}><InlineMarkdown text={heading[1]} /></h4>);
+      lineIndex += 1;
+      continue;
+    }
+
+    if (/^\d+[.)]\s+/.test(line)) {
+      const items: string[] = [];
+      while (lineIndex < lines.length && /^\d+[.)]\s+/.test(lines[lineIndex])) {
+        items.push(lines[lineIndex].replace(/^\d+[.)]\s+/, ""));
+        lineIndex += 1;
+      }
+      blocks.push(
+        <ol key={`ordered-${lineIndex}`}>
+          {items.map((item, index) => <li key={`${item}-${index}`}><InlineMarkdown text={item} /></li>)}
+        </ol>,
+      );
+      continue;
+    }
+
+    if (/^[-*]\s+/.test(line)) {
+      const items: string[] = [];
+      while (lineIndex < lines.length && /^[-*]\s+/.test(lines[lineIndex])) {
+        items.push(lines[lineIndex].replace(/^[-*]\s+/, ""));
+        lineIndex += 1;
+      }
+      blocks.push(
+        <ul key={`unordered-${lineIndex}`}>
+          {items.map((item, index) => <li key={`${item}-${index}`}><InlineMarkdown text={item} /></li>)}
+        </ul>,
+      );
+      continue;
+    }
+
+    const paragraph: string[] = [];
+    while (
+      lineIndex < lines.length
+      && lines[lineIndex]
+      && !/^#{1,4}\s+/.test(lines[lineIndex])
+      && !/^\d+[.)]\s+/.test(lines[lineIndex])
+      && !/^[-*]\s+/.test(lines[lineIndex])
+    ) {
+      paragraph.push(lines[lineIndex]);
+      lineIndex += 1;
+    }
+    blocks.push(
+      <p key={`paragraph-${lineIndex}`}><InlineMarkdown text={paragraph.join(" ")} /></p>,
+    );
+  }
+
+  return <div className="rich-message-body">{blocks}</div>;
+}
+
 function ThreadMessageCard({
   feedbackValue,
   language,
@@ -2407,7 +3817,7 @@ function ThreadMessageCard({
             <strong>{message.stage ? t.userRevision : t.userQuestion}</strong>
             <time>{formatTime(message.createdAt)}</time>
           </header>
-          <p>{message.body}</p>
+          {message.body ? <RichMessageBody text={message.body} /> : null}
         </div>
       </article>
     );
@@ -2436,7 +3846,13 @@ function ThreadMessageCard({
         <header>
           <div>
             <strong>{title}</strong>
-            {stage ? <small>{stageMeta[stage].agent}</small> : null}
+            {stage ? (
+              <small>
+                {stageMeta[stage].agent} · {language === "zh"
+                  ? `第 ${messageIteration(message)} 轮`
+                  : `Iteration ${messageIteration(message)}`}
+              </small>
+            ) : null}
           </div>
           <div className="message-status-group">
             <MessageRuntime
@@ -2449,7 +3865,31 @@ function ThreadMessageCard({
           </div>
         </header>
 
-        {message.body ? <p className="message-copy">{message.body}</p> : null}
+        {message.body ? <RichMessageBody text={message.body} /> : null}
+        {message.activity ? (
+          <div className={`agent-live-activity ${message.status ?? "running"}`}>
+            <span className="agent-live-icon">
+              <Loader2 className={message.status === "running" || message.status === "validating" ? "spin" : ""} size={16} />
+            </span>
+            <div>
+              <div className="agent-live-title">
+                <strong>
+                  {language === "zh"
+                    ? message.status === "validating" ? "正在校验结果" : "当前正在进行"
+                    : message.status === "validating" ? "Validating result" : "Current activity"}
+                </strong>
+                {message.activityNode ? <span>{message.activityNode}</span> : null}
+              </div>
+              <p>{message.activity}</p>
+              <i className={typeof message.activityProgress === "number" ? "" : "indeterminate"}>
+                <b style={typeof message.activityProgress === "number"
+                  ? { width: `${Math.round(message.activityProgress * 100)}%` }
+                  : undefined}
+                />
+              </i>
+            </div>
+          </div>
+        ) : null}
         {stage && message.revisionNote ? (
           <p className="revision-note">
             {language === "zh" ? "本次重跑依据：" : "Rerun note:"} {message.revisionNote}
@@ -2468,7 +3908,6 @@ function ThreadMessageCard({
           <footer className="message-footer">
             <div className="score-row">
               <span>Self {Math.round(message.response.self_review.overall_score * 100)}%</span>
-              <span>Gate {message.review ? Math.round(message.review.overall_score * 100) : "--"}%</span>
               <span>{stageMeta[stage].allowedWrites.join(", ")}</span>
             </div>
             <button
@@ -2605,11 +4044,24 @@ function AgentOutput({ language, response, stage }: { language: Language; respon
   if (stage === "knowledge_integration") {
     return (
       <div className="module-output">
-        <BulletList
-          label={language === "zh" ? "文献卡片" : "Literature cards"}
-          values={arrayValue(payload.literature_cards).map((item) => `${objectField(item, "title")} · ${objectField(item, "year")}`)}
-        />
-        <BulletList label={language === "zh" ? "证据卡片" : "Evidence cards"} values={arrayValue(payload.evidence_cards).map((item) => objectField(item, "claim"))} />
+        <div className="output-section artifact-card-list">
+          <span>{language === "zh" ? "文献卡片" : "Literature cards"}</span>
+          {arrayValue(payload.literature_cards).map((item, index) => (
+            <article id={`artifact-${objectField(item, "literature_id")}`} key={`${objectField(item, "literature_id")}-${index}`}>
+              <strong>{objectField(item, "title")}</strong>
+              <small>{objectField(item, "year")} · {objectField(item, "source")}</small>
+            </article>
+          ))}
+        </div>
+        <div className="output-section artifact-card-list">
+          <span>{language === "zh" ? "证据卡片" : "Evidence cards"}</span>
+          {arrayValue(payload.evidence_cards).map((item, index) => (
+            <article id={`artifact-${objectField(item, "evidence_id")}`} key={`${objectField(item, "evidence_id")}-${index}`}>
+              <strong>{objectField(item, "evidence_id")}</strong>
+              <p>{objectField(item, "claim")}</p>
+            </article>
+          ))}
+        </div>
         <BulletList label={language === "zh" ? "知识空白" : "Knowledge gaps"} values={arrayValue(payload.knowledge_gaps).map((item) => objectField(item, "description"))} />
       </div>
     );
@@ -2648,16 +4100,7 @@ function AgentOutput({ language, response, stage }: { language: Language; respon
   }
 
   if (stage === "research_planning") {
-    const plan = ((payload.research_plan as Record<string, unknown>)?.plans as Array<Record<string, unknown>> | undefined)?.[0]?.plan as Record<string, unknown> | undefined;
-    return (
-      <div className="module-output">
-        <KeyValue label={language === "zh" ? "研究问题" : "Problem"} value={stringValue(plan?.problem_statement)} />
-        <PillList label={language === "zh" ? "方法" : "Methods"} values={arrayValue(objectValue(plan?.technical_details, "required_methods"))} />
-        <PillList label={language === "zh" ? "数据字段" : "Data fields"} values={arrayValue((objectValue(plan?.datasets, "target") as Array<Record<string, unknown>> | undefined)?.[0]?.fields)} />
-        <BulletList label={language === "zh" ? "失败判据" : "Falsification criteria"} values={arrayValue(objectValue(plan?.results, "falsification_criteria"))} />
-        <BulletList label={language === "zh" ? "反馈任务" : "Feedback tasks"} values={arrayValue(plan?.feedback_tasks).map((item) => objectField(item, "objective"))} />
-      </div>
-    );
+    return <ResearchPlanOutput language={language} researchPlan={payload.research_plan as ResearchPlan} />;
   }
 
   const finalReview = payload.final_review as Record<string, unknown>;
@@ -2667,6 +4110,202 @@ function AgentOutput({ language, response, stage }: { language: Language; respon
       <BulletList label={language === "zh" ? "优势" : "Strengths"} values={arrayValue(finalReview.strengths)} />
       <BulletList label={language === "zh" ? "不足" : "Weaknesses"} values={arrayValue(finalReview.weaknesses)} />
       <KeyValue label={language === "zh" ? "是否需要修订" : "Revision required"} value={finalReview.revision_required ? "Yes" : language === "zh" ? "否" : "No"} />
+    </div>
+  );
+}
+
+type ResearchPlanItem = ResearchPlan["plans"][number];
+
+function normalizeResearchPlan(plan: ResearchPlanItem["plan"] | null | undefined): ResearchPlanItem["plan"] {
+  const methods = plan?.methods;
+  const datasets = plan?.datasets;
+  const experiments = plan?.experiments;
+  const mainExperiment = experiments?.main_experiment;
+  const results = plan?.results;
+  const rationale = plan?.rationale;
+  return {
+    ...plan,
+    problem_statement: plan?.problem_statement ?? "",
+    paper_title: plan?.paper_title ?? "",
+    paper_abstract: plan?.paper_abstract ?? "",
+    methods: {
+      ...methods,
+      overall_design: methods?.overall_design ?? "",
+      steps: (methods?.steps ?? []).map((step) => ({
+        ...step,
+        input: step.input ?? [],
+        output: step.output ?? [],
+      })),
+    },
+    datasets: {
+      ...datasets,
+      source: (datasets?.source ?? []).map((dataset) => ({
+        ...dataset,
+        required_fields: dataset.required_fields ?? [],
+      })),
+    },
+    experiments: {
+      ...experiments,
+      main_experiment: {
+        ...mainExperiment,
+        independent_variables: mainExperiment?.independent_variables ?? [],
+        dependent_variables: mainExperiment?.dependent_variables ?? [],
+        control_variables: mainExperiment?.control_variables ?? [],
+      },
+      metrics: experiments?.metrics ?? [],
+      baselines: experiments?.baselines ?? [],
+      procedure: experiments?.procedure ?? [],
+      ablation_or_sensitivity_analysis: experiments?.ablation_or_sensitivity_analysis ?? [],
+    },
+    results: {
+      ...results,
+      result_type: results?.result_type ?? "",
+      expected_findings: results?.expected_findings ?? [],
+      feasibility_check: results?.feasibility_check ?? "",
+      falsification_criteria: results?.falsification_criteria ?? [],
+    },
+    rationale: {
+      ...rationale,
+      logic_chain: (rationale?.logic_chain ?? []).map((step) => ({
+        ...step,
+        evidence_ids: step.evidence_ids ?? [],
+      })),
+    },
+    references: (plan?.references ?? []).map((reference) => ({
+      ...reference,
+      authors: reference.authors ?? [],
+    })),
+    feedback_tasks: plan?.feedback_tasks ?? [],
+    limitations: plan?.limitations ?? [],
+  } as ResearchPlanItem["plan"];
+}
+
+function planMarkdown(item: ResearchPlanItem) {
+  const plan = normalizeResearchPlan(item.plan);
+  const section = (title: string, values: string[]) => `\n## ${title}\n${values.length ? values.map((value) => `- ${value}`).join("\n") : "- --"}\n`;
+  return [
+    `# ${plan.paper_title || item.hypothesis_id}`,
+    `\n**Hypothesis:** ${item.hypothesis_id}`,
+    `\n**Status:** ${item.status}`,
+    `\n## Problem\n${plan.problem_statement}`,
+    `\n## Overall Design\n${plan.methods.overall_design}`,
+    section("Methods", plan.methods.steps.map((step) => `${step.name}: ${step.description}`)),
+    section("Datasets", plan.datasets.source.map((dataset) => `${dataset.name}: ${dataset.usage} (${dataset.access_status})`)),
+    section("Metrics", plan.experiments.metrics.map((metric) => `${metric.name}: ${metric.description}`)),
+    section("Procedure", plan.experiments.procedure),
+    section("Expected Findings", plan.results.expected_findings),
+    section("Falsification Criteria", plan.results.falsification_criteria),
+    section("References", plan.references.map((reference) => `${reference.title} (${reference.year}) ${reference.doi || reference.url}`)),
+    section("Limitations", plan.limitations),
+  ].join("\n");
+}
+
+function ResearchPlanOutput({ language, researchPlan }: { language: Language; researchPlan?: ResearchPlan }) {
+  const plans = researchPlan?.plans ?? [];
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [copied, setCopied] = useState(false);
+  const selected = plans[Math.min(selectedIndex, Math.max(0, plans.length - 1))];
+
+  if (!selected) {
+    return <div className="module-output"><p>{language === "zh" ? "研究计划未返回可展示内容。" : "No research plan was returned."}</p></div>;
+  }
+
+  const plan = normalizeResearchPlan(selected.plan);
+  const copyPlan = async () => {
+    await navigator.clipboard.writeText(planMarkdown(selected));
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1600);
+  };
+  const downloadPlan = () => {
+    const blob = new Blob([planMarkdown(selected)], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${selected.hypothesis_id || "research-plan"}.md`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="module-output research-plan-output">
+      <div className="plan-toolbar">
+        <div className="plan-tabs" role="tablist" aria-label={language === "zh" ? "研究计划" : "Research plans"}>
+          {plans.map((item, index) => (
+            <button
+              aria-selected={index === selectedIndex}
+              className={index === selectedIndex ? "active" : ""}
+              key={`${item.hypothesis_id}-${index}`}
+              role="tab"
+              type="button"
+              onClick={() => setSelectedIndex(index)}
+            >
+              {item.hypothesis_id}
+              <i className={item.status} />
+            </button>
+          ))}
+        </div>
+        <div className="plan-actions">
+          <button type="button" onClick={() => void copyPlan()}><Copy size={13} />{copied ? (language === "zh" ? "已复制" : "Copied") : (language === "zh" ? "复制" : "Copy")}</button>
+          <button type="button" onClick={downloadPlan}><Download size={13} />Markdown</button>
+        </div>
+      </div>
+
+      {selected.status === "failed" ? (
+        <div className="plan-error"><strong>{language === "zh" ? "该假设规划失败" : "Planning failed"}</strong><p>{selected.error_message || "--"}</p></div>
+      ) : null}
+
+      <KeyValue label={language === "zh" ? "研究问题" : "Problem"} value={plan.problem_statement} />
+      <KeyValue label={language === "zh" ? "论文题目" : "Paper title"} value={plan.paper_title} />
+      <KeyValue label={language === "zh" ? "摘要" : "Abstract"} value={plan.paper_abstract} />
+
+      <section className="plan-section">
+        <h4>{language === "zh" ? "研究设计" : "Research design"}</h4>
+        <p>{plan.methods.overall_design}</p>
+        <div className="plan-timeline">
+          {plan.methods.steps.map((step, index) => (
+            <article key={`${step.step_id}-${index}`}>
+              <b>{String(index + 1).padStart(2, "0")}</b>
+              <div><strong>{step.name}</strong><p>{step.description}</p><small>{step.input.join(", ")} → {step.output.join(", ")}</small></div>
+            </article>
+          ))}
+        </div>
+      </section>
+
+      <section className="plan-section plan-grid">
+        <div><h4>{language === "zh" ? "实验变量" : "Variables"}</h4><PillList label={language === "zh" ? "自变量" : "Independent"} values={plan.experiments.main_experiment.independent_variables} /><PillList label={language === "zh" ? "因变量" : "Dependent"} values={plan.experiments.main_experiment.dependent_variables} /><PillList label={language === "zh" ? "控制变量" : "Controls"} values={plan.experiments.main_experiment.control_variables} /></div>
+        <div><h4>{language === "zh" ? "指标与基线" : "Metrics and baselines"}</h4><BulletList label={language === "zh" ? "指标" : "Metrics"} values={plan.experiments.metrics.map((item) => `${item.name}: ${item.description}`)} /><BulletList label={language === "zh" ? "基线" : "Baselines"} values={plan.experiments.baselines.map((item) => `${item.name}: ${item.description}`)} /></div>
+      </section>
+
+      <section className="plan-section">
+        <h4>{language === "zh" ? "数据" : "Data"}</h4>
+        <div className="dataset-grid">
+          {plan.datasets.source.map((dataset, index) => (
+            <article key={`${dataset.dataset_id}-${index}`}><strong>{dataset.name}</strong><p>{dataset.usage}</p><small>{dataset.access_status} · {dataset.required_fields.join(", ")}</small></article>
+          ))}
+        </div>
+      </section>
+
+      <section className="plan-section plan-grid">
+        <div><h4>{language === "zh" ? "预期结果" : "Expected results"}</h4><BulletList label={plan.results.result_type} values={plan.results.expected_findings} /><KeyValue label={language === "zh" ? "可行性" : "Feasibility"} value={plan.results.feasibility_check} /></div>
+        <div><h4>{language === "zh" ? "证伪与敏感性" : "Falsification and sensitivity"}</h4><BulletList label={language === "zh" ? "失败判据" : "Falsification"} values={plan.results.falsification_criteria} /><BulletList label={language === "zh" ? "消融/敏感性" : "Ablation/sensitivity"} values={plan.experiments.ablation_or_sensitivity_analysis} /></div>
+      </section>
+
+      <section className="plan-section">
+        <h4>{language === "zh" ? "证据与参考文献" : "Evidence and references"}</h4>
+        <div className="trace-links">
+          {plan.rationale.logic_chain.flatMap((step) => step.evidence_ids).filter((id, index, values) => values.indexOf(id) === index).map((id) => <a href={`#artifact-${id}`} key={id}>{id}</a>)}
+        </div>
+        <div className="reference-list">
+          {plan.references.map((reference, index) => (
+            <article key={`${reference.source_id}-${index}`}><strong>{reference.title}</strong><p>{reference.authors.join(", ")} · {reference.year}</p><a href={reference.url || (reference.doi ? `https://doi.org/${reference.doi}` : undefined)} target="_blank" rel="noreferrer">{reference.doi || reference.source_id}</a></article>
+          ))}
+        </div>
+      </section>
+
+      <section className="plan-section plan-grid">
+        <BulletList label={language === "zh" ? "限制" : "Limitations"} values={plan.limitations} />
+        <BulletList label={language === "zh" ? "反馈任务" : "Feedback tasks"} values={plan.feedback_tasks.map((item) => `[${item.priority}] ${item.objective}`)} />
+      </section>
     </div>
   );
 }
@@ -2925,6 +4564,7 @@ function StateTreeModal({
   iteration,
   language,
   onClose,
+  onNodeAction,
   onSelectStage,
   stages,
   t,
@@ -2934,6 +4574,7 @@ function StateTreeModal({
   iteration: number;
   language: Language;
   onClose: () => void;
+  onNodeAction: (stage: StageId, action: "only" | "from" | "pause" | "history") => void;
   onSelectStage: (stage: StageId) => void;
   stages: StageRun[];
   t: (typeof copy)[Language];
@@ -3162,6 +4803,12 @@ function StateTreeModal({
               <span>{language === "zh" ? "执行单元" : "Executor"}</span>
               <strong>{stageMeta[selectedStage.id].agent}</strong>
             </div>
+            <div className="tree-node-actions">
+              <button type="button" onClick={() => onNodeAction(selectedStage.id, "only")}>{language === "zh" ? "仅运行" : "Run only"}</button>
+              <button type="button" onClick={() => onNodeAction(selectedStage.id, "from")}>{language === "zh" ? "从此继续" : "Continue"}</button>
+              <button type="button" onClick={() => onNodeAction(selectedStage.id, "pause")}>{language === "zh" ? "暂停" : "Pause"}</button>
+              <button type="button" onClick={() => onNodeAction(selectedStage.id, "history")}>{language === "zh" ? "历史" : "History"}</button>
+            </div>
             <pre>{JSON.stringify(inspectorData ?? null, null, 2)}</pre>
           </aside>
         </div>
@@ -3258,6 +4905,7 @@ function getMessageTitle(message: ThreadMessage, language: Language) {
 
 function getMessageIndexPreview(message: ThreadMessage, language: Language) {
   if (message.body) return trimPreview(message.body, 160);
+  if (message.activity) return trimPreview(message.activity, 160);
   if (message.response?.metadata.status === "failed") {
     return trimPreview(
       message.response.self_review.issues[0]

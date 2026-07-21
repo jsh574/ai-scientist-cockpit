@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
 from .llm import LLMClient, QwenDashScopeClient
@@ -493,7 +494,35 @@ class KnowledgeIntegrationAgent:
         self.gap_synthesizer = GapSynthesizer(self.llm_client)
         self.quality_reviewer = QualityReviewer(self.llm_client)
 
-    def run(self, request: dict[str, Any]) -> dict[str, Any]:
+    def run(
+        self,
+        request: dict[str, Any],
+        *,
+        progress_handler: Callable[[dict[str, Any]], None] | None = None,
+        cancellation_checker: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        def checkpoint(
+            node_id: str,
+            message: str,
+            progress: float,
+            *,
+            kind: str = "progress",
+            payload: dict[str, Any] | None = None,
+            operation: str = "append",
+        ) -> None:
+            if cancellation_checker:
+                cancellation_checker()
+            if progress_handler:
+                progress_handler({
+                    "node_id": node_id,
+                    "kind": kind,
+                    "message": message,
+                    "progress": progress,
+                    "payload": payload or {},
+                    "operation": operation,
+                })
+
+        checkpoint("query_planning", "Parsing the research question.", 0.02, kind="started")
         question, missing_fields = self.question_parser.parse(request)
         if missing_fields:
             return self._failure_response(
@@ -503,21 +532,61 @@ class KnowledgeIntegrationAgent:
             )
 
         assert question is not None
+        resume = (request.get("extensions") or {}).get("workflow_resume") or {}
+        checkpoint_payloads = {
+            item.get("node_id"): item.get("payload") or {}
+            for item in resume.get("checkpoints") or []
+            if isinstance(item, dict)
+        }
+        resumed_literature = checkpoint_payloads.get("literature_extract", {}).get("literature_cards")
+        resumed_evidence = checkpoint_payloads.get("evidence_extract", {}).get("evidence_cards")
+        resumed_gaps = checkpoint_payloads.get("gap_synthesis", {}).get("knowledge_gaps")
         try:
-            queries = self.search_query_planner.build_queries(question)
-            retrieved_sources = self.retrieval_service.retrieve(question, queries)
-            verified_sources = self.source_verifier.verify(
-                retrieved_sources,
-                bool(question.search_policy.get("must_verify_sources", True)),
+            if resumed_evidence:
+                literature_cards = resumed_literature or []
+                evidence_cards = resumed_evidence
+                checkpoint("evidence_extract", "Restored evidence checkpoint.", 0.82)
+            else:
+                checkpoint("query_planning", "Planning literature search queries.", 0.08)
+                queries = self.search_query_planner.build_queries(question)
+                checkpoint("source_search", "Searching configured literature sources.", 0.16, kind="started", payload={"queries": queries})
+                retrieved_sources = self.retrieval_service.retrieve(question, queries)
+                checkpoint("source_verify", "Verifying retrieved source identifiers.", 0.38, payload={"candidate_sources": len(retrieved_sources)})
+                verified_sources = self.source_verifier.verify(retrieved_sources, bool(question.search_policy.get("must_verify_sources", True)))
+                checkpoint("relevance_filter", "Filtering sources for question relevance.", 0.48, payload={"verified_sources": len(verified_sources)})
+                relevant_sources = self.source_relevance_filter.filter(question, verified_sources)
+                checkpoint("literature_extract", "Extracting structured literature cards.", 0.6, payload={"relevant_sources": len(relevant_sources)})
+                literature_cards = self.literature_extractor.extract(relevant_sources)
+            checkpoint(
+                "literature_extract",
+                "Literature cards are available.",
+                0.7,
+                kind="partial_output",
+                payload={"literature_cards": literature_cards},
+                operation="replace",
             )
-            relevant_sources = self.source_relevance_filter.filter(
-                question, verified_sources
+            if not resumed_evidence:
+                checkpoint("evidence_extract", "Extracting traceable evidence cards.", 0.74)
+                evidence_cards = self.evidence_extractor.extract(relevant_sources, literature_cards)
+            checkpoint(
+                "evidence_extract",
+                "Evidence cards are available.",
+                0.82,
+                kind="partial_output",
+                payload={"evidence_cards": evidence_cards},
+                operation="replace",
             )
-            literature_cards = self.literature_extractor.extract(relevant_sources)
-            evidence_cards = self.evidence_extractor.extract(
-                relevant_sources, literature_cards
+            checkpoint("gap_synthesis", "Synthesizing knowledge gaps.", 0.86)
+            knowledge_gaps = resumed_gaps or self.gap_synthesizer.synthesize(question, evidence_cards)
+            checkpoint(
+                "gap_synthesis",
+                "Knowledge gaps are available.",
+                0.92,
+                kind="partial_output",
+                payload={"knowledge_gaps": knowledge_gaps},
+                operation="replace",
             )
-            knowledge_gaps = self.gap_synthesizer.synthesize(question, evidence_cards)
+            checkpoint("quality_review", "Reviewing knowledge integration quality.", 0.96)
             self_review = self.quality_reviewer.review(
                 literature_cards, evidence_cards, knowledge_gaps, question
             )
