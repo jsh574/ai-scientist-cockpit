@@ -126,6 +126,7 @@ class HumanReviewRequest(BaseModel):
     stage: str
     decision: Literal["accept", "retry", "rollback"]
     comment: str = Field(default="", max_length=20_000)
+    approval_id: str | None = Field(default=None, max_length=160)
 
 
 class FeedbackRequest(BaseModel):

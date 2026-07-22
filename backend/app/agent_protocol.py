@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Protocol
 
 STAGE_ORDER = (
@@ -47,7 +49,7 @@ class NodeSpec:
 AgentSpec = NodeSpec
 
 
-AGENT_SPECS: dict[str, NodeSpec] = {
+DEFAULT_AGENT_SPECS: dict[str, NodeSpec] = {
     "question_understanding": AgentSpec(
         stage="question_understanding",
         agent_id="question_understanding_agent",
@@ -130,6 +132,49 @@ AGENT_SPECS: dict[str, NodeSpec] = {
         description="Audit completeness, traceability, and iteration readiness.",
     ),
 }
+
+
+def _manifest_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "agents" / "agent-manifest.v1.json"
+
+
+def _load_agent_specs_from_manifest() -> dict[str, NodeSpec] | None:
+    path = _manifest_path()
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    stages = data.get("stages")
+    if not isinstance(stages, list):
+        raise ValueError("Agent manifest must contain a stages array")
+    specs: dict[str, NodeSpec] = {}
+    for item in stages:
+        if not isinstance(item, dict):
+            raise ValueError("Agent manifest stages must be objects")
+        retry = item.get("retry_policy") if isinstance(item.get("retry_policy"), dict) else {}
+        spec = NodeSpec(
+            stage=str(item["stage"]),
+            agent_id=str(item["agent_id"]),
+            reads=tuple(str(value) for value in item.get("reads", [])),
+            writes=tuple(str(value) for value in item.get("writes", [])),
+            schema_version=str(item.get("schema_version") or "node_spec_v1"),
+            interruptible=bool(item.get("interruptible", False)),
+            retry_policy=RetryPolicy(
+                max_attempts=int(retry.get("max_attempts", 1)),
+                backoff_seconds=float(retry.get("backoff_seconds", 0)),
+                retry_on=tuple(str(value) for value in retry.get("retry_on", ["review_gate_retry"])),
+            ),
+            hybrid_review=bool(item.get("hybrid_review", False)),
+            description=str(item.get("description") or ""),
+        )
+        specs[spec.stage] = spec
+    missing = set(STAGE_ORDER) - set(specs)
+    extra = set(specs) - set(STAGE_ORDER)
+    if missing or extra:
+        raise ValueError(f"Agent manifest stages mismatch. Missing={sorted(missing)} extra={sorted(extra)}")
+    return {stage: specs[stage] for stage in STAGE_ORDER}
+
+
+AGENT_SPECS: dict[str, NodeSpec] = _load_agent_specs_from_manifest() or DEFAULT_AGENT_SPECS
 
 
 class AgentRunner(Protocol):

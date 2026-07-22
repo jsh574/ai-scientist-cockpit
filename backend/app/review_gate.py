@@ -25,6 +25,7 @@ class ReviewGate:
         issues: list[str] = []
         valid_evidence = self._ids(context.get("evidence_cards"), "evidence_id")
         valid_literature = self._ids(context.get("literature_cards"), "literature_id")
+        valid_gaps = self._ids(context.get("knowledge_gaps"), "gap_id")
         valid_hypotheses = self._ids(context.get("hypothesis_cards"), "hypothesis_id")
 
         if stage == "knowledge_integration":
@@ -43,16 +44,37 @@ class ReviewGate:
 
         if stage == "hypothesis_generation":
             cards = payload.get("hypothesis_cards") or []
-            references = [
+            evidence_references = [
                 evidence_id
                 for card in cards
                 if isinstance(card, dict)
                 for evidence_id in card.get("based_on_evidence_ids") or []
             ]
-            unknown = sorted(set(map(str, references)) - valid_evidence)
-            if unknown:
-                issues.append(f"Unknown evidence IDs in hypotheses: {unknown}")
-            return (1.0 if not unknown else 0.0), issues
+            gap_references = [
+                gap_id
+                for card in cards
+                if isinstance(card, dict)
+                for gap_id in card.get("related_gap_ids") or []
+            ]
+            for card in cards:
+                if not isinstance(card, dict):
+                    continue
+                hypothesis_id = str(card.get("hypothesis_id") or "unknown")
+                if not card.get("based_on_evidence_ids"):
+                    issues.append(
+                        f"Hypothesis {hypothesis_id} must cite at least one evidence_id."
+                    )
+                if not card.get("related_gap_ids"):
+                    issues.append(
+                        f"Hypothesis {hypothesis_id} must cite at least one gap_id."
+                    )
+            unknown_evidence = sorted(set(map(str, evidence_references)) - valid_evidence)
+            unknown_gaps = sorted(set(map(str, gap_references)) - valid_gaps)
+            if unknown_evidence:
+                issues.append(f"Unknown evidence IDs in hypotheses: {unknown_evidence}")
+            if unknown_gaps:
+                issues.append(f"Unknown knowledge gap IDs in hypotheses: {unknown_gaps}")
+            return (1.0 if not issues else 0.0), issues
 
         if stage == "evidence_mapping":
             maps = payload.get("evidence_map") or []
@@ -144,6 +166,7 @@ class ReviewGate:
             if response.metadata.status == "failed":
                 decision = "fail"
             elif not response.self_review.passed:
+                issues.extend(str(issue) for issue in response.self_review.issues)
                 issues.append("Agent self-review did not pass.")
             elif response.self_review.overall_score < response.self_review.threshold:
                 issues.append("Agent self-review score is below its declared threshold.")

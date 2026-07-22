@@ -76,11 +76,20 @@ export interface TaskStageDetail {
 
 export interface RemoteAttachment {
   attachment_id: string;
+  file_id?: string;
   name: string;
   path: string;
+  parsed_path?: string;
   media_type: string;
+  file_type?: string;
   size: number;
+  hash?: string;
   created_at: string;
+  message_id?: string | null;
+  upload_status?: "pending" | "completed" | "failed";
+  parse_status?: "pending" | "completed" | "failed";
+  parse_error?: string | null;
+  chunk_count?: number;
 }
 
 export type WorkflowRunStatus =
@@ -451,9 +460,11 @@ export async function fetchTaskAttachments(taskId: string): Promise<RemoteAttach
 export async function uploadTaskAttachments(
   taskId: string,
   files: File[],
+  messageId?: string,
 ): Promise<{ attachments: RemoteAttachment[]; task_context: TaskContext }> {
   const form = new FormData();
   files.forEach((file) => form.append("files", file));
+  if (messageId) form.append("message_id", messageId);
   return requestJson(`/api/tasks/${encodeURIComponent(taskId)}/attachments`, {
     method: "POST",
     body: form,
@@ -500,12 +511,13 @@ export async function submitHumanReview(
   stage: StageId,
   decision: "accept" | "retry" | "rollback",
   comment: string,
+  approvalId?: string,
 ): Promise<{ status: string; review?: ReviewRecord; task_context?: TaskContext }> {
   if (!usesRealAgents) return { status: decision === "accept" ? "passed" : decision };
   return requestJson(`/api/tasks/${encodeURIComponent(taskId)}/reviews`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ stage, decision, comment }),
+    body: JSON.stringify({ stage, decision, comment, approval_id: approvalId }),
   });
 }
 
@@ -554,6 +566,11 @@ export async function fetchArtifacts(taskId: string): Promise<RemoteArtifact[]> 
     `/api/tasks/${encodeURIComponent(taskId)}/artifacts`,
   );
   return result.artifacts;
+}
+
+export async function fetchArtifactJson(taskId: string, artifactPath: string): Promise<unknown> {
+  const encodedPath = artifactPath.split("/").map(encodeURIComponent).join("/");
+  return requestJson(`/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodedPath}`);
 }
 
 export async function fetchVersions(taskId: string) {

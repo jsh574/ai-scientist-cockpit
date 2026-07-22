@@ -67,6 +67,47 @@ class CooperativeRegistry(RunRegistry):
         return super().run(stage, context, feedback)
 
 
+class KnowledgePhaseRegistry(RunRegistry):
+    def run(
+        self,
+        stage: str,
+        context: dict,
+        feedback: str | None = None,
+        *,
+        progress_handler=None,
+        cancellation_checker=None,
+    ) -> dict:
+        if stage == "knowledge_integration" and progress_handler:
+            progress_handler(
+                {
+                    "node_id": "literature_extract",
+                    "kind": "partial_output",
+                    "message": "Literature cards are available.",
+                    "progress": 0.7,
+                    "payload": {"literature_cards": [{"literature_id": "lit_001"}]},
+                }
+            )
+            progress_handler(
+                {
+                    "node_id": "evidence_extract",
+                    "kind": "partial_output",
+                    "message": "Evidence cards are available.",
+                    "progress": 0.82,
+                    "payload": {"evidence_cards": [{"evidence_id": "ev_001"}]},
+                }
+            )
+            progress_handler(
+                {
+                    "node_id": "gap_synthesis",
+                    "kind": "partial_output",
+                    "message": "Knowledge gaps are available.",
+                    "progress": 0.92,
+                    "payload": {"knowledge_gaps": [{"gap_id": "gap_001"}]},
+                }
+            )
+        return super().run(stage, context, feedback)
+
+
 class WorkflowRunManagerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -220,6 +261,37 @@ class WorkflowRunManagerTests(unittest.TestCase):
 
         self.assertLess(time.perf_counter() - started_at, 2)
         self.assertEqual(cancelled["current_node"], "source_search:crossref")
+
+    def test_knowledge_progress_events_include_standard_phase_ids(self) -> None:
+        self.orchestrator.registry = KnowledgePhaseRegistry()
+        self.create_task("task_knowledge_phases")
+        run = self.manager.start("task_knowledge_phases")
+        self.wait_for(run["run_id"], {"completed"})
+
+        events = [
+            event
+            for event in self.artifacts.read_events("task_knowledge_phases")
+            if event["stage"] == "knowledge_integration"
+            and event["data"].get("kind") == "partial_output"
+        ]
+        phase_ids = {
+            event["data"]["payload"].get("phase_id")
+            for event in events
+        }
+        self.assertIn("literature_search", phase_ids)
+        self.assertIn("evidence_integration", phase_ids)
+        self.assertIn("knowledge_gap_synthesis", phase_ids)
+
+        stored = self.artifacts.read_json(
+            "task_knowledge_phases", f"runs/{run['run_id']}.json"
+        )
+        checkpoint_ids = {
+            checkpoint.get("node_id")
+            for checkpoint in stored.get("checkpoints", [])
+        }
+        self.assertIn("literature_search", checkpoint_ids)
+        self.assertIn("evidence_integration", checkpoint_ids)
+        self.assertIn("knowledge_gap_synthesis", checkpoint_ids)
 
     def test_instruction_is_applied_at_target_stage_boundary(self) -> None:
         instruction_registry = InstructionRegistry()

@@ -11,6 +11,7 @@ import {
   Activity,
   Archive,
   ArrowDown,
+  AtSign,
   Brain,
   Check,
   CheckCircle2,
@@ -50,6 +51,7 @@ import {
   evaluateResearchPlan,
   executeNode,
   exportTaskBundle,
+  fetchArtifactJson,
   finishTaskIteration,
   fetchArtifacts,
   fetchHealthStatus,
@@ -122,6 +124,25 @@ const activeWorkflowStatuses = new Set([
   "paused",
   "cancelling",
 ]);
+const fallbackAttachmentExtensions = [".txt", ".md", ".csv", ".json", ".pdf", ".docx", ".pptx", ".xlsx"];
+const attachmentAccept = [
+  ".txt",
+  ".md",
+  ".csv",
+  ".json",
+  ".pdf",
+  ".docx",
+  ".pptx",
+  ".xlsx",
+  "text/plain",
+  "text/markdown",
+  "text/csv",
+  "application/json",
+  "application/pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+].join(",");
 
 interface StarterQuestion {
   domain: string;
@@ -164,10 +185,13 @@ interface ThreadMessage {
   id: string;
   kind: MessageKind;
   stage?: StageId;
+  title?: string;
   body?: string;
+  attachments?: RemoteAttachment[];
   activity?: string;
   activityNode?: string;
   activityProgress?: number;
+  partialPayload?: Record<string, unknown>;
   workflowRunId?: string;
   iteration?: number;
   response?: AgentResponse | null;
@@ -178,6 +202,41 @@ interface ThreadMessage {
   revisionNote?: string;
   durationMs?: number;
   createdAt: string;
+}
+
+interface ChatScrollState {
+  isNearBottom: boolean;
+  autoFollowEnabled: boolean;
+  hasUnreadOutput: boolean;
+  isAgentStreaming: boolean;
+}
+
+function pendingFileAttachments(files: File[], messageId: string): RemoteAttachment[] {
+  const now = new Date().toISOString();
+  return files.map((file, index) => ({
+    attachment_id: `pending_${messageId}_${index}`,
+    name: file.name,
+    path: "",
+    media_type: file.type || "application/octet-stream",
+    size: file.size,
+    created_at: now,
+    message_id: messageId,
+    upload_status: "pending",
+    parse_status: "pending",
+  }));
+}
+
+function failedFileAttachments(files: File[], messageId: string): RemoteAttachment[] {
+  return pendingFileAttachments(files, messageId).map((attachment) => ({
+    ...attachment,
+    upload_status: "failed",
+    parse_status: "failed",
+  }));
+}
+
+function mergeRemoteAttachments(current: RemoteAttachment[], incoming: RemoteAttachment[]) {
+  const known = new Set(current.map((item) => item.attachment_id));
+  return [...current, ...incoming.filter((item) => !known.has(item.attachment_id))];
 }
 
 interface MessageIndexPreview {
@@ -193,6 +252,15 @@ interface PickerOption<T extends string> {
   value: T;
   label: string;
   description?: string;
+}
+
+interface ComposerMentionOption {
+  token: string;
+  label: string;
+  description: string;
+  stage?: StageId;
+  controller?: boolean;
+  aliases: string[];
 }
 
 interface ProjectSession {
@@ -225,15 +293,83 @@ const eventKey = (event: EventLog) => {
   return runId && sequence ? `${runId}:${sequence}` : event.event_id;
 };
 
+const controllerMentionAliases = ["@controller", "@control", "@orchestrator", "@总控", "@控制器"];
+const stageMentionAliases: Record<StageId, string[]> = {
+  question_understanding: ["@question", "@understanding", "@question_understanding", "@问题理解", "@理解"],
+  knowledge_integration: ["@knowledge", "@knowledge_integration", "@literature", "@文献", "@知识整合"],
+  hypothesis_generation: ["@hypothesis", "@hypothesis_generation", "@假设", "@假设生成"],
+  evidence_mapping: ["@evidence", "@evidence_mapping", "@证据", "@证据梳理"],
+  research_planning: ["@plan", "@planning", "@research_planning", "@计划", "@研究计划"],
+  final_review: ["@final", "@review", "@final_review", "@总评", "@最终输出"],
+};
+const stageMentionTokens: Record<StageId, string> = {
+  question_understanding: "@question",
+  knowledge_integration: "@knowledge",
+  hypothesis_generation: "@hypothesis",
+  evidence_mapping: "@evidence",
+  research_planning: "@plan",
+  final_review: "@final",
+};
+const allComposerMentionAliases = [
+  ...controllerMentionAliases,
+  ...Object.values(stageMentionAliases).flat(),
+].sort((left, right) => right.length - left.length);
+const activeComposerMentionPattern = /(^|\s)@([A-Za-z0-9_\-\u4e00-\u9fff]*)$/;
+const mentionTrailingBoundary = String.raw`(?=$|[\s,.;:!?，。；：！？、])`;
+
+function includesComposerMention(message: string, aliases: string[]) {
+  return aliases.some((alias) =>
+    new RegExp(`(^|\\s)${escapeRegex(alias)}${mentionTrailingBoundary}`, "i").test(message),
+  );
+}
+
+function mentionsController(message: string) {
+  return includesComposerMention(message, controllerMentionAliases);
+}
+
+function mentionsStage(message: string) {
+  return stageOrder.some((stage) => includesComposerMention(message, stageMentionAliases[stage]));
+}
+
 function mentionedStage(message: string, fallback: StageId): StageId {
-  const lowered = message.toLowerCase();
-  const targets: Array<[string, StageId]> = [
-    ["@knowledge", "knowledge_integration"],
-    ["@hypothesis", "hypothesis_generation"],
-    ["@evidence", "evidence_mapping"],
-    ["@planning", "research_planning"],
-  ];
-  return targets.find(([mention]) => lowered.includes(mention))?.[1] ?? fallback;
+  const match = stageOrder.find((stage) => includesComposerMention(message, stageMentionAliases[stage]));
+  return match ?? fallback;
+}
+
+function escapeRegex(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stripComposerMentions(message: string) {
+  return allComposerMentionAliases
+    .reduce((current, alias) =>
+      current.replace(new RegExp(`(^|\\s)${escapeRegex(alias)}${mentionTrailingBoundary}`, "gi"), " "),
+    message)
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getActiveComposerMentionQuery(message: string) {
+  const match = message.match(activeComposerMentionPattern);
+  return match ? match[2].toLowerCase() : null;
+}
+
+function renderComposerDraftHighlight(message: string): ReactNode[] {
+  if (!message) return [];
+  const aliases = allComposerMentionAliases.map(escapeRegex).join("|");
+  if (!aliases) return [message];
+  const pattern = new RegExp(`(^|\\s)(${aliases})${mentionTrailingBoundary}`, "gi");
+  const nodes: ReactNode[] = [];
+  let lastIndex = 0;
+  message.replace(pattern, (match, prefix: string, token: string, offset: number) => {
+    if (offset > lastIndex) nodes.push(message.slice(lastIndex, offset));
+    if (prefix) nodes.push(prefix);
+    nodes.push(<span className="composer-mention-token" key={`${token}-${offset}`}>{token}</span>);
+    lastIndex = offset + match.length;
+    return match;
+  });
+  if (lastIndex < message.length) nodes.push(message.slice(lastIndex));
+  return nodes;
 }
 
 function nodeEventSummary(event: EventLog, language: Language) {
@@ -348,6 +484,24 @@ function upsertStageMessage(
   return next;
 }
 
+function mergeKnowledgePartialPayload(
+  existing: Record<string, unknown> | undefined,
+  event: EventLog,
+) {
+  if (event.stage !== "knowledge_integration") return existing;
+  const next: Record<string, unknown> = { ...(existing ?? {}) };
+  const nodeId = event.data?.node_id;
+  const payload = event.data?.payload;
+  if (nodeId) next._active_node = nodeId;
+  if (typeof event.data?.kind === "string") next._event_kind = event.data.kind;
+  if (typeof event.data?.progress === "number") next._progress = event.data.progress;
+  if (payload && typeof payload === "object") {
+    Object.assign(next, payload);
+    if (typeof payload.phase_id === "string") next._active_phase = payload.phase_id;
+  }
+  return next;
+}
+
 function applyWorkflowEventToMessages(
   current: ThreadMessage[],
   event: EventLog,
@@ -389,6 +543,7 @@ function applyWorkflowEventToMessages(
     activity: getWorkflowActivity(event, language),
     activityNode: getNodeActivityLabel(event, language),
     activityProgress: typeof event.data?.progress === "number" ? event.data.progress : existing?.activityProgress,
+    partialPayload: mergeKnowledgePartialPayload(sameRun ? existing?.partialPayload : undefined, event),
     workflowRunId: runId,
     durationMs,
   };
@@ -1073,11 +1228,28 @@ function App() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [activeRun, setActiveRun] = useState<WorkflowRun | null>(null);
   const [runsByTask, setRunsByTask] = useState<Record<string, WorkflowRun | null>>({});
+  const [pendingActionIds, setPendingActionIds] = useState<Set<string>>(() => new Set());
+  const [composerDragActive, setComposerDragActive] = useState(false);
+  const [chatScrollState, setChatScrollState] = useState<ChatScrollState>({
+    isNearBottom: true,
+    autoFollowEnabled: true,
+    hasUnreadOutput: false,
+    isAgentStreaming: false,
+  });
   const [streamConnected, setStreamConnected] = useState(false);
+  const threadAreaRef = useRef<HTMLElement | null>(null);
   const threadEndRef = useRef<HTMLDivElement | null>(null);
+  const composerHighlightRef = useRef<HTMLDivElement | null>(null);
   const taskIdRef = useRef(context.task_id);
   const activeProjectIdRef = useRef(activeProjectId);
   const runsByTaskRef = useRef<Record<string, WorkflowRun | null>>({});
+  const pendingActionIdsRef = useRef<Set<string>>(new Set());
+  const chatScrollStateRef = useRef<ChatScrollState>({
+    isNearBottom: true,
+    autoFollowEnabled: true,
+    hasUnreadOutput: false,
+    isAgentStreaming: false,
+  });
   const streamConnectedByTaskRef = useRef<Record<string, boolean>>({});
   const restoredLanguageRef = useRef<Language | null>(null);
   const restoredTaskIdsRef = useRef<Set<string>>(new Set());
@@ -1103,10 +1275,60 @@ function App() {
   );
   const progress = Math.round((completedCount / stages.length) * 100);
   const currentStageLabel = finished ? statusLabel[language].completed : stageLabel[language][activeStage];
-  const uploadedLabel = [...attachments.map((item) => item.name), ...files.map((file) => file.name)].join(", ") || t.noFiles;
+  const pendingFilesLabel = files.map((file) => file.name).join(", ") || t.noFiles;
+  const composerCleanDraft = stripComposerMentions(questionDraft);
   const composerCanSubmit = hasSubmittedQuestion
-    ? Boolean(questionDraft.trim() || files.length)
-    : Boolean(questionDraft.trim());
+    ? Boolean(composerCleanDraft || files.length)
+    : Boolean(composerCleanDraft || files.length);
+  const composerMentionsController = mentionsController(questionDraft);
+  const composerMentionsStage = mentionsStage(questionDraft);
+  const composerTargetStage = mentionedStage(questionDraft, feedbackTarget);
+  const composerRouteLabel = composerMentionsController
+    ? (language === "zh" ? "总控" : "Controller")
+    : composerMentionsStage
+      ? stageLabel[language][composerTargetStage]
+      : "";
+  const composerMentionQuery = getActiveComposerMentionQuery(questionDraft);
+  const composerMentionOptions = useMemo<ComposerMentionOption[]>(() => {
+    if (composerMentionQuery === null) return [];
+    const options: ComposerMentionOption[] = [
+      {
+        token: "@controller",
+        label: language === "zh" ? "总控" : "Controller",
+        description: language === "zh" ? "提问、澄清意图或让总控判断下一步" : "Ask, clarify intent, or let the controller decide next steps",
+        controller: true,
+        aliases: controllerMentionAliases,
+      },
+      ...stageOrder.filter((stage) => stage !== "final_review").map((stage) => ({
+        token: stageMentionTokens[stage],
+        label: stageLabel[language][stage],
+        description: language === "zh" ? `${stageMeta[stage].agent} 定向反馈或重跑` : `Direct feedback or rerun for ${stageMeta[stage].agent}`,
+        stage,
+        aliases: stageMentionAliases[stage],
+      })),
+    ];
+    const query = composerMentionQuery.toLowerCase();
+    return options
+      .filter((option) =>
+        !query
+        || option.token.toLowerCase().includes(query)
+        || option.label.toLowerCase().includes(query)
+        || option.aliases.some((alias) => alias.toLowerCase().includes(query)))
+      .slice(0, 7);
+  }, [composerMentionQuery, language]);
+  const showComposerTargetControls = false;
+  const showComposerRunHint = false;
+  const composerSendTitle = running
+    ? composerCanSubmit
+      ? language === "zh" ? "发送给总控或 @ 指定模块" : "Send to the controller or targeted @ module"
+      : language === "zh" ? "停止当前工作流" : "Stop workflow immediately"
+    : !hasSubmittedQuestion
+      ? t.start
+      : iterationEnded
+        ? language === "zh" ? "向总控提问" : "Ask controller"
+        : composerMentionsStage
+          ? language === "zh" ? "发送给指定模块" : "Send to targeted module"
+          : language === "zh" ? "向总控提问" : "Ask controller";
   const latestEvent = events[0]?.message;
   const maxIterations = health?.max_iterations ?? 10;
   const readyAgentCount = health?.ready_agent_count ?? 0;
@@ -1122,11 +1344,85 @@ function App() {
     }).slice(0, 6);
   }, [activeRun, events]);
 
+  const insertComposerMention = useCallback((token: string) => {
+    setQuestionDraft((current) => {
+      if (activeComposerMentionPattern.test(current)) {
+        return current.replace(activeComposerMentionPattern, `$1${token} `);
+      }
+      const cleanCurrent = stripComposerMentions(current);
+      return cleanCurrent ? `${token} ${cleanCurrent}` : `${token} `;
+    });
+  }, []);
+
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     document.documentElement.style.colorScheme = theme;
     window.localStorage.setItem("eurekaloop-theme", theme);
   }, [theme]);
+
+  const updateChatScrollState = useCallback((patch: Partial<ChatScrollState>) => {
+    const next = { ...chatScrollStateRef.current, ...patch };
+    const previous = chatScrollStateRef.current;
+    if (
+      next.isNearBottom === previous.isNearBottom
+      && next.autoFollowEnabled === previous.autoFollowEnabled
+      && next.hasUnreadOutput === previous.hasUnreadOutput
+      && next.isAgentStreaming === previous.isAgentStreaming
+    ) {
+      return;
+    }
+    chatScrollStateRef.current = next;
+    setChatScrollState(next);
+  }, []);
+
+  const scrollToLatest = useCallback((behavior: ScrollBehavior = "smooth") => {
+    updateChatScrollState({
+      autoFollowEnabled: true,
+      hasUnreadOutput: false,
+      isNearBottom: true,
+    });
+    window.requestAnimationFrame(() => {
+      threadEndRef.current?.scrollIntoView({ behavior, block: "end" });
+    });
+  }, [updateChatScrollState]);
+
+  const syncChatScrollPosition = useCallback(() => {
+    const area = threadAreaRef.current;
+    if (!area) return;
+    const distanceToBottom = area.scrollHeight - area.scrollTop - area.clientHeight;
+    const isNearBottom = distanceToBottom < 96;
+    updateChatScrollState({
+      isNearBottom,
+      autoFollowEnabled: isNearBottom,
+      hasUnreadOutput: isNearBottom ? false : chatScrollStateRef.current.hasUnreadOutput,
+    });
+  }, [updateChatScrollState]);
+
+  const addPendingFiles = useCallback((selected: File[]) => {
+    if (!selected.length) return;
+    const allowed = new Set(health?.attachments.allowed_extensions ?? fallbackAttachmentExtensions);
+    const maxBytes = health?.attachments.max_bytes ?? 2_000_000;
+    const invalid = selected.find((file) => {
+      const dot = file.name.lastIndexOf(".");
+      const extension = dot >= 0 ? file.name.slice(dot).toLowerCase() : "";
+      return !allowed.has(extension) || file.size > maxBytes;
+    });
+    if (invalid) {
+      setRuntimeError(language === "zh"
+        ? `无法添加 ${invalid.name}：仅支持 ${[...allowed].join("、")}，单个文件不超过 ${formatBytes(maxBytes)}。`
+        : `Cannot add ${invalid.name}. Use ${[...allowed].join(", ")} files up to ${formatBytes(maxBytes)} each.`);
+      return;
+    }
+    setRuntimeError("");
+    setFiles((current) => {
+      const known = new Set(current.map((file) => `${file.name}:${file.size}:${file.lastModified}`));
+      return [...current, ...selected.filter((file) => !known.has(`${file.name}:${file.size}:${file.lastModified}`))];
+    });
+  }, [health?.attachments.allowed_extensions, health?.attachments.max_bytes, language]);
+
+  const removePendingFile = useCallback((target: File) => {
+    setFiles((current) => current.filter((file) => file !== target));
+  }, []);
 
   const refreshRuntimeData = useCallback(async () => {
     if (!hasSubmittedQuestion) return;
@@ -1169,10 +1465,17 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (messages.length) {
-      threadEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    updateChatScrollState({ isAgentStreaming: running });
+  }, [running, updateChatScrollState]);
+
+  useEffect(() => {
+    if (!messages.length) return;
+    if (chatScrollStateRef.current.autoFollowEnabled || chatScrollStateRef.current.isNearBottom) {
+      scrollToLatest("smooth");
+      return;
     }
-  }, [messages, running]);
+    updateChatScrollState({ hasUnreadOutput: true });
+  }, [messages, scrollToLatest, updateChatScrollState]);
 
   useEffect(() => {
     const now = new Date().toISOString();
@@ -1368,14 +1671,51 @@ function App() {
     [language],
   );
 
-  const pushMessage = useCallback((message: Omit<ThreadMessage, "id" | "createdAt">) => {
-    const id = makeMessageId(message.kind);
+  const pushMessage = useCallback((message: Omit<ThreadMessage, "id" | "createdAt"> & { id?: string }) => {
+    const id = message.id ?? makeMessageId(message.kind);
     setMessages((current) => [...current, { ...message, id, createdAt: new Date().toISOString() }]);
     return id;
   }, []);
 
   const patchMessage = useCallback((id: string, patch: Partial<ThreadMessage>) => {
     setMessages((current) => current.map((message) => (message.id === id ? { ...message, ...patch } : message)));
+  }, []);
+
+  const uploadPendingFilesForMessage = useCallback(
+    async (taskId: string, selectedFiles: File[], messageId: string) => {
+      if (!selectedFiles.length) return null;
+      const uploaded = await uploadTaskAttachments(taskId, selectedFiles, messageId);
+      setAttachments((current) => mergeRemoteAttachments(current, uploaded.attachments));
+      patchMessage(messageId, { attachments: uploaded.attachments });
+      setFiles((current) => current.filter((file) => !selectedFiles.includes(file)));
+      return uploaded.task_context;
+    },
+    [patchMessage],
+  );
+
+  const markMessageAttachmentUploadFailed = useCallback(
+    (messageId: string, selectedFiles: File[]) => {
+      if (!selectedFiles.length) return;
+      patchMessage(messageId, { attachments: failedFileAttachments(selectedFiles, messageId) });
+    },
+    [patchMessage],
+  );
+
+  const beginMessageAction = useCallback((id: string) => {
+    if (pendingActionIdsRef.current.has(id)) return false;
+    const next = new Set(pendingActionIdsRef.current);
+    next.add(id);
+    pendingActionIdsRef.current = next;
+    setPendingActionIds(next);
+    return true;
+  }, []);
+
+  const finishMessageAction = useCallback((id: string) => {
+    if (!pendingActionIdsRef.current.has(id)) return;
+    const next = new Set(pendingActionIdsRef.current);
+    next.delete(id);
+    pendingActionIdsRef.current = next;
+    setPendingActionIds(next);
   }, []);
 
   const updateStage = useCallback((stageId: StageId, patch: Partial<StageRun>) => {
@@ -1581,6 +1921,15 @@ function App() {
     },
     [hydrateProject, language, trackWorkflowRun, updateStage],
   );
+
+  const handleExternalWorkflowRun = useCallback((run: WorkflowRun) => {
+    trackWorkflowRun(run.task_id, run);
+    if (!activeWorkflowStatuses.has(run.status)) return;
+    void monitorWorkflowRun(run).catch((error) => {
+      trackWorkflowRun(run.task_id, null);
+      setRuntimeError(error instanceof Error ? error.message : String(error));
+    });
+  }, [monitorWorkflowRun, trackWorkflowRun]);
 
   useEffect(() => {
     if (!hasSubmittedQuestion || !restoredTaskIdsRef.current.has(context.task_id)) return;
@@ -1822,9 +2171,16 @@ function App() {
   );
 
   const startDemo = useCallback(async () => {
-    const question = questionDraft.trim();
+    const selectedFiles = [...files];
+    const typedQuestion = stripComposerMentions(questionDraft.trim());
+    const question = typedQuestion || (selectedFiles.length
+      ? language === "zh"
+        ? "请基于我上传的附件，提炼研究问题并启动 AI Scientist 协作流程。"
+        : "Use the uploaded attachments to extract the research question and start the AI Scientist workflow."
+      : "");
     if (running || !question) return;
 
+    const userMessageId = makeMessageId("user");
     const localTask = buildFreshTask(question);
     setRunning(true);
     let fresh: TaskContext;
@@ -1860,19 +2216,22 @@ function App() {
     setHasSubmittedQuestion(true);
     setQuestionDraft("");
 
-    pushMessage({ kind: "user", body: question });
+    pushMessage({
+      id: userMessageId,
+      kind: "user",
+      body: question,
+      attachments: pendingFileAttachments(selectedFiles, userMessageId),
+    });
     pushMessage({ kind: "controller", body: t.controllerStarted, status: "passed" });
 
-    if (files.length) {
+    if (selectedFiles.length) {
       try {
-        const uploaded = await uploadTaskAttachments(fresh.task_id, files);
-        fresh = uploaded.task_context;
+        fresh = await uploadPendingFilesForMessage(fresh.task_id, selectedFiles, userMessageId) ?? fresh;
         setContext(fresh);
-        setAttachments((current) => [...current, ...uploaded.attachments]);
-        setFiles([]);
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         setRuntimeError(detail);
+        markMessageAttachmentUploadFailed(userMessageId, selectedFiles);
         pushMessage({
           kind: "controller",
           body: language === "zh"
@@ -1904,15 +2263,23 @@ function App() {
         status: "failed",
       });
     }
-  }, [appendEvent, approval, buildFreshTask, continueFrom, files, language, memory, monitorWorkflowRun, pushMessage, questionDraft, reasoning, running, t.controllerStarted]);
+  }, [appendEvent, approval, buildFreshTask, continueFrom, files, language, markMessageAttachmentUploadFailed, memory, monitorWorkflowRun, pushMessage, questionDraft, reasoning, running, t.controllerStarted, uploadPendingFilesForMessage]);
 
-  const approveReview = useCallback(async (stageOverride?: StageId) => {
+  const approveReview = useCallback(async (stageOverride?: StageId, sourceMessageId?: string) => {
     const stage = stageOverride ?? reviewStage;
     if (!stage || running) return;
+    const approvalId = sourceMessageId ? `${context.task_id}:${stage}:${sourceMessageId}:approve` : undefined;
+    if (sourceMessageId && !beginMessageAction(sourceMessageId)) return;
     const resumeIndex = pendingIndex ?? stageOrder.indexOf(stage);
-    if (resumeIndex < 0) return;
+    if (resumeIndex < 0) {
+      if (sourceMessageId) finishMessageAction(sourceMessageId);
+      return;
+    }
     const stageRun = stages.find((item) => item.id === stage);
-    if (!stageRun?.output) return;
+    if (!stageRun?.output) {
+      if (sourceMessageId) finishMessageAction(sourceMessageId);
+      return;
+    }
 
     const qualityOverride = stageRun.status === "revision_required";
     const comment = qualityOverride
@@ -1924,10 +2291,11 @@ function App() {
         : "Human approval granted. Continue.";
     let remoteResult: Awaited<ReturnType<typeof submitHumanReview>>;
     try {
-      remoteResult = await submitHumanReview(context.task_id, stage, "accept", comment);
+      remoteResult = await submitHumanReview(context.task_id, stage, "accept", comment, approvalId);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       appendEvent("human_review_failed", `审批提交失败：${detail}`, `Review submission failed: ${detail}`, stage);
+      if (sourceMessageId) finishMessageAction(sourceMessageId);
       return;
     }
     const approvedReview: ReviewRecord = remoteResult.review ?? {
@@ -1987,8 +2355,10 @@ function App() {
     } catch (error) {
       setRunning(false);
       setRuntimeError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (sourceMessageId) finishMessageAction(sourceMessageId);
     }
-  }, [activeRun, appendEvent, context, continueFrom, language, monitorWorkflowRun, pendingIndex, reviewStage, running, stages, updateStage, versions]);
+  }, [activeRun, appendEvent, beginMessageAction, context, continueFrom, finishMessageAction, language, monitorWorkflowRun, pendingIndex, reviewStage, running, stages, updateStage, versions]);
 
   const rerunStageWithFeedback = useCallback(
     async (
@@ -1999,8 +2369,12 @@ function App() {
       review: ReviewRecord | null = null,
     ) => {
       if (running) return;
+      if (!beginMessageAction(sourceMessageId)) return;
       const index = stageOrder.indexOf(stage);
-      if (index < 0) return;
+      if (index < 0) {
+        finishMessageAction(sourceMessageId);
+        return;
+      }
       const note = systemGenerated && response
         ? buildSystemRevisionNote(response, review, language)
         : feedbackDrafts[sourceMessageId]?.trim() || (language === "zh" ? "请重新检查并改进这一阶段输出。" : "Please re-check and improve this stage output.");
@@ -2021,6 +2395,7 @@ function App() {
         const detail = error instanceof Error ? error.message : String(error);
         appendEvent("feedback_record_failed", `反馈保存失败：${detail}`, `Feedback persistence failed: ${detail}`, stage);
         setRuntimeError(detail);
+        finishMessageAction(sourceMessageId);
         return;
       }
 
@@ -2064,12 +2439,16 @@ function App() {
       } catch (error) {
         setRunning(false);
         setRuntimeError(error instanceof Error ? error.message : String(error));
+      } finally {
+        finishMessageAction(sourceMessageId);
       }
     },
     [
       appendEvent,
+      beginMessageAction,
       context,
       feedbackDrafts,
+      finishMessageAction,
       language,
       memory,
       monitorWorkflowRun,
@@ -2081,24 +2460,33 @@ function App() {
   );
 
   const submitProjectFeedback = useCallback(async () => {
-    const typedNote = questionDraft.trim();
+    const typedNote = stripComposerMentions(questionDraft.trim());
     if (running || (!typedNote && !files.length) || !hasSubmittedQuestion || context.current_stage === "human_review") return;
-    const targetStage = mentionedStage(typedNote, feedbackTarget);
+    const targetStage = mentionedStage(questionDraft, feedbackTarget);
     const targetIndex = stageOrder.indexOf(targetStage);
     if (targetIndex < 0) return;
 
+    const selectedFiles = [...files];
+    const userMessageId = makeMessageId("user");
+    const note = typedNote || (language === "zh"
+      ? "请结合本次新增附件重新检查并改进该模块输出。"
+      : "Re-check and improve this module using the newly attached files.");
     setRuntimeError("");
+    pushMessage({
+      id: userMessageId,
+      kind: "user",
+      title: language === "zh" ? `给${stageLabel.zh[targetStage]}的反馈` : `Feedback for ${stageLabel.en[targetStage]}`,
+      body: note,
+      stage: targetStage,
+      attachments: pendingFileAttachments(selectedFiles, userMessageId),
+    });
     let rerunContext = context;
+    let uploadedOk = false;
     try {
-      if (files.length) {
-        const uploaded = await uploadTaskAttachments(context.task_id, files);
-        rerunContext = uploaded.task_context;
-        setAttachments((current) => [...current, ...uploaded.attachments]);
-        setFiles([]);
+      if (selectedFiles.length) {
+        rerunContext = await uploadPendingFilesForMessage(context.task_id, selectedFiles, userMessageId) ?? rerunContext;
       }
-      const note = typedNote || (language === "zh"
-        ? "请结合本次新增附件重新检查并改进该模块输出。"
-        : "Re-check and improve this module using the newly attached files.");
+      uploadedOk = true;
       rerunContext = (await recordFeedback(context.task_id, targetStage, note, {
         mode: runMode,
         reasoningLevel: reasoning,
@@ -2107,6 +2495,7 @@ function App() {
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       setRuntimeError(detail);
+      if (!uploadedOk) markMessageAttachmentUploadFailed(userMessageId, selectedFiles);
       pushMessage({
         kind: "controller",
         body: language === "zh" ? `反馈保存失败：${detail}` : `Feedback failed: ${detail}`,
@@ -2115,10 +2504,6 @@ function App() {
       return;
     }
 
-    const note = typedNote || (language === "zh"
-      ? "请结合本次新增附件重新检查并改进该模块输出。"
-      : "Re-check and improve this module using the newly attached files.");
-    pushMessage({ kind: "user", body: note, stage: targetStage });
     setQuestionDraft("");
     setContext(rerunContext);
     setVersions(rerunContext.versions);
@@ -2147,6 +2532,7 @@ function App() {
     hasSubmittedQuestion,
     files,
     language,
+    markMessageAttachmentUploadFailed,
     memory,
     monitorWorkflowRun,
     pushMessage,
@@ -2154,20 +2540,42 @@ function App() {
     reasoning,
     runMode,
     running,
+    uploadPendingFilesForMessage,
   ]);
 
   const submitRunInstruction = useCallback(async () => {
-    const comment = questionDraft.trim();
-    if (!activeRun || !comment) return;
+    const typedComment = stripComposerMentions(questionDraft.trim());
+    if (!activeRun || (!typedComment && !files.length)) return;
+    const selectedFiles = [...files];
+    const userMessageId = makeMessageId("user");
+    const targetStage = mentionedStage(questionDraft, feedbackTarget);
+    const comment = typedComment || (language === "zh"
+      ? "请结合本次新增附件，在下一个安全节点边界重新检查该模块。"
+      : "Use the newly attached files to re-check this module at the next safe node boundary.");
+    let uploadedOk = false;
+    pushMessage({
+      id: userMessageId,
+      kind: "user",
+      title: language === "zh" ? `给${stageLabel.zh[targetStage]}的运行指令` : `Instruction for ${stageLabel.en[targetStage]}`,
+      body: comment,
+      stage: targetStage,
+      attachments: pendingFileAttachments(selectedFiles, userMessageId),
+    });
     try {
-      const targetStage = mentionedStage(comment, feedbackTarget);
+      if (selectedFiles.length) {
+        const updatedContext = await uploadPendingFilesForMessage(activeRun.task_id, selectedFiles, userMessageId);
+        if (updatedContext) {
+          setContext(updatedContext);
+          setVersions(updatedContext.versions);
+        }
+      }
+      uploadedOk = true;
       const updated = await queueRunInstruction(
         activeRun.run_id,
         comment,
         targetStage,
       );
       trackWorkflowRun(updated.task_id, updated);
-      pushMessage({ kind: "user", body: comment, stage: targetStage });
       pushMessage({
         kind: "controller",
         body: language === "zh"
@@ -2177,9 +2585,26 @@ function App() {
       });
       setQuestionDraft("");
     } catch (error) {
-      setRuntimeError(error instanceof Error ? error.message : String(error));
+      const detail = error instanceof Error ? error.message : String(error);
+      setRuntimeError(detail);
+      if (!uploadedOk) markMessageAttachmentUploadFailed(userMessageId, selectedFiles);
+      pushMessage({
+        kind: "controller",
+        body: language === "zh" ? `运行指令提交失败：${detail}` : `Instruction failed: ${detail}`,
+        status: "failed",
+      });
     }
-  }, [activeRun, feedbackTarget, language, pushMessage, questionDraft, trackWorkflowRun]);
+  }, [
+    activeRun,
+    feedbackTarget,
+    files,
+    language,
+    markMessageAttachmentUploadFailed,
+    pushMessage,
+    questionDraft,
+    trackWorkflowRun,
+    uploadPendingFilesForMessage,
+  ]);
 
   const continueIteration = useCallback(async () => {
     const controllerSuggestion = controllerFinalReview?.suggestions?.join("\n").trim();
@@ -2244,27 +2669,66 @@ function App() {
   }, [context, iterationBusy, language, pushMessage, running]);
 
   const submitControllerQuestion = useCallback(async () => {
-    const question = questionDraft.trim();
-    if (!question || running) return;
-    setQuestionDraft("");
+    const typedQuestion = stripComposerMentions(questionDraft.trim());
+    if (!typedQuestion && !files.length) return;
+    const selectedFiles = [...files];
+    const userMessageId = makeMessageId("user");
+    const question = typedQuestion || (language === "zh"
+      ? "我上传了新的附件，请先阅读并告诉我这些材料会如何影响当前项目。"
+      : "I uploaded new attachments. Review them and tell me how they affect the current project.");
     setRuntimeError("");
-    pushMessage({ kind: "user", body: question });
+    pushMessage({
+      id: userMessageId,
+      kind: "user",
+      title: language === "zh" ? "向总控提问" : "Controller question",
+      body: question,
+      attachments: pendingFileAttachments(selectedFiles, userMessageId),
+    });
+    let uploadedOk = false;
     try {
+      if (selectedFiles.length) {
+        const updatedContext = await uploadPendingFilesForMessage(context.task_id, selectedFiles, userMessageId);
+        if (updatedContext) {
+          setContext(updatedContext);
+          setVersions(updatedContext.versions);
+        }
+      }
+      uploadedOk = true;
       const result = await routeControllerMessage(context.task_id, question, false);
       setContext(result.task_context);
+      setVersions(result.task_context.versions);
       pushMessage({
         kind: "controller",
         body: result.route.answer || result.route.reason,
         status: "passed",
       });
+      setQuestionDraft("");
     } catch (error) {
-      setRuntimeError(error instanceof Error ? error.message : String(error));
+      const detail = error instanceof Error ? error.message : String(error);
+      setRuntimeError(detail);
+      if (!uploadedOk) markMessageAttachmentUploadFailed(userMessageId, selectedFiles);
+      pushMessage({
+        kind: "controller",
+        body: language === "zh" ? `总控处理失败：${detail}` : `Controller failed: ${detail}`,
+        status: "failed",
+      });
     }
-  }, [context.task_id, pushMessage, questionDraft, running]);
+  }, [
+    context.task_id,
+    files,
+    language,
+    markMessageAttachmentUploadFailed,
+    pushMessage,
+    questionDraft,
+    uploadPendingFilesForMessage,
+  ]);
 
   const submitComposer = useCallback(() => {
     if (running && activeRun) {
-      void submitRunInstruction();
+      if (composerMentionsStage && !composerMentionsController) void submitRunInstruction();
+      else void submitControllerQuestion();
+    } else if (hasSubmittedQuestion && (composerMentionsController || !composerMentionsStage)) {
+      void submitControllerQuestion();
     } else if (iterationEnded) {
       void submitControllerQuestion();
     } else if (hasSubmittedQuestion) {
@@ -2272,7 +2736,7 @@ function App() {
     } else {
       void startDemo();
     }
-  }, [activeRun, hasSubmittedQuestion, iterationEnded, running, startDemo, submitControllerQuestion, submitProjectFeedback, submitRunInstruction]);
+  }, [activeRun, composerMentionsController, composerMentionsStage, hasSubmittedQuestion, iterationEnded, running, startDemo, submitControllerQuestion, submitProjectFeedback, submitRunInstruction]);
 
   const activeStageRun = stages.find((stage) => stage.id === activeStage) ?? stages[0];
   const visibleMessages = iterationReviewReady
@@ -2468,7 +2932,12 @@ function App() {
               </div>
             </header>
 
-            <section className="thread-area" aria-label={language === "zh" ? "对话记录" : "Conversation"}>
+            <section
+              className="thread-area"
+              aria-label={language === "zh" ? "对话记录" : "Conversation"}
+              ref={threadAreaRef}
+              onScroll={syncChatScrollPosition}
+            >
               {messages.length === 0 ? (
                 <ResearchStarter
                   constraints={context.user_input.user_constraints}
@@ -2508,7 +2977,8 @@ function App() {
                     key={message.id}
                     language={language}
                     message={message}
-                    onApprove={() => message.stage && void approveReview(message.stage)}
+                    actionBusy={pendingActionIds.has(message.id)}
+                    onApprove={() => message.stage && void approveReview(message.stage, message.id)}
                     onFeedbackChange={(value) => setFeedbackDrafts((current) => ({ ...current, [message.id]: value }))}
                     onOpenJson={(title, data) => setJsonOpen({ title, data })}
                     onRerun={() => {
@@ -2548,76 +3018,156 @@ function App() {
                 ) : null}
                 <div ref={threadEndRef} />
               </div>
+              {messages.length && (!chatScrollState.isNearBottom || chatScrollState.hasUnreadOutput) ? (
+                <button
+                  className={`scroll-latest-button ${chatScrollState.hasUnreadOutput ? "unread" : ""}`}
+                  type="button"
+                  onClick={() => scrollToLatest()}
+                >
+                  <ArrowDown size={15} />
+                  {chatScrollState.hasUnreadOutput
+                    ? language === "zh" ? "新输出" : "New output"
+                    : language === "zh" ? "回到最新" : "Latest"}
+                  {chatScrollState.isAgentStreaming ? <i /> : null}
+                </button>
+              ) : null}
             </section>
 
             <section className="composer-shell">
-              <div className="composer">
-                {hasSubmittedQuestion && !iterationEnded ? (
-                  <label className="feedback-target">
-                    <span>{language === "zh" ? "反馈目标" : "Feedback target"}</span>
-                    <select
-                      aria-label={language === "zh" ? "选择反馈目标模块" : "Select feedback target module"}
-                      disabled={context.current_stage === "human_review"}
-                      onChange={(event) => setFeedbackTarget(event.target.value as StageId)}
-                      value={feedbackTarget}
+              <div
+                className={`composer ${composerDragActive ? "drag-active" : ""}`}
+                onDragEnter={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  if (event.dataTransfer.types.includes("Files")) setComposerDragActive(true);
+                }}
+                onDragOver={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  if (event.dataTransfer.types.includes("Files")) setComposerDragActive(true);
+                }}
+                onDragLeave={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  const related = event.relatedTarget;
+                  if (!(related instanceof globalThis.Node) || !event.currentTarget.contains(related)) {
+                    setComposerDragActive(false);
+                  }
+                }}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  setComposerDragActive(false);
+                  addPendingFiles(Array.from(event.dataTransfer.files ?? []));
+                }}
+              >
+                {showComposerTargetControls ? (
+                  <div className="mention-strip" aria-label={language === "zh" ? "定向发送目标" : "Directed send target"}>
+                    <button
+                      className={composerMentionsController ? "active controller" : "controller"}
+                      disabled={context.current_stage === "human_review" || iterationReviewReady}
+                      type="button"
+                      onClick={() => insertComposerMention("@controller")}
                     >
-                      {stageOrder.map((stage) => (
-                        <option key={stage} value={stage}>{stageLabel[language][stage]}</option>
-                      ))}
-                    </select>
-                  </label>
+                      <AtSign size={13} />
+                      {language === "zh" ? "总控" : "Controller"}
+                    </button>
+                    {stageOrder.filter((stage) => stage !== "final_review").map((stage) => (
+                      <button
+                        className={!composerMentionsController && composerTargetStage === stage ? "active" : ""}
+                        disabled={context.current_stage === "human_review" || iterationReviewReady}
+                        key={stage}
+                        type="button"
+                        onClick={() => {
+                          setFeedbackTarget(stage);
+                          insertComposerMention(stageMentionTokens[stage]);
+                        }}
+                      >
+                        <AtSign size={13} />
+                        {stageLabel[language][stage]}
+                      </button>
+                    ))}
+                  </div>
                 ) : null}
-                <textarea
-                  aria-label={!hasSubmittedQuestion ? t.questionPlaceholder : language === "zh" ? "输入修改意见" : "Enter revision feedback"}
-                  disabled={context.current_stage === "human_review" || iterationReviewReady}
-                  onChange={(event) => setQuestionDraft(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" && !event.shiftKey) {
-                      event.preventDefault();
-                      submitComposer();
-                    }
-                  }}
-                  placeholder={!hasSubmittedQuestion
-                    ? t.questionPlaceholder
-                    : iterationEnded
-                      ? language === "zh"
-                        ? "询问总控：假设依据、证据关系、计划细节或最终结论"
-                        : "Ask about hypotheses, evidence, plan details, or conclusions"
-                      : iterationReviewReady
+                {showComposerRunHint ? (
+                  <div className="composer-run-hint">
+                    <span>{language === "zh" ? "运行中，输入会作为指令排队" : "Running. Your input will be queued as an instruction."}</span>
+                    {composerRouteLabel ? <b>{composerRouteLabel}</b> : null}
+                  </div>
+                ) : null}
+                {composerRouteLabel ? (
+                  <div className="composer-selected-target">
+                    <AtSign size={13} />
+                    <span>{composerRouteLabel}</span>
+                  </div>
+                ) : null}
+                {composerMentionOptions.length ? (
+                  <div className="mention-suggestions" role="listbox">
+                    {composerMentionOptions.map((option) => (
+                      <button
+                        className={option.controller ? "controller" : ""}
+                        key={option.token}
+                        type="button"
+                        onClick={() => {
+                          if (option.stage) setFeedbackTarget(option.stage);
+                          insertComposerMention(option.token);
+                        }}
+                      >
+                        <AtSign size={14} />
+                        <span>
+                          <strong>{option.label}</strong>
+                          <small>{option.description}</small>
+                        </span>
+                        <code>{option.token}</code>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+                <div className="composer-input-wrap">
+                  <div aria-hidden="true" className="composer-input-highlight" ref={composerHighlightRef}>
+                    {questionDraft ? renderComposerDraftHighlight(questionDraft) : null}
+                  </div>
+                  <textarea
+                    aria-label={!hasSubmittedQuestion ? t.questionPlaceholder : language === "zh" ? "输入修改意见" : "Enter revision feedback"}
+                    className="rich-composer-textarea"
+                    disabled={context.current_stage === "human_review" || iterationReviewReady}
+                    spellCheck={false}
+                    onChange={(event) => setQuestionDraft(event.target.value)}
+                    onScroll={(event) => {
+                      if (composerHighlightRef.current) {
+                        composerHighlightRef.current.scrollTop = event.currentTarget.scrollTop;
+                      }
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && !event.shiftKey) {
+                        event.preventDefault();
+                        submitComposer();
+                      }
+                    }}
+                    placeholder={!hasSubmittedQuestion
+                      ? t.questionPlaceholder
+                      : iterationEnded
                         ? language === "zh"
-                          ? "请先在上方总控评价卡片选择继续迭代或结束迭代"
-                          : "Choose continue or end iteration in the controller review card"
-                        : language === "zh"
-                          ? "说明希望如何改进当前项目"
-                          : "Describe how this project should be improved"}
-                  value={questionDraft}
-                />
+                          ? "询问总控：假设依据、证据关系、计划细节或最终结论"
+                          : "Ask about hypotheses, evidence, plan details, or conclusions"
+                        : iterationReviewReady
+                          ? language === "zh"
+                            ? "请先在上方总控评价卡片选择继续迭代或结束迭代"
+                            : "Choose continue or end iteration in the controller review card"
+                          : language === "zh"
+                            ? "说明希望如何改进当前项目，输入 @ 可定向到总控或 Agent"
+                            : "Describe improvements, or type @ to target the controller or an Agent"}
+                    value={questionDraft}
+                  />
+                </div>
                 <div className="composer-footer">
                   <label className="attach-button">
                     <input
                       multiple
-                      accept=".txt,.md,.csv,.json,text/plain,text/markdown,text/csv,application/json"
+                      accept={attachmentAccept}
                       type="file"
                       onChange={(event) => {
-                        const selected = Array.from(event.target.files ?? []);
-                        const allowed = new Set(health?.attachments.allowed_extensions ?? [".txt", ".md", ".csv", ".json"]);
-                        const maxBytes = health?.attachments.max_bytes ?? 2_000_000;
-                        const invalid = selected.find((file) => {
-                          const dot = file.name.lastIndexOf(".");
-                          const extension = dot >= 0 ? file.name.slice(dot).toLowerCase() : "";
-                          return !allowed.has(extension) || file.size > maxBytes;
-                        });
-                        if (invalid) {
-                          setRuntimeError(language === "zh"
-                            ? `无法添加 ${invalid.name}：仅支持 ${[...allowed].join("、")}，单个文件不超过 ${formatBytes(maxBytes)}。`
-                            : `Cannot add ${invalid.name}. Use ${[...allowed].join(", ")} files up to ${formatBytes(maxBytes)} each.`);
-                        } else {
-                          setRuntimeError("");
-                          setFiles((current) => {
-                            const known = new Set(current.map((file) => `${file.name}:${file.size}:${file.lastModified}`));
-                            return [...current, ...selected.filter((file) => !known.has(`${file.name}:${file.size}:${file.lastModified}`))];
-                          });
-                        }
+                        addPendingFiles(Array.from(event.target.files ?? []));
                         event.currentTarget.value = "";
                       }}
                     />
@@ -2625,9 +3175,9 @@ function App() {
                     <span className="tooltip">{t.addFile}</span>
                   </label>
 
-                  <span className="file-hint" title={uploadedLabel}>
+                  <span className="file-hint" title={pendingFilesLabel}>
                     <Paperclip size={14} />
-                    {uploadedLabel}
+                    {pendingFilesLabel}
                   </span>
 
                   <ControllerSettings
@@ -2657,18 +3207,33 @@ function App() {
                     className="send-button"
                     disabled={context.current_stage === "human_review" || iterationReviewReady || (!running && !composerCanSubmit)}
                     type="button"
-                    onClick={running ? () => void cancelActiveRun() : submitComposer}
-                    title={running
-                      ? language === "zh" ? "立即终止工作流" : "Stop workflow immediately"
-                      : !hasSubmittedQuestion
-                        ? t.start
-                        : iterationEnded
-                          ? language === "zh" ? "向总控提问" : "Ask controller"
-                          : language === "zh" ? "发送反馈并重跑" : "Send feedback and rerun"}
+                    onClick={running && !composerCanSubmit ? () => void cancelActiveRun() : submitComposer}
+                    title={composerSendTitle}
                   >
-                    {running ? <Square fill="currentColor" size={15} /> : <Send size={17} />}
+                    {running && !composerCanSubmit ? <Square fill="currentColor" size={15} /> : <Send size={17} />}
                   </button>
                 </div>
+                {files.length ? (
+                  <div className="pending-file-list" aria-label={language === "zh" ? "待发送附件" : "Pending attachments"}>
+                    {files.map((file) => (
+                      <span key={`${file.name}:${file.size}:${file.lastModified}`}>
+                        <Paperclip size={13} />
+                        <b title={file.name}>{file.name}</b>
+                        <small>{formatBytes(file.size)}</small>
+                        <button
+                          aria-label={language === "zh" ? `移除 ${file.name}` : `Remove ${file.name}`}
+                          type="button"
+                          onClick={() => removePendingFile(file)}
+                        >
+                          <X size={13} />
+                        </button>
+                      </span>
+                    ))}
+                    <button className="pending-file-clear" type="button" onClick={() => setFiles([])}>
+                      {language === "zh" ? "清空" : "Clear"}
+                    </button>
+                  </div>
+                ) : null}
               </div>
               </section>
             </div>
@@ -2683,7 +3248,10 @@ function App() {
             health={health}
             maxIterations={maxIterations}
             onExport={() => void exportTaskBundle(context.task_id).catch((error) => setRuntimeError(String(error)))}
+            onOpenJson={(title, data) => setJsonOpen({ title, data })}
             onRefresh={() => void refreshRuntimeData()}
+            onRuntimeError={(error) => setRuntimeError(error)}
+            onWorkflowRun={handleExternalWorkflowRun}
             runtimeError={runtimeError}
             stages={stages}
             versions={versions}
@@ -2870,7 +3438,10 @@ function SystemPage({
   language,
   maxIterations,
   onExport,
+  onOpenJson,
   onRefresh,
+  onRuntimeError,
+  onWorkflowRun,
   runtimeError,
   stages,
   versions,
@@ -2884,13 +3455,22 @@ function SystemPage({
   language: Language;
   maxIterations: number;
   onExport: () => void;
+  onOpenJson: (title: string, data: unknown) => void;
   onRefresh: () => void;
+  onRuntimeError: (error: string) => void;
+  onWorkflowRun: (run: WorkflowRun) => void;
   runtimeError: string;
   stages: StageRun[];
   versions: VersionRecord[];
   versionDiff: VersionDiffResult | null;
 }) {
   const zh = language === "zh";
+  const openParsedAttachment = (attachment: RemoteAttachment) => {
+    if (!attachment.parsed_path) return;
+    void fetchArtifactJson(context.task_id, attachment.parsed_path)
+      .then((data) => onOpenJson(`${attachment.name} parsed JSON`, data))
+      .catch((error) => onRuntimeError(error instanceof Error ? error.message : String(error)));
+  };
   return (
     <section className="system-page">
       <header className="system-header">
@@ -2914,6 +3494,10 @@ function SystemPage({
       </header>
 
       {runtimeError ? <p className="runtime-error">{runtimeError}</p> : null}
+
+      <ControllerConsole context={context} language={language} onWorkflowRun={onWorkflowRun} />
+
+      <NodeDebugger context={context} events={events} language={language} onOpenJson={onOpenJson} onWorkflowRun={onWorkflowRun} />
 
       <div className="runtime-metrics">
         <StatusMetric label={zh ? "当前阶段" : "Current stage"} value={context.current_stage} />
@@ -2987,12 +3571,24 @@ function SystemPage({
           <h3>{zh ? "已上传附件" : "Uploaded attachments"}</h3>
           <span>{attachments.length}</span>
         </div>
-        <div className="runtime-table artifact-runtime-table">
+        <div className="runtime-table artifact-runtime-table attachment-runtime-table">
           {attachments.length ? attachments.map((attachment) => (
             <div className="runtime-row" key={attachment.attachment_id}>
               <Paperclip size={15} />
               <code>{attachment.name}</code>
-              <span>{formatBytes(attachment.size)}</span>
+              <span>
+                {attachment.parse_status ?? "completed"} · {attachment.file_type ?? formatBytes(attachment.size)}
+                {attachment.chunk_count ? ` · ${attachment.chunk_count} chunks` : ""}
+              </span>
+              <button
+                className="icon-row-button"
+                disabled={!attachment.parsed_path || attachment.parse_status === "failed"}
+                title={zh ? "查看解析 JSON" : "View parsed JSON"}
+                type="button"
+                onClick={() => openParsedAttachment(attachment)}
+              >
+                <FileJson size={13} />
+              </button>
             </div>
           )) : <p className="runtime-empty">{zh ? "当前任务还没有持久化附件。" : "This task has no persisted attachments."}</p>}
         </div>
@@ -3077,7 +3673,7 @@ function ControllerConsole({
     setBusy(true);
     setError("");
     try {
-      const result = await routeControllerMessage(context.task_id, message.trim());
+      const result = await routeControllerMessage(context.task_id, message.trim(), false);
       setRoute(result.route);
       if (result.run && !["cancelled", "cancelling"].includes(result.run.status)) {
         onWorkflowRun(result.run);
@@ -3119,7 +3715,128 @@ function ControllerConsole({
   );
 }
 
-function NodeDebugger({ context, language, onWorkflowRun }: { context: TaskContext; language: Language; onWorkflowRun: (run: WorkflowRun) => void }) {
+interface AttachmentChunkCitation {
+  attachment_id?: string;
+  chunk_id?: string;
+  citation_id?: string;
+  file_id?: string;
+  file_type?: string;
+  name?: string;
+  page?: number;
+  parsed_path?: string;
+  score?: number;
+  section?: string;
+  source_path?: string;
+  source_type?: string;
+  stage?: string;
+  table_index?: number;
+  text?: string;
+}
+
+function attachmentChunksFromInput(input: Record<string, unknown> | null | undefined): AttachmentChunkCitation[] {
+  const directContext = input?.attachment_context;
+  const directChunks = directContext && typeof directContext === "object"
+    ? (directContext as Record<string, unknown>).chunks
+    : null;
+  const userInput = input?.user_input;
+  const userChunks = userInput && typeof userInput === "object"
+    ? (userInput as Record<string, unknown>).retrieved_attachment_chunks
+    : null;
+  const chunks = Array.isArray(directChunks) ? directChunks : userChunks;
+  if (!Array.isArray(chunks)) return [];
+  return chunks
+    .filter((chunk): chunk is Record<string, unknown> => Boolean(chunk) && typeof chunk === "object")
+    .map((chunk) => ({
+      attachment_id: stringOrUndefined(chunk.attachment_id),
+      chunk_id: stringOrUndefined(chunk.chunk_id),
+      citation_id: stringOrUndefined(chunk.citation_id),
+      file_id: stringOrUndefined(chunk.file_id),
+      file_type: stringOrUndefined(chunk.file_type),
+      name: stringOrUndefined(chunk.name),
+      page: typeof chunk.page === "number" ? chunk.page : undefined,
+      parsed_path: stringOrUndefined(chunk.parsed_path),
+      score: typeof chunk.score === "number" ? chunk.score : undefined,
+      section: stringOrUndefined(chunk.section),
+      source_path: stringOrUndefined(chunk.source_path),
+      source_type: stringOrUndefined(chunk.source_type),
+      stage: stringOrUndefined(chunk.stage),
+      table_index: typeof chunk.table_index === "number" ? chunk.table_index : undefined,
+      text: stringOrUndefined(chunk.text),
+    }));
+}
+
+function stringOrUndefined(value: unknown) {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function AttachmentCitationList({
+  chunks,
+  language,
+  onError,
+  onOpenJson,
+  taskId,
+}: {
+  chunks: AttachmentChunkCitation[];
+  language: Language;
+  onError: (error: string) => void;
+  onOpenJson: (title: string, data: unknown) => void;
+  taskId: string;
+}) {
+  if (!chunks.length) return null;
+  const zh = language === "zh";
+  const openParsedChunk = (chunk: AttachmentChunkCitation, citationId: string) => {
+    if (!chunk.parsed_path) return;
+    void fetchArtifactJson(taskId, chunk.parsed_path)
+      .then((parsed) => onOpenJson(`${citationId} parsed source`, { citation: chunk, parsed }))
+      .catch((error) => onError(error instanceof Error ? error.message : String(error)));
+  };
+  return (
+    <section className="attachment-citation-panel">
+      <div>
+        <strong>{zh ? "附件引用片段" : "Retrieved attachment chunks"}</strong>
+        <span>{chunks.length}</span>
+      </div>
+      {chunks.map((chunk, index) => {
+        const citationId = chunk.citation_id || `${chunk.attachment_id ?? "attachment"}:${chunk.chunk_id ?? index + 1}`;
+        return (
+          <article key={`${citationId}-${index}`}>
+            <header>
+              <code>{citationId}</code>
+              <span>{chunk.name ?? "--"}{chunk.file_type ? ` · ${chunk.file_type}` : ""}</span>
+              {typeof chunk.score === "number" ? <b>{chunk.score.toFixed(3)}</b> : null}
+              {chunk.parsed_path ? (
+                <button type="button" onClick={() => openParsedChunk(chunk, citationId)}>
+                  {zh ? "定位" : "Source"}
+                </button>
+              ) : null}
+              <button type="button" onClick={() => onOpenJson(`${citationId} chunk`, chunk)}>
+                JSON
+              </button>
+            </header>
+            <small>
+              {[chunk.source_type, chunk.source_path, chunk.page ? `p.${chunk.page}` : "", chunk.section, typeof chunk.table_index === "number" ? `table ${chunk.table_index}` : ""].filter(Boolean).join(" · ") || (zh ? "无解析定位" : "No parsed location")}
+            </small>
+            <p>{trimPreview(chunk.text, 260)}</p>
+          </article>
+        );
+      })}
+    </section>
+  );
+}
+
+function NodeDebugger({
+  context,
+  events,
+  language,
+  onOpenJson,
+  onWorkflowRun,
+}: {
+  context: TaskContext;
+  events: EventLog[];
+  language: Language;
+  onOpenJson: (title: string, data: unknown) => void;
+  onWorkflowRun: (run: WorkflowRun) => void;
+}) {
   const zh = language === "zh";
   const [nodeId, setNodeId] = useState<StageId>("question_understanding");
   const [runs, setRuns] = useState<NodeRunSummary[]>([]);
@@ -3212,6 +3929,44 @@ function NodeDebugger({ context, language, onWorkflowRun }: { context: TaskConte
       setLoading(false);
     }
   };
+  const attachmentChunks = attachmentChunksFromInput(detail?.input);
+  const nodeEvents = useMemo(() => {
+    const phaseAliases: Record<StageId, string[]> = {
+      question_understanding: ["question_understanding"],
+      knowledge_integration: [
+        "knowledge_integration",
+        "query_planning",
+        "source_search",
+        "source_verify",
+        "relevance_filter",
+        "literature_extract",
+        "evidence_extract",
+        "gap_synthesis",
+        "quality_review",
+        "literature_search",
+        "evidence_integration",
+        "knowledge_gap_synthesis",
+      ],
+      hypothesis_generation: ["hypothesis_generation"],
+      evidence_mapping: ["evidence_mapping"],
+      research_planning: ["research_planning"],
+      final_review: ["final_review"],
+    };
+    const aliases = new Set(phaseAliases[nodeId]);
+    return events
+      .filter((event) =>
+        event.stage === nodeId
+        || aliases.has(String(event.data?.node_id ?? "").split(":", 1)[0])
+        || aliases.has(String(event.data?.payload?.phase_id ?? "")))
+      .slice(0, 12);
+  }, [events, nodeId]);
+  const diagnosisItems = [
+    ...(detail?.output?.self_review.issues ?? []),
+    ...(detail?.review?.issues ?? []),
+    ...nodeEvents
+      .filter((event) => ["stage_preflight_blocked", "node_failed", "node_revision_required"].includes(event.type))
+      .map((event) => event.message),
+  ].filter(Boolean).slice(0, 8);
 
   return (
     <section className="runtime-section node-debugger">
@@ -3239,6 +3994,30 @@ function NodeDebugger({ context, language, onWorkflowRun }: { context: TaskConte
           <p>{validation.missing_fields.length ? `${zh ? "缺少" : "Missing"}: ${validation.missing_fields.join(", ")}` : (zh ? "所有声明字段均可读取。" : "All declared inputs are readable.")}</p>
           <small>{zh ? "重跑将影响" : "A rerun would affect"}: {validation.would_invalidate.join(", ")}</small>
         </div>
+      ) : null}
+      {diagnosisItems.length || nodeEvents.length ? (
+        <section className="node-insight-panel">
+          {diagnosisItems.length ? (
+            <div>
+              <strong>{zh ? "阻断/风险解释" : "Blockers and risks"}</strong>
+              <ul>
+                {diagnosisItems.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}
+              </ul>
+            </div>
+          ) : null}
+          {nodeEvents.length ? (
+            <div>
+              <strong>{zh ? "相关事件" : "Related events"}</strong>
+              {nodeEvents.map((event) => (
+                <article key={eventKey(event)}>
+                  <code>{event.data?.payload?.phase_id ? String(event.data.payload.phase_id) : event.data?.node_id ?? event.type}</code>
+                  <span>{event.message}</span>
+                  <small>{event.type} · {new Date(event.created_at).toLocaleTimeString()}</small>
+                </article>
+              ))}
+            </div>
+          ) : null}
+        </section>
       ) : null}
       <div className="node-operator-console">
         <div>
@@ -3274,6 +4053,13 @@ function NodeDebugger({ context, language, onWorkflowRun }: { context: TaskConte
           {detail ? (
             <>
               <div><strong>{detail.metadata.status}</strong><span>{detail.metadata.workflow_run_id || "standalone"}</span></div>
+              <AttachmentCitationList
+                chunks={attachmentChunks}
+                language={language}
+                onError={setError}
+                onOpenJson={onOpenJson}
+                taskId={context.task_id}
+              />
               <details open><summary>Input</summary><pre>{JSON.stringify(detail.input, null, 2)}</pre></details>
               <details><summary>Output</summary><pre>{JSON.stringify(detail.output, null, 2)}</pre></details>
               <details><summary>Review</summary><pre>{JSON.stringify(detail.review, null, 2)}</pre></details>
@@ -3284,9 +4070,6 @@ function NodeDebugger({ context, language, onWorkflowRun }: { context: TaskConte
     </section>
   );
 }
-
-void ControllerConsole;
-void NodeDebugger;
 
 function formatBytes(size: number) {
   if (size < 1024) return `${size} B`;
@@ -3789,6 +4572,7 @@ function ThreadMessageCard({
   feedbackValue,
   language,
   message,
+  actionBusy,
   onApprove,
   onFeedbackChange,
   onOpenJson,
@@ -3797,6 +4581,7 @@ function ThreadMessageCard({
   running,
   t,
 }: {
+  actionBusy: boolean;
   feedbackValue: string;
   language: Language;
   message: ThreadMessage;
@@ -3814,10 +4599,37 @@ function ThreadMessageCard({
         <div className="message-avatar">你</div>
         <div className="message-bubble">
           <header>
-            <strong>{message.stage ? t.userRevision : t.userQuestion}</strong>
+            <strong>{message.title ?? (message.stage ? t.userRevision : t.userQuestion)}</strong>
             <time>{formatTime(message.createdAt)}</time>
           </header>
           {message.body ? <RichMessageBody text={message.body} /> : null}
+          {message.attachments?.length ? (
+            <div className="message-attachments" aria-label={language === "zh" ? "消息附件" : "Message attachments"}>
+              {message.attachments.map((attachment) => (
+                <span
+                  className={`message-attachment ${attachment.upload_status ?? "completed"}`}
+                  key={attachment.attachment_id}
+                  title={`${attachment.name} · ${formatBytes(attachment.size)}`}
+                >
+                  <Paperclip size={13} />
+                  <b>{attachment.name}</b>
+                  <small>
+                    {attachment.upload_status === "pending"
+                      ? language === "zh" ? "上传中" : "Uploading"
+                      : attachment.upload_status === "failed"
+                        ? language === "zh" ? "失败" : "Failed"
+                        : attachment.parse_status === "failed"
+                          ? language === "zh" ? "解析失败" : "Parse failed"
+                        : attachment.parse_status === "pending"
+                          ? language === "zh" ? "解析中" : "Parsing"
+                          : attachment.chunk_count
+                            ? `${formatBytes(attachment.size)} · ${attachment.chunk_count}`
+                            : formatBytes(attachment.size)}
+                  </small>
+                </span>
+              ))}
+            </div>
+          ) : null}
         </div>
       </article>
     );
@@ -3902,7 +4714,14 @@ function ThreadMessageCard({
           </button>
         ) : null}
 
-        {stage ? <AgentOutput language={language} response={message.response ?? null} stage={stage} /> : null}
+        {stage ? (
+          <AgentOutput
+            language={language}
+            partialPayload={message.partialPayload}
+            response={message.response ?? null}
+            stage={stage}
+          />
+        ) : null}
 
         {stage && message.response ? (
           <footer className="message-footer">
@@ -3931,19 +4750,19 @@ function ThreadMessageCard({
           <section className="inline-review">
             <p>{t.gateWaiting}</p>
             <div className="review-actions">
-              <button className="main-action" disabled={running} type="button" onClick={onApprove}>
+              <button className="main-action" disabled={running || actionBusy} type="button" onClick={onApprove}>
                 <CheckCircle2 size={16} />
                 {t.approveContinue}
               </button>
             </div>
             <div className="revision-composer">
               <textarea
-                disabled={running}
+                disabled={running || actionBusy}
                 onChange={(event) => onFeedbackChange(event.target.value)}
                 placeholder={t.revisePlaceholder}
                 value={feedbackValue}
               />
-              <button className="ghost-button" disabled={running} type="button" onClick={onRerun}>
+              <button className="ghost-button" disabled={running || actionBusy} type="button" onClick={onRerun}>
                 {t.revise}
               </button>
             </div>
@@ -3966,11 +4785,11 @@ function ThreadMessageCard({
             <div className="system-revision-action">
               <span>{language === "zh" ? "重新执行时，修订意见由总控自动生成，无需填写。" : "For a rerun, the controller generates revision guidance automatically."}</span>
               <div className="quality-choice-buttons">
-                <button className="main-action" disabled={running} type="button" onClick={onApprove}>
+                <button className="main-action" disabled={running || actionBusy} type="button" onClick={onApprove}>
                   <CheckCircle2 size={16} />
                   {language === "zh" ? "继续执行" : "Continue"}
                 </button>
-                <button className="ghost-button" disabled={running} type="button" onClick={onRerun}>
+                <button className="ghost-button" disabled={running || actionBusy} type="button" onClick={onRerun}>
                   <RotateCcw size={15} />
                   {language === "zh" ? "重新执行" : "Rerun"}
                 </button>
@@ -4002,8 +4821,193 @@ function ThreadMessageCard({
   );
 }
 
-function AgentOutput({ language, response, stage }: { language: Language; response: AgentResponse | null; stage: StageId }) {
+function KnowledgeIntegrationOutput({
+  language,
+  partial = false,
+  payload,
+}: {
+  language: Language;
+  partial?: boolean;
+  payload: Record<string, unknown>;
+}) {
+  const literature = arrayValue(payload.literature_cards);
+  const evidence = arrayValue(payload.evidence_cards);
+  const gaps = arrayValue(payload.knowledge_gaps);
+  const retrievedSources = arrayValue(payload.retrieved_sources);
+  const activeNode = stringValue(payload._active_node);
+  const standardPhase = stringValue(payload._active_phase) || stringValue(payload.phase_id);
+  const activePhase = standardPhase === "evidence_integration"
+    ? "evidence"
+    : standardPhase === "knowledge_gap_synthesis"
+      ? "gaps"
+      : activeNode === "evidence_extract"
+        ? "evidence"
+        : activeNode === "gap_synthesis" || activeNode === "quality_review"
+          ? "gaps"
+          : "literature";
+  const literatureProgressCount = literature.length
+    || retrievedSources.length
+    || numberValue(payload.relevant_sources)
+    || numberValue(payload.verified_sources)
+    || numberValue(payload.candidate_sources);
+  const phases = [
+    {
+      id: "literature",
+      icon: FileJson,
+      title: language === "zh" ? "文献检索" : "Literature search",
+      subtitle: language === "zh" ? "形成可追踪的文献卡片" : "Build traceable literature cards",
+      count: literatureProgressCount,
+      ready: literature.length > 0,
+      empty: language === "zh" ? "尚未返回文献卡片。" : "No literature cards returned.",
+    },
+    {
+      id: "evidence",
+      icon: CheckCircle2,
+      title: language === "zh" ? "证据整合" : "Evidence integration",
+      subtitle: language === "zh" ? "抽取可被下游引用的证据结论" : "Extract evidence claims for downstream use",
+      count: evidence.length,
+      ready: evidence.length > 0,
+      empty: language === "zh" ? "尚未返回证据卡片。" : "No evidence cards returned.",
+    },
+    {
+      id: "gaps",
+      icon: HelpCircle,
+      title: language === "zh" ? "知识空白合成" : "Knowledge gap synthesis",
+      subtitle: language === "zh" ? "确定假设生成必须引用的 gap_id" : "Identify gap_id references required by hypotheses",
+      count: gaps.length,
+      ready: gaps.length > 0,
+      empty: language === "zh" ? "尚未返回知识空白，假设生成会被后端门禁拦截。" : "No knowledge gaps returned; hypothesis generation will be blocked.",
+    },
+  ];
+  const visibleSections = partial ? phases.filter((phase) => phase.id !== "gaps") : phases;
+
+  return (
+    <div className={`module-output knowledge-output ${partial ? "partial" : ""}`}>
+      <div className="knowledge-phase-strip">
+        {phases.map((phase, index) => {
+          const Icon = phase.icon;
+          const phaseState = phase.ready
+            ? "ready"
+            : partial
+              ? phase.id === activePhase ? "active" : "pending"
+              : "empty";
+          return (
+            <div className={`knowledge-phase ${phaseState}`} key={phase.id}>
+              <i>{index + 1}</i>
+              <Icon size={15} />
+              <div>
+                <strong>{phase.title}</strong>
+                <span>{phase.subtitle}</span>
+              </div>
+              <b>{phase.count}</b>
+            </div>
+          );
+        })}
+      </div>
+      {partial ? (
+        <p className="knowledge-progress-note">
+          {language === "zh"
+            ? "知识整合正在运行，先展示已完成的检索与证据阶段；知识空白会在最终结果完成后展示。"
+            : "Knowledge integration is running. Search and evidence phases are shown first; gaps appear with the final result."}
+        </p>
+      ) : null}
+
+      {visibleSections.some((phase) => phase.id === "literature") ? (
+      <section className="knowledge-section">
+        <header>
+          <span>{language === "zh" ? "文献卡片" : "Literature cards"}</span>
+          <small>{literature.length}</small>
+        </header>
+        {literature.length ? (
+          <div className="knowledge-card-grid">
+            {literature.map((item, index) => (
+              <article id={`artifact-${objectField(item, "literature_id")}`} key={`${objectField(item, "literature_id")}-${index}`}>
+                <div>
+                  <strong>{objectField(item, "title") || objectField(item, "literature_id")}</strong>
+                  <small>{[objectField(item, "year"), objectField(item, "source")].filter(Boolean).join(" · ") || "--"}</small>
+                </div>
+                <p>{trimPreview(objectField(item, "abstract") || objectField(item, "summary"), 150)}</p>
+                <code>{objectField(item, "doi") || objectField(item, "url") || objectField(item, "literature_id")}</code>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <p className="knowledge-empty">
+            {partial && literatureProgressCount
+              ? language === "zh"
+                ? `已检索到 ${literatureProgressCount} 条候选/相关来源，正在抽取文献卡片。`
+                : `${literatureProgressCount} candidate or relevant sources found; extracting literature cards.`
+              : phases[0].empty}
+          </p>
+        )}
+      </section>
+      ) : null}
+
+      {visibleSections.some((phase) => phase.id === "evidence") ? (
+      <section className="knowledge-section">
+        <header>
+          <span>{language === "zh" ? "证据卡片" : "Evidence cards"}</span>
+          <small>{evidence.length}</small>
+        </header>
+        {evidence.length ? (
+          <div className="knowledge-card-grid">
+            {evidence.map((item, index) => (
+              <article id={`artifact-${objectField(item, "evidence_id")}`} key={`${objectField(item, "evidence_id")}-${index}`}>
+                <div>
+                  <strong>{objectField(item, "evidence_id")}</strong>
+                  <small>{language === "zh" ? "来源" : "Source"}: {objectField(item, "source_literature_id") || "--"}</small>
+                </div>
+                <p>{objectField(item, "claim") || "--"}</p>
+                <code>{objectField(item, "evidence_type") || objectField(item, "strength") || "--"}</code>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <p className="knowledge-empty">{phases[1].empty}</p>
+        )}
+      </section>
+      ) : null}
+
+      {visibleSections.some((phase) => phase.id === "gaps") ? (
+      <section className="knowledge-section">
+        <header>
+          <span>{language === "zh" ? "知识空白" : "Knowledge gaps"}</span>
+          <small>{gaps.length}</small>
+        </header>
+        {gaps.length ? (
+          <div className="knowledge-gap-list">
+            {gaps.map((item, index) => (
+              <article id={`artifact-${objectField(item, "gap_id")}`} key={`${objectField(item, "gap_id")}-${index}`}>
+                <code>{objectField(item, "gap_id") || `gap_${index + 1}`}</code>
+                <p>{objectField(item, "description") || "--"}</p>
+                <small>{objectField(item, "research_opportunity") || objectField(item, "why_it_matters")}</small>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <p className="knowledge-empty warning">{phases[2].empty}</p>
+        )}
+      </section>
+      ) : null}
+    </div>
+  );
+}
+
+function AgentOutput({
+  language,
+  partialPayload,
+  response,
+  stage,
+}: {
+  language: Language;
+  partialPayload?: Record<string, unknown>;
+  response: AgentResponse | null;
+  stage: StageId;
+}) {
   if (!response) {
+    if (stage === "knowledge_integration" && partialPayload) {
+      return <KnowledgeIntegrationOutput language={language} partial payload={partialPayload} />;
+    }
     return (
       <div className="output-skeleton">
         <Loader2 className="spin" size={16} />
@@ -4042,29 +5046,7 @@ function AgentOutput({ language, response, stage }: { language: Language; respon
   }
 
   if (stage === "knowledge_integration") {
-    return (
-      <div className="module-output">
-        <div className="output-section artifact-card-list">
-          <span>{language === "zh" ? "文献卡片" : "Literature cards"}</span>
-          {arrayValue(payload.literature_cards).map((item, index) => (
-            <article id={`artifact-${objectField(item, "literature_id")}`} key={`${objectField(item, "literature_id")}-${index}`}>
-              <strong>{objectField(item, "title")}</strong>
-              <small>{objectField(item, "year")} · {objectField(item, "source")}</small>
-            </article>
-          ))}
-        </div>
-        <div className="output-section artifact-card-list">
-          <span>{language === "zh" ? "证据卡片" : "Evidence cards"}</span>
-          {arrayValue(payload.evidence_cards).map((item, index) => (
-            <article id={`artifact-${objectField(item, "evidence_id")}`} key={`${objectField(item, "evidence_id")}-${index}`}>
-              <strong>{objectField(item, "evidence_id")}</strong>
-              <p>{objectField(item, "claim")}</p>
-            </article>
-          ))}
-        </div>
-        <BulletList label={language === "zh" ? "知识空白" : "Knowledge gaps"} values={arrayValue(payload.knowledge_gaps).map((item) => objectField(item, "description"))} />
-      </div>
-    );
+    return <KnowledgeIntegrationOutput language={language} payload={payload} />;
   }
 
   if (stage === "hypothesis_generation") {
@@ -4123,11 +5105,19 @@ function normalizeResearchPlan(plan: ResearchPlanItem["plan"] | null | undefined
   const mainExperiment = experiments?.main_experiment;
   const results = plan?.results;
   const rationale = plan?.rationale;
+  const technical = plan?.technical_details;
   return {
     ...plan,
     problem_statement: plan?.problem_statement ?? "",
     paper_title: plan?.paper_title ?? "",
     paper_abstract: plan?.paper_abstract ?? "",
+    technical_details: {
+      ...technical,
+      required_methods: technical?.required_methods ?? [],
+      candidate_models_or_algorithms: technical?.candidate_models_or_algorithms ?? [],
+      statistical_tests: technical?.statistical_tests ?? [],
+      software_stack: technical?.software_stack ?? [],
+    },
     methods: {
       ...methods,
       overall_design: methods?.overall_design ?? "",
@@ -4142,6 +5132,10 @@ function normalizeResearchPlan(plan: ResearchPlanItem["plan"] | null | undefined
       source: (datasets?.source ?? []).map((dataset) => ({
         ...dataset,
         required_fields: dataset.required_fields ?? [],
+      })),
+      target: (datasets?.target ?? []).map((dataset) => ({
+        ...dataset,
+        fields: dataset.fields ?? [],
       })),
     },
     experiments: {
@@ -4166,16 +5160,22 @@ function normalizeResearchPlan(plan: ResearchPlanItem["plan"] | null | undefined
     },
     rationale: {
       ...rationale,
+      text: rationale?.text ?? "",
       logic_chain: (rationale?.logic_chain ?? []).map((step) => ({
         ...step,
         evidence_ids: step.evidence_ids ?? [],
+        source_ids: step.source_ids ?? [],
       })),
     },
     references: (plan?.references ?? []).map((reference) => ({
       ...reference,
       authors: reference.authors ?? [],
+      used_for: reference.used_for ?? [],
     })),
-    feedback_tasks: plan?.feedback_tasks ?? [],
+    feedback_tasks: (plan?.feedback_tasks ?? []).map((task) => ({
+      ...task,
+      input_requirements: task.input_requirements ?? [],
+    })),
     limitations: plan?.limitations ?? [],
   } as ResearchPlanItem["plan"];
 }
@@ -4257,6 +5257,7 @@ function ResearchPlanOutput({ language, researchPlan }: { language: Language; re
       <KeyValue label={language === "zh" ? "研究问题" : "Problem"} value={plan.problem_statement} />
       <KeyValue label={language === "zh" ? "论文题目" : "Paper title"} value={plan.paper_title} />
       <KeyValue label={language === "zh" ? "摘要" : "Abstract"} value={plan.paper_abstract} />
+      <KeyValue label={language === "zh" ? "科学依据" : "Rationale"} value={plan.rationale.text} />
 
       <section className="plan-section">
         <h4>{language === "zh" ? "研究设计" : "Research design"}</h4>
@@ -4272,6 +5273,19 @@ function ResearchPlanOutput({ language, researchPlan }: { language: Language; re
       </section>
 
       <section className="plan-section plan-grid">
+        <div>
+          <h4>{language === "zh" ? "技术路线" : "Technical route"}</h4>
+          <BulletList label={language === "zh" ? "方法" : "Methods"} values={plan.technical_details.required_methods} />
+          <BulletList label={language === "zh" ? "模型/算法" : "Models/algorithms"} values={plan.technical_details.candidate_models_or_algorithms} />
+        </div>
+        <div>
+          <h4>{language === "zh" ? "统计与软件" : "Statistics and software"}</h4>
+          <BulletList label={language === "zh" ? "统计检验" : "Statistical tests"} values={plan.technical_details.statistical_tests} />
+          <BulletList label={language === "zh" ? "软件栈" : "Software stack"} values={plan.technical_details.software_stack} />
+        </div>
+      </section>
+
+      <section className="plan-section plan-grid">
         <div><h4>{language === "zh" ? "实验变量" : "Variables"}</h4><PillList label={language === "zh" ? "自变量" : "Independent"} values={plan.experiments.main_experiment.independent_variables} /><PillList label={language === "zh" ? "因变量" : "Dependent"} values={plan.experiments.main_experiment.dependent_variables} /><PillList label={language === "zh" ? "控制变量" : "Controls"} values={plan.experiments.main_experiment.control_variables} /></div>
         <div><h4>{language === "zh" ? "指标与基线" : "Metrics and baselines"}</h4><BulletList label={language === "zh" ? "指标" : "Metrics"} values={plan.experiments.metrics.map((item) => `${item.name}: ${item.description}`)} /><BulletList label={language === "zh" ? "基线" : "Baselines"} values={plan.experiments.baselines.map((item) => `${item.name}: ${item.description}`)} /></div>
       </section>
@@ -4282,6 +5296,18 @@ function ResearchPlanOutput({ language, researchPlan }: { language: Language; re
           {plan.datasets.source.map((dataset, index) => (
             <article key={`${dataset.dataset_id}-${index}`}><strong>{dataset.name}</strong><p>{dataset.usage}</p><small>{dataset.access_status} · {dataset.required_fields.join(", ")}</small></article>
           ))}
+          {plan.datasets.target.map((dataset, index) => (
+            <article key={`${dataset.name}-${index}`}><strong>{dataset.name}</strong><p>{dataset.description}</p><small>{dataset.fields.join(", ")}</small></article>
+          ))}
+        </div>
+      </section>
+
+      <section className="plan-section">
+        <h4>{language === "zh" ? "实验流程" : "Experiment procedure"}</h4>
+        <div className="plan-procedure">
+          {plan.experiments.procedure.length ? plan.experiments.procedure.map((step, index) => (
+            <article key={`${step}-${index}`}><b>{String(index + 1).padStart(2, "0")}</b><p>{step}</p></article>
+          )) : <article><b>--</b><p>--</p></article>}
         </div>
       </section>
 
@@ -4295,17 +5321,44 @@ function ResearchPlanOutput({ language, researchPlan }: { language: Language; re
         <div className="trace-links">
           {plan.rationale.logic_chain.flatMap((step) => step.evidence_ids).filter((id, index, values) => values.indexOf(id) === index).map((id) => <a href={`#artifact-${id}`} key={id}>{id}</a>)}
         </div>
+        <div className="logic-chain-list">
+          {plan.rationale.logic_chain.length ? plan.rationale.logic_chain.map((step, index) => (
+            <article key={`${step.step}-${index}`}>
+              <b>{step.step ?? index + 1}</b>
+              <div>
+                <strong>{step.claim}</strong>
+                <small>{[...step.evidence_ids, ...step.source_ids].join(" · ") || "--"}</small>
+              </div>
+            </article>
+          )) : null}
+        </div>
         <div className="reference-list">
           {plan.references.map((reference, index) => (
-            <article key={`${reference.source_id}-${index}`}><strong>{reference.title}</strong><p>{reference.authors.join(", ")} · {reference.year}</p><a href={reference.url || (reference.doi ? `https://doi.org/${reference.doi}` : undefined)} target="_blank" rel="noreferrer">{reference.doi || reference.source_id}</a></article>
+            <article key={`${reference.source_id}-${index}`}><strong>{reference.title}</strong><p>{reference.authors.join(", ")} · {reference.year}</p><small>{reference.used_for.join(", ")}</small><a href={reference.url || (reference.doi ? `https://doi.org/${reference.doi}` : undefined)} target="_blank" rel="noreferrer">{reference.doi || reference.source_id}</a></article>
           ))}
         </div>
       </section>
 
       <section className="plan-section plan-grid">
         <BulletList label={language === "zh" ? "限制" : "Limitations"} values={plan.limitations} />
-        <BulletList label={language === "zh" ? "反馈任务" : "Feedback tasks"} values={plan.feedback_tasks.map((item) => `[${item.priority}] ${item.objective}`)} />
+        <div>
+          <h4>{language === "zh" ? "反馈任务" : "Feedback tasks"}</h4>
+          <div className="feedback-task-list">
+            {plan.feedback_tasks.length ? plan.feedback_tasks.map((item, index) => (
+              <article key={`${item.task_id}-${index}`}>
+                <strong>{item.task_id || item.task_type}</strong>
+                <p>[{item.priority}] {item.objective}</p>
+                <small>{item.input_requirements.join(", ") || "--"} → {item.expected_output || "--"}</small>
+              </article>
+            )) : <article><strong>--</strong><p>--</p></article>}
+          </div>
+        </div>
       </section>
+
+      <details className="json-fallback-panel">
+        <summary>{language === "zh" ? "完整 JSON 兜底" : "Complete JSON fallback"}</summary>
+        <JsonTree data={selected.plan ?? selected} rootLabel={language === "zh" ? "研究计划" : "research_plan"} />
+      </details>
     </div>
   );
 }
@@ -4337,6 +5390,50 @@ function BulletList({ label, values }: { label: string; values: unknown[] }) {
       <ul>
         {values.length ? values.map((value, index) => <li key={`${String(value)}-${index}`}>{String(value)}</li>) : <li>--</li>}
       </ul>
+    </div>
+  );
+}
+
+function JsonTree({
+  data,
+  depth = 0,
+  rootLabel = "root",
+}: {
+  data: unknown;
+  depth?: number;
+  rootLabel?: string;
+}) {
+  if (Array.isArray(data)) {
+    return (
+      <details className="json-tree-node" open={depth < 2}>
+        <summary><code>{rootLabel}</code><span>Array[{data.length}]</span></summary>
+        <div className="json-tree-children">
+          {data.length ? data.map((item, index) => (
+            <JsonTree data={item} depth={depth + 1} key={`${rootLabel}-${index}`} rootLabel={String(index)} />
+          )) : <span className="json-tree-empty">[]</span>}
+        </div>
+      </details>
+    );
+  }
+
+  if (data && typeof data === "object") {
+    const entries = Object.entries(data as Record<string, unknown>);
+    return (
+      <details className="json-tree-node" open={depth < 2}>
+        <summary><code>{rootLabel}</code><span>Object{`{${entries.length}}`}</span></summary>
+        <div className="json-tree-children">
+          {entries.length ? entries.map(([key, value]) => (
+            <JsonTree data={value} depth={depth + 1} key={key} rootLabel={key} />
+          )) : <span className="json-tree-empty">{`{}`}</span>}
+        </div>
+      </details>
+    );
+  }
+
+  return (
+    <div className="json-tree-leaf">
+      <code>{rootLabel}</code>
+      <span>{data === null ? "null" : JSON.stringify(data) ?? String(data)}</span>
     </div>
   );
 }
@@ -4854,9 +5951,15 @@ function JsonModal({ data, onClose, title }: { data: unknown; onClose: () => voi
             <X size={18} />
           </button>
         </div>
-        <pre className="json-block">
-          <code>{JSON.stringify(data, null, 2)}</code>
-        </pre>
+        <div className="json-tree-panel">
+          <JsonTree data={data} rootLabel="payload" />
+        </div>
+        <details className="raw-json-panel">
+          <summary>Raw JSON</summary>
+          <pre className="json-block">
+            <code>{JSON.stringify(data, null, 2)}</code>
+          </pre>
+        </details>
       </section>
     </div>
   );

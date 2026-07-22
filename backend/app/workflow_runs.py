@@ -15,6 +15,21 @@ from .orchestrator import Orchestrator
 ACTIVE_RUN_STATUSES = {"queued", "running", "pausing", "paused", "cancelling"}
 RESUMABLE_RUN_STATUSES = {"paused", "human_review", "retry", "interrupted", "cancelled"}
 FINAL_RUN_STATUSES = {"completed", "cancelled", "failed"}
+KNOWLEDGE_PHASES_BY_NODE = {
+    "query_planning": ("literature_search", 1),
+    "source_search": ("literature_search", 1),
+    "source_verify": ("literature_search", 1),
+    "relevance_filter": ("literature_search", 1),
+    "literature_extract": ("literature_search", 1),
+    "evidence_extract": ("evidence_integration", 2),
+    "gap_synthesis": ("knowledge_gap_synthesis", 3),
+    "quality_review": ("knowledge_gap_synthesis", 3),
+}
+KNOWLEDGE_PHASE_LABELS = {
+    "literature_search": "Literature search",
+    "evidence_integration": "Evidence integration",
+    "knowledge_gap_synthesis": "Knowledge gap synthesis",
+}
 
 
 class WorkflowRunError(RuntimeError):
@@ -424,6 +439,17 @@ class WorkflowRunManager:
         self, run_id: str, stage: str, update: dict[str, Any]
     ) -> None:
         node_id = str(update.get("node_id") or stage)
+        payload = update.get("payload") if isinstance(update.get("payload"), dict) else {}
+        payload = dict(payload)
+        phase_id = None
+        if stage == "knowledge_integration":
+            phase_id, phase_index = KNOWLEDGE_PHASES_BY_NODE.get(
+                node_id.split(":", 1)[0],
+                ("literature_search", 1),
+            )
+            payload.setdefault("phase_id", phase_id)
+            payload.setdefault("phase_index", phase_index)
+            payload.setdefault("phase_label", KNOWLEDGE_PHASE_LABELS[phase_id])
         self._cooperate(run_id, stage, node_id)
         with self._lock:
             record = self._require_record(run_id)
@@ -431,9 +457,8 @@ class WorkflowRunManager:
                 checkpoint = {
                     "node_id": node_id,
                     "stage": stage,
-                    "payload": update.get("payload")
-                    if isinstance(update.get("payload"), dict)
-                    else {},
+                    "phase_id": phase_id,
+                    "payload": payload,
                     "created_at": utc_now(),
                 }
                 record["checkpoints"] = [
@@ -441,6 +466,19 @@ class WorkflowRunManager:
                     for item in list(record.get("checkpoints") or [])
                     if item.get("node_id") != node_id
                 ] + [checkpoint]
+                if phase_id:
+                    phase_checkpoint = {
+                        "node_id": phase_id,
+                        "stage": stage,
+                        "phase_id": phase_id,
+                        "payload": payload,
+                        "created_at": utc_now(),
+                    }
+                    record["checkpoints"] = [
+                        item
+                        for item in list(record.get("checkpoints") or [])
+                        if item.get("node_id") != phase_id
+                    ] + [phase_checkpoint]
                 self._persist(record)
             self._emit(
                 record,
@@ -449,9 +487,7 @@ class WorkflowRunManager:
                 stage,
                 node_id=node_id,
                 progress=update.get("progress"),
-                payload=update.get("payload")
-                if isinstance(update.get("payload"), dict)
-                else {},
+                payload=payload,
                 operation=str(update.get("operation") or "append"),
             )
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+import zipfile
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -38,6 +40,21 @@ class PersistenceTests(unittest.TestCase):
             )
         )
 
+    @staticmethod
+    def minimal_docx(text: str) -> bytes:
+        buffer = BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr(
+                "word/document.xml",
+                (
+                    '<?xml version="1.0" encoding="UTF-8"?>'
+                    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                    f"<w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body>"
+                    "</w:document>"
+                ),
+            )
+        return buffer.getvalue()
+
     def test_archived_tasks_are_hidden_by_default_and_can_be_restored(self) -> None:
         self.create("task_active")
         self.create("task_archived")
@@ -65,20 +82,35 @@ class PersistenceTests(unittest.TestCase):
             "# Background\nA longitudinal cohort is required.".encode("utf-8"),
             "text/markdown",
             context_char_limit=10_000,
+            message_id="msg_user_001",
         )
 
         self.assertEqual(item["name"], "background.md")
+        self.assertEqual(item["message_id"], "msg_user_001")
+        self.assertEqual(item["upload_status"], "completed")
+        self.assertEqual(item["parse_status"], "completed")
         self.assertTrue((self.artifacts.task_root("task_attachment") / item["path"]).is_file())
-        self.assertEqual(len(self.artifacts.list_attachments("task_attachment")), 1)
+        persisted_attachments = self.artifacts.list_attachments("task_attachment")
+        self.assertEqual(len(persisted_attachments), 1)
+        self.assertEqual(persisted_attachments[0]["message_id"], "msg_user_001")
         self.assertIn("longitudinal cohort", context["user_input"]["question_description"])
         self.assertEqual(context["user_input"]["attachments"][0]["name"], "background.md")
+        self.assertEqual(
+            context["user_input"]["attachments"][0]["message_id"],
+            "msg_user_001",
+        )
+        self.assertNotIn("text_excerpt", context["user_input"]["attachments"][0])
+        self.assertEqual(
+            context["extensions"]["message_attachments"]["msg_user_001"][0]["attachment_id"],
+            item["attachment_id"],
+        )
 
         with self.assertRaises(ArtifactError):
             self.artifacts.add_attachment(
                 "task_attachment",
-                "unsafe.pdf",
-                b"pdf",
-                "application/pdf",
+                "unsafe.exe",
+                b"exe",
+                "application/octet-stream",
                 context_char_limit=10_000,
             )
         with self.assertRaises(ArtifactError):
@@ -89,6 +121,60 @@ class PersistenceTests(unittest.TestCase):
                 "text/plain",
                 context_char_limit=10_000,
             )
+
+    def test_docx_attachment_is_parsed_and_contextualized(self) -> None:
+        self.create("task_docx")
+        item, context = self.artifacts.add_attachment(
+            "task_docx",
+            "protocol.docx",
+            self.minimal_docx("Measure cytokines before tau PET follow-up."),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            context_char_limit=10_000,
+            message_id="msg_docx",
+        )
+
+        self.assertEqual(item["file_type"], "docx")
+        self.assertEqual(item["parse_status"], "completed")
+        self.assertEqual(len(item["hash"]), 64)
+        self.assertGreater(item["chunk_count"], 0)
+        parsed = self.artifacts.read_json("task_docx", item["parsed_path"])
+        self.assertEqual(parsed["metadata"]["file_type"], "docx")
+        self.assertIn("cytokines", parsed["sections"][0]["text"])
+        self.assertIn("cytokines", context["user_input"]["question_description"])
+        self.assertEqual(
+            context["user_input"]["attachments"][0]["parsed_path"],
+            item["parsed_path"],
+        )
+
+    def test_attachment_chunks_are_searchable_with_citations(self) -> None:
+        self.create("task_chunk_search")
+        item, _context = self.artifacts.add_attachment(
+            "task_chunk_search",
+            "background.md",
+            (
+                "# Background\n"
+                "Cytokine trajectories should be aligned before tau PET follow-up.\n"
+                "Unrelated notes discuss telescope calibration."
+            ).encode("utf-8"),
+            "text/markdown",
+            context_char_limit=10_000,
+            message_id="msg_chunks",
+        )
+
+        chunks = self.artifacts.search_attachment_chunks(
+            "task_chunk_search",
+            "cytokine tau follow-up",
+            stage="hypothesis_generation",
+            limit=3,
+        )
+
+        self.assertGreaterEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["attachment_id"], item["attachment_id"])
+        self.assertEqual(chunks[0]["stage"], "hypothesis_generation")
+        self.assertIn("citation_id", chunks[0])
+        self.assertIn("source_type", chunks[0])
+        self.assertIn("source_path", chunks[0])
+        self.assertIn("Cytokine", chunks[0]["text"])
 
     def test_feedback_updates_runtime_controls_without_creating_a_new_task(self) -> None:
         context = self.create("task_controls")

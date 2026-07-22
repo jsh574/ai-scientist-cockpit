@@ -7,7 +7,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from .adapters import REAL_AGENT_STAGES, AgentRegistry, ProjectLLMClient
 from .controller_assistant import ControllerAssistant
 from .agent_protocol import AGENT_SPECS, STAGE_ORDER, slice_context
-from .artifact_service import ArtifactError, ArtifactService
+from .artifact_service import ArtifactError, ArtifactService, allowed_attachment_extensions
 from .contracts import (
     FeedbackRequest,
     ControllerRouteRequest,
@@ -121,7 +121,7 @@ def health() -> dict[str, Any]:
         },
         "attachments": {
             "max_bytes": settings.attachment_max_bytes,
-            "allowed_extensions": [".txt", ".md", ".csv", ".json"],
+            "allowed_extensions": allowed_attachment_extensions(),
         },
         "llm": {
             "timeout_seconds": float(os.getenv("LLM_TIMEOUT_SECONDS", "120")),
@@ -208,6 +208,7 @@ def list_task_attachments(task_id: str) -> dict[str, Any]:
 async def upload_task_attachments(
     task_id: str,
     files: list[UploadFile] = File(...),
+    message_id: str | None = Form(default=None),
 ) -> dict[str, Any]:
     try:
         if not artifacts.task_exists(task_id):
@@ -227,6 +228,7 @@ async def upload_task_attachments(
                 content,
                 upload.content_type,
                 context_char_limit=settings.attachment_context_chars,
+                message_id=message_id,
             )
             uploaded.append(item)
         return {"task_id": task_id, "attachments": uploaded, "task_context": context}

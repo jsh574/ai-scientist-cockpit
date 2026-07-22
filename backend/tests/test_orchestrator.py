@@ -117,6 +117,21 @@ class BorderlineHypothesisRegistry(FakeRegistry):
         return response
 
 
+class FailingHypothesisRegistry(FakeRegistry):
+    def run(self, stage: str, context: dict, feedback: str | None = None) -> dict:
+        if stage == "hypothesis_generation":
+            raise AssertionError("Hypothesis generation should be blocked before agent execution")
+        return super().run(stage, context, feedback)
+
+
+class UnknownGapHypothesisRegistry(FakeRegistry):
+    def run(self, stage: str, context: dict, feedback: str | None = None) -> dict:
+        response = super().run(stage, context, feedback)
+        if stage == "hypothesis_generation":
+            response["payload"]["hypothesis_cards"][0]["related_gap_ids"] = ["gap_missing"]
+        return response
+
+
 class OrchestratorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -170,6 +185,42 @@ class OrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(accepted["status"], "passed")
         self.assertIsNotNone(accepted["task_context"]["question_card"])
+
+    def test_duplicate_human_review_approval_is_idempotent(self) -> None:
+        context = self.create("manual")
+        first = self.orchestrator.run_from(context["task_id"])
+        self.assertEqual(first["status"], "human_review")
+        request = HumanReviewRequest(
+            stage="question_understanding",
+            decision="accept",
+            comment="Looks testable.",
+            approval_id="approval_question_understanding_msg_001_accept",
+        )
+
+        accepted = self.orchestrator.submit_review(context["task_id"], request)
+        after_first = self.artifacts.load_context(context["task_id"])
+        review_count = len(after_first["reviews"])
+        version_count = len(after_first["versions"])
+        event_count = len(self.artifacts.read_events(context["task_id"]))
+
+        duplicate = self.orchestrator.submit_review(context["task_id"], request)
+        after_second = self.artifacts.load_context(context["task_id"])
+
+        self.assertEqual(accepted["status"], "passed")
+        self.assertEqual(duplicate["status"], "passed")
+        self.assertTrue(duplicate["idempotent"])
+        self.assertEqual(
+            duplicate["approval_id"], "approval_question_understanding_msg_001_accept"
+        )
+        self.assertEqual(len(after_second["reviews"]), review_count)
+        self.assertEqual(len(after_second["versions"]), version_count)
+        self.assertEqual(len(self.artifacts.read_events(context["task_id"])), event_count)
+        self.assertEqual(
+            after_second["extensions"]["processed_approvals"][
+                "approval_question_understanding_msg_001_accept"
+            ]["status"],
+            "passed",
+        )
 
     def test_final_review_is_persisted_before_human_review(self) -> None:
         context = self.create()
@@ -253,6 +304,48 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(accepted["task_context"]["hypothesis_cards"])
         self.assertEqual(accepted["review"]["operator"], "human")
         self.assertAlmostEqual(accepted["review"]["overall_score"], 0.9731)
+
+    def test_hypothesis_generation_is_blocked_without_knowledge_gaps(self) -> None:
+        self.orchestrator.registry = FailingHypothesisRegistry()
+        context = self.create()
+        context.update(
+            {
+                "question_card": {"question_id": "q_001", "core_question": "test"},
+                "evidence_cards": [{"evidence_id": "ev_001"}],
+                "knowledge_gaps": [],
+                "current_stage": "hypothesis_generation",
+            }
+        )
+        self.artifacts.save_context(context["task_id"], context)
+
+        result = self.orchestrator.run_stage(context["task_id"], "hypothesis_generation")
+
+        self.assertEqual(result["status"], "retry")
+        self.assertEqual(result["response"]["payload"]["hypothesis_cards"], [])
+        self.assertIn("knowledge_gaps is empty", " ".join(result["review"]["issues"]))
+        events = self.artifacts.read_events(context["task_id"])
+        self.assertIn("stage_preflight_blocked", {event["type"] for event in events})
+
+    def test_hypothesis_review_requires_known_gap_references(self) -> None:
+        self.orchestrator.registry = UnknownGapHypothesisRegistry()
+        context = self.create()
+        self.assertEqual(
+            self.orchestrator.run_stage(context["task_id"], "question_understanding")[
+                "status"
+            ],
+            "passed",
+        )
+        self.assertEqual(
+            self.orchestrator.run_stage(context["task_id"], "knowledge_integration")[
+                "status"
+            ],
+            "passed",
+        )
+
+        result = self.orchestrator.run_stage(context["task_id"], "hypothesis_generation")
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("Unknown knowledge gap IDs", " ".join(result["review"]["issues"]))
 
     def test_artifact_path_traversal_is_rejected(self) -> None:
         context = self.create()
@@ -351,6 +444,40 @@ class OrchestratorTests(unittest.TestCase):
             if artifact["path"].startswith("operator_overrides/")
         ]
         self.assertEqual(len(overrides), 1)
+
+    def test_stage_input_receives_retrieved_attachment_chunks(self) -> None:
+        context = self.create()
+        self.artifacts.add_attachment(
+            context["task_id"],
+            "background.md",
+            (
+                "Inflammation markers and cytokines should be measured before tau PET follow-up. "
+                "This protocol note is relevant to the question."
+            ).encode("utf-8"),
+            "text/markdown",
+            context_char_limit=10_000,
+            message_id="msg_background",
+        )
+
+        result = self.orchestrator.run_stage(context["task_id"], "question_understanding")
+        detail = self.artifacts.get_node_run(
+            context["task_id"],
+            "question_understanding",
+            result["node_run_id"],
+        )
+        attachment_context = detail["input"]["attachment_context"]
+
+        self.assertEqual(
+            attachment_context["schema_version"],
+            "attachment_retrieval_v1",
+        )
+        self.assertEqual(attachment_context["retrieval_mode"], "stage_scoped_chunks")
+        self.assertGreaterEqual(len(attachment_context["chunks"]), 1)
+        self.assertIn("citation_id", attachment_context["chunks"][0])
+        self.assertIn(
+            "cytokines",
+            detail["input"]["user_input"]["retrieved_attachment_chunks"][0]["text"],
+        )
 
     def test_node_run_diff_compares_persisted_outputs(self) -> None:
         context = self.create()
