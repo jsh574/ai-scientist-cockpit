@@ -26,6 +26,7 @@ agents/**/.git/
 agents/**/.env
 agents/**/.tmp/
 agents/**/test-artifacts/
+agents/knowledge_integration/tests/output*.json
 samples/test-artifacts/
 artifacts/tasks/*
 !artifacts/tasks/.gitkeep
