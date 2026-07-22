@@ -81,6 +81,9 @@ export interface RemoteAttachment {
   media_type: string;
   size: number;
   created_at: string;
+  message_id?: string | null;
+  upload_status?: "pending" | "completed" | "failed";
+  parse_status?: "pending" | "completed" | "failed";
 }
 
 export type WorkflowRunStatus =
@@ -451,9 +454,11 @@ export async function fetchTaskAttachments(taskId: string): Promise<RemoteAttach
 export async function uploadTaskAttachments(
   taskId: string,
   files: File[],
+  messageId?: string,
 ): Promise<{ attachments: RemoteAttachment[]; task_context: TaskContext }> {
   const form = new FormData();
   files.forEach((file) => form.append("files", file));
+  if (messageId) form.append("message_id", messageId);
   return requestJson(`/api/tasks/${encodeURIComponent(taskId)}/attachments`, {
     method: "POST",
     body: form,
@@ -500,12 +505,13 @@ export async function submitHumanReview(
   stage: StageId,
   decision: "accept" | "retry" | "rollback",
   comment: string,
+  approvalId?: string,
 ): Promise<{ status: string; review?: ReviewRecord; task_context?: TaskContext }> {
   if (!usesRealAgents) return { status: decision === "accept" ? "passed" : decision };
   return requestJson(`/api/tasks/${encodeURIComponent(taskId)}/reviews`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ stage, decision, comment }),
+    body: JSON.stringify({ stage, decision, comment, approval_id: approvalId }),
   });
 }
 

@@ -165,6 +165,7 @@ interface ThreadMessage {
   kind: MessageKind;
   stage?: StageId;
   body?: string;
+  attachments?: RemoteAttachment[];
   activity?: string;
   activityNode?: string;
   activityProgress?: number;
@@ -178,6 +179,21 @@ interface ThreadMessage {
   revisionNote?: string;
   durationMs?: number;
   createdAt: string;
+}
+
+function pendingFileAttachments(files: File[], messageId: string): RemoteAttachment[] {
+  const now = new Date().toISOString();
+  return files.map((file, index) => ({
+    attachment_id: `pending_${messageId}_${index}`,
+    name: file.name,
+    path: "",
+    media_type: file.type || "application/octet-stream",
+    size: file.size,
+    created_at: now,
+    message_id: messageId,
+    upload_status: "pending",
+    parse_status: "pending",
+  }));
 }
 
 interface MessageIndexPreview {
@@ -1073,11 +1089,13 @@ function App() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [activeRun, setActiveRun] = useState<WorkflowRun | null>(null);
   const [runsByTask, setRunsByTask] = useState<Record<string, WorkflowRun | null>>({});
+  const [pendingActionIds, setPendingActionIds] = useState<Set<string>>(() => new Set());
   const [streamConnected, setStreamConnected] = useState(false);
   const threadEndRef = useRef<HTMLDivElement | null>(null);
   const taskIdRef = useRef(context.task_id);
   const activeProjectIdRef = useRef(activeProjectId);
   const runsByTaskRef = useRef<Record<string, WorkflowRun | null>>({});
+  const pendingActionIdsRef = useRef<Set<string>>(new Set());
   const streamConnectedByTaskRef = useRef<Record<string, boolean>>({});
   const restoredLanguageRef = useRef<Language | null>(null);
   const restoredTaskIdsRef = useRef<Set<string>>(new Set());
@@ -1368,14 +1386,31 @@ function App() {
     [language],
   );
 
-  const pushMessage = useCallback((message: Omit<ThreadMessage, "id" | "createdAt">) => {
-    const id = makeMessageId(message.kind);
+  const pushMessage = useCallback((message: Omit<ThreadMessage, "id" | "createdAt"> & { id?: string }) => {
+    const id = message.id ?? makeMessageId(message.kind);
     setMessages((current) => [...current, { ...message, id, createdAt: new Date().toISOString() }]);
     return id;
   }, []);
 
   const patchMessage = useCallback((id: string, patch: Partial<ThreadMessage>) => {
     setMessages((current) => current.map((message) => (message.id === id ? { ...message, ...patch } : message)));
+  }, []);
+
+  const beginMessageAction = useCallback((id: string) => {
+    if (pendingActionIdsRef.current.has(id)) return false;
+    const next = new Set(pendingActionIdsRef.current);
+    next.add(id);
+    pendingActionIdsRef.current = next;
+    setPendingActionIds(next);
+    return true;
+  }, []);
+
+  const finishMessageAction = useCallback((id: string) => {
+    if (!pendingActionIdsRef.current.has(id)) return;
+    const next = new Set(pendingActionIdsRef.current);
+    next.delete(id);
+    pendingActionIdsRef.current = next;
+    setPendingActionIds(next);
   }, []);
 
   const updateStage = useCallback((stageId: StageId, patch: Partial<StageRun>) => {
@@ -1825,6 +1860,8 @@ function App() {
     const question = questionDraft.trim();
     if (running || !question) return;
 
+    const selectedFiles = [...files];
+    const userMessageId = makeMessageId("user");
     const localTask = buildFreshTask(question);
     setRunning(true);
     let fresh: TaskContext;
@@ -1860,19 +1897,32 @@ function App() {
     setHasSubmittedQuestion(true);
     setQuestionDraft("");
 
-    pushMessage({ kind: "user", body: question });
+    pushMessage({
+      id: userMessageId,
+      kind: "user",
+      body: question,
+      attachments: pendingFileAttachments(selectedFiles, userMessageId),
+    });
     pushMessage({ kind: "controller", body: t.controllerStarted, status: "passed" });
 
-    if (files.length) {
+    if (selectedFiles.length) {
       try {
-        const uploaded = await uploadTaskAttachments(fresh.task_id, files);
+        const uploaded = await uploadTaskAttachments(fresh.task_id, selectedFiles, userMessageId);
         fresh = uploaded.task_context;
         setContext(fresh);
         setAttachments((current) => [...current, ...uploaded.attachments]);
+        patchMessage(userMessageId, { attachments: uploaded.attachments });
         setFiles([]);
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         setRuntimeError(detail);
+        patchMessage(userMessageId, {
+          attachments: pendingFileAttachments(selectedFiles, userMessageId).map((attachment) => ({
+            ...attachment,
+            upload_status: "failed",
+            parse_status: "failed",
+          })),
+        });
         pushMessage({
           kind: "controller",
           body: language === "zh"
@@ -1904,15 +1954,23 @@ function App() {
         status: "failed",
       });
     }
-  }, [appendEvent, approval, buildFreshTask, continueFrom, files, language, memory, monitorWorkflowRun, pushMessage, questionDraft, reasoning, running, t.controllerStarted]);
+  }, [appendEvent, approval, buildFreshTask, continueFrom, files, language, memory, monitorWorkflowRun, patchMessage, pushMessage, questionDraft, reasoning, running, t.controllerStarted]);
 
-  const approveReview = useCallback(async (stageOverride?: StageId) => {
+  const approveReview = useCallback(async (stageOverride?: StageId, sourceMessageId?: string) => {
     const stage = stageOverride ?? reviewStage;
     if (!stage || running) return;
+    const approvalId = sourceMessageId ? `${context.task_id}:${stage}:${sourceMessageId}:approve` : undefined;
+    if (sourceMessageId && !beginMessageAction(sourceMessageId)) return;
     const resumeIndex = pendingIndex ?? stageOrder.indexOf(stage);
-    if (resumeIndex < 0) return;
+    if (resumeIndex < 0) {
+      if (sourceMessageId) finishMessageAction(sourceMessageId);
+      return;
+    }
     const stageRun = stages.find((item) => item.id === stage);
-    if (!stageRun?.output) return;
+    if (!stageRun?.output) {
+      if (sourceMessageId) finishMessageAction(sourceMessageId);
+      return;
+    }
 
     const qualityOverride = stageRun.status === "revision_required";
     const comment = qualityOverride
@@ -1924,10 +1982,11 @@ function App() {
         : "Human approval granted. Continue.";
     let remoteResult: Awaited<ReturnType<typeof submitHumanReview>>;
     try {
-      remoteResult = await submitHumanReview(context.task_id, stage, "accept", comment);
+      remoteResult = await submitHumanReview(context.task_id, stage, "accept", comment, approvalId);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       appendEvent("human_review_failed", `审批提交失败：${detail}`, `Review submission failed: ${detail}`, stage);
+      if (sourceMessageId) finishMessageAction(sourceMessageId);
       return;
     }
     const approvedReview: ReviewRecord = remoteResult.review ?? {
@@ -1987,8 +2046,10 @@ function App() {
     } catch (error) {
       setRunning(false);
       setRuntimeError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (sourceMessageId) finishMessageAction(sourceMessageId);
     }
-  }, [activeRun, appendEvent, context, continueFrom, language, monitorWorkflowRun, pendingIndex, reviewStage, running, stages, updateStage, versions]);
+  }, [activeRun, appendEvent, beginMessageAction, context, continueFrom, finishMessageAction, language, monitorWorkflowRun, pendingIndex, reviewStage, running, stages, updateStage, versions]);
 
   const rerunStageWithFeedback = useCallback(
     async (
@@ -1999,8 +2060,12 @@ function App() {
       review: ReviewRecord | null = null,
     ) => {
       if (running) return;
+      if (!beginMessageAction(sourceMessageId)) return;
       const index = stageOrder.indexOf(stage);
-      if (index < 0) return;
+      if (index < 0) {
+        finishMessageAction(sourceMessageId);
+        return;
+      }
       const note = systemGenerated && response
         ? buildSystemRevisionNote(response, review, language)
         : feedbackDrafts[sourceMessageId]?.trim() || (language === "zh" ? "请重新检查并改进这一阶段输出。" : "Please re-check and improve this stage output.");
@@ -2021,6 +2086,7 @@ function App() {
         const detail = error instanceof Error ? error.message : String(error);
         appendEvent("feedback_record_failed", `反馈保存失败：${detail}`, `Feedback persistence failed: ${detail}`, stage);
         setRuntimeError(detail);
+        finishMessageAction(sourceMessageId);
         return;
       }
 
@@ -2064,12 +2130,16 @@ function App() {
       } catch (error) {
         setRunning(false);
         setRuntimeError(error instanceof Error ? error.message : String(error));
+      } finally {
+        finishMessageAction(sourceMessageId);
       }
     },
     [
       appendEvent,
+      beginMessageAction,
       context,
       feedbackDrafts,
+      finishMessageAction,
       language,
       memory,
       monitorWorkflowRun,
@@ -2087,18 +2157,28 @@ function App() {
     const targetIndex = stageOrder.indexOf(targetStage);
     if (targetIndex < 0) return;
 
+    const selectedFiles = [...files];
+    const userMessageId = makeMessageId("user");
+    const note = typedNote || (language === "zh"
+      ? "请结合本次新增附件重新检查并改进该模块输出。"
+      : "Re-check and improve this module using the newly attached files.");
     setRuntimeError("");
+    pushMessage({
+      id: userMessageId,
+      kind: "user",
+      body: note,
+      stage: targetStage,
+      attachments: pendingFileAttachments(selectedFiles, userMessageId),
+    });
     let rerunContext = context;
     try {
-      if (files.length) {
-        const uploaded = await uploadTaskAttachments(context.task_id, files);
+      if (selectedFiles.length) {
+        const uploaded = await uploadTaskAttachments(context.task_id, selectedFiles, userMessageId);
         rerunContext = uploaded.task_context;
         setAttachments((current) => [...current, ...uploaded.attachments]);
+        patchMessage(userMessageId, { attachments: uploaded.attachments });
         setFiles([]);
       }
-      const note = typedNote || (language === "zh"
-        ? "请结合本次新增附件重新检查并改进该模块输出。"
-        : "Re-check and improve this module using the newly attached files.");
       rerunContext = (await recordFeedback(context.task_id, targetStage, note, {
         mode: runMode,
         reasoningLevel: reasoning,
@@ -2107,6 +2187,15 @@ function App() {
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       setRuntimeError(detail);
+      if (selectedFiles.length) {
+        patchMessage(userMessageId, {
+          attachments: pendingFileAttachments(selectedFiles, userMessageId).map((attachment) => ({
+            ...attachment,
+            upload_status: "failed",
+            parse_status: "failed",
+          })),
+        });
+      }
       pushMessage({
         kind: "controller",
         body: language === "zh" ? `反馈保存失败：${detail}` : `Feedback failed: ${detail}`,
@@ -2115,10 +2204,6 @@ function App() {
       return;
     }
 
-    const note = typedNote || (language === "zh"
-      ? "请结合本次新增附件重新检查并改进该模块输出。"
-      : "Re-check and improve this module using the newly attached files.");
-    pushMessage({ kind: "user", body: note, stage: targetStage });
     setQuestionDraft("");
     setContext(rerunContext);
     setVersions(rerunContext.versions);
@@ -2149,6 +2234,7 @@ function App() {
     language,
     memory,
     monitorWorkflowRun,
+    patchMessage,
     pushMessage,
     questionDraft,
     reasoning,
@@ -2508,7 +2594,8 @@ function App() {
                     key={message.id}
                     language={language}
                     message={message}
-                    onApprove={() => message.stage && void approveReview(message.stage)}
+                    actionBusy={pendingActionIds.has(message.id)}
+                    onApprove={() => message.stage && void approveReview(message.stage, message.id)}
                     onFeedbackChange={(value) => setFeedbackDrafts((current) => ({ ...current, [message.id]: value }))}
                     onOpenJson={(title, data) => setJsonOpen({ title, data })}
                     onRerun={() => {
@@ -3789,6 +3876,7 @@ function ThreadMessageCard({
   feedbackValue,
   language,
   message,
+  actionBusy,
   onApprove,
   onFeedbackChange,
   onOpenJson,
@@ -3797,6 +3885,7 @@ function ThreadMessageCard({
   running,
   t,
 }: {
+  actionBusy: boolean;
   feedbackValue: string;
   language: Language;
   message: ThreadMessage;
@@ -3818,6 +3907,29 @@ function ThreadMessageCard({
             <time>{formatTime(message.createdAt)}</time>
           </header>
           {message.body ? <RichMessageBody text={message.body} /> : null}
+          {message.attachments?.length ? (
+            <div className="message-attachments" aria-label={language === "zh" ? "消息附件" : "Message attachments"}>
+              {message.attachments.map((attachment) => (
+                <span
+                  className={`message-attachment ${attachment.upload_status ?? "completed"}`}
+                  key={attachment.attachment_id}
+                  title={`${attachment.name} · ${formatBytes(attachment.size)}`}
+                >
+                  <Paperclip size={13} />
+                  <b>{attachment.name}</b>
+                  <small>
+                    {attachment.upload_status === "pending"
+                      ? language === "zh" ? "上传中" : "Uploading"
+                      : attachment.upload_status === "failed"
+                        ? language === "zh" ? "失败" : "Failed"
+                        : attachment.parse_status === "pending"
+                          ? language === "zh" ? "解析中" : "Parsing"
+                          : formatBytes(attachment.size)}
+                  </small>
+                </span>
+              ))}
+            </div>
+          ) : null}
         </div>
       </article>
     );
@@ -3931,19 +4043,19 @@ function ThreadMessageCard({
           <section className="inline-review">
             <p>{t.gateWaiting}</p>
             <div className="review-actions">
-              <button className="main-action" disabled={running} type="button" onClick={onApprove}>
+              <button className="main-action" disabled={running || actionBusy} type="button" onClick={onApprove}>
                 <CheckCircle2 size={16} />
                 {t.approveContinue}
               </button>
             </div>
             <div className="revision-composer">
               <textarea
-                disabled={running}
+                disabled={running || actionBusy}
                 onChange={(event) => onFeedbackChange(event.target.value)}
                 placeholder={t.revisePlaceholder}
                 value={feedbackValue}
               />
-              <button className="ghost-button" disabled={running} type="button" onClick={onRerun}>
+              <button className="ghost-button" disabled={running || actionBusy} type="button" onClick={onRerun}>
                 {t.revise}
               </button>
             </div>
@@ -3966,11 +4078,11 @@ function ThreadMessageCard({
             <div className="system-revision-action">
               <span>{language === "zh" ? "重新执行时，修订意见由总控自动生成，无需填写。" : "For a rerun, the controller generates revision guidance automatically."}</span>
               <div className="quality-choice-buttons">
-                <button className="main-action" disabled={running} type="button" onClick={onApprove}>
+                <button className="main-action" disabled={running || actionBusy} type="button" onClick={onApprove}>
                   <CheckCircle2 size={16} />
                   {language === "zh" ? "继续执行" : "Continue"}
                 </button>
-                <button className="ghost-button" disabled={running} type="button" onClick={onRerun}>
+                <button className="ghost-button" disabled={running || actionBusy} type="button" onClick={onRerun}>
                   <RotateCcw size={15} />
                   {language === "zh" ? "重新执行" : "Rerun"}
                 </button>
@@ -3999,6 +4111,131 @@ function ThreadMessageCard({
         ) : null}
       </div>
     </article>
+  );
+}
+
+function KnowledgeIntegrationOutput({
+  language,
+  payload,
+}: {
+  language: Language;
+  payload: Record<string, unknown>;
+}) {
+  const literature = arrayValue(payload.literature_cards);
+  const evidence = arrayValue(payload.evidence_cards);
+  const gaps = arrayValue(payload.knowledge_gaps);
+  const phases = [
+    {
+      id: "literature",
+      icon: FileJson,
+      title: language === "zh" ? "文献检索" : "Literature search",
+      subtitle: language === "zh" ? "形成可追踪的文献卡片" : "Build traceable literature cards",
+      count: literature.length,
+      empty: language === "zh" ? "尚未返回文献卡片。" : "No literature cards returned.",
+    },
+    {
+      id: "evidence",
+      icon: CheckCircle2,
+      title: language === "zh" ? "证据整合" : "Evidence integration",
+      subtitle: language === "zh" ? "抽取可被下游引用的证据结论" : "Extract evidence claims for downstream use",
+      count: evidence.length,
+      empty: language === "zh" ? "尚未返回证据卡片。" : "No evidence cards returned.",
+    },
+    {
+      id: "gaps",
+      icon: HelpCircle,
+      title: language === "zh" ? "知识空白合成" : "Knowledge gap synthesis",
+      subtitle: language === "zh" ? "确定假设生成必须引用的 gap_id" : "Identify gap_id references required by hypotheses",
+      count: gaps.length,
+      empty: language === "zh" ? "尚未返回知识空白，假设生成会被后端门禁拦截。" : "No knowledge gaps returned; hypothesis generation will be blocked.",
+    },
+  ];
+
+  return (
+    <div className="module-output knowledge-output">
+      <div className="knowledge-phase-strip">
+        {phases.map((phase, index) => {
+          const Icon = phase.icon;
+          return (
+            <div className={`knowledge-phase ${phase.count ? "ready" : "empty"}`} key={phase.id}>
+              <i>{index + 1}</i>
+              <Icon size={15} />
+              <div>
+                <strong>{phase.title}</strong>
+                <span>{phase.subtitle}</span>
+              </div>
+              <b>{phase.count}</b>
+            </div>
+          );
+        })}
+      </div>
+
+      <section className="knowledge-section">
+        <header>
+          <span>{language === "zh" ? "文献卡片" : "Literature cards"}</span>
+          <small>{literature.length}</small>
+        </header>
+        {literature.length ? (
+          <div className="knowledge-card-grid">
+            {literature.map((item, index) => (
+              <article id={`artifact-${objectField(item, "literature_id")}`} key={`${objectField(item, "literature_id")}-${index}`}>
+                <div>
+                  <strong>{objectField(item, "title") || objectField(item, "literature_id")}</strong>
+                  <small>{[objectField(item, "year"), objectField(item, "source")].filter(Boolean).join(" · ") || "--"}</small>
+                </div>
+                <p>{trimPreview(objectField(item, "abstract") || objectField(item, "summary"), 150)}</p>
+                <code>{objectField(item, "doi") || objectField(item, "url") || objectField(item, "literature_id")}</code>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <p className="knowledge-empty">{phases[0].empty}</p>
+        )}
+      </section>
+
+      <section className="knowledge-section">
+        <header>
+          <span>{language === "zh" ? "证据卡片" : "Evidence cards"}</span>
+          <small>{evidence.length}</small>
+        </header>
+        {evidence.length ? (
+          <div className="knowledge-card-grid">
+            {evidence.map((item, index) => (
+              <article id={`artifact-${objectField(item, "evidence_id")}`} key={`${objectField(item, "evidence_id")}-${index}`}>
+                <div>
+                  <strong>{objectField(item, "evidence_id")}</strong>
+                  <small>{language === "zh" ? "来源" : "Source"}: {objectField(item, "source_literature_id") || "--"}</small>
+                </div>
+                <p>{objectField(item, "claim") || "--"}</p>
+                <code>{objectField(item, "evidence_type") || objectField(item, "strength") || "--"}</code>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <p className="knowledge-empty">{phases[1].empty}</p>
+        )}
+      </section>
+
+      <section className="knowledge-section">
+        <header>
+          <span>{language === "zh" ? "知识空白" : "Knowledge gaps"}</span>
+          <small>{gaps.length}</small>
+        </header>
+        {gaps.length ? (
+          <div className="knowledge-gap-list">
+            {gaps.map((item, index) => (
+              <article id={`artifact-${objectField(item, "gap_id")}`} key={`${objectField(item, "gap_id")}-${index}`}>
+                <code>{objectField(item, "gap_id") || `gap_${index + 1}`}</code>
+                <p>{objectField(item, "description") || "--"}</p>
+                <small>{objectField(item, "research_opportunity") || objectField(item, "why_it_matters")}</small>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <p className="knowledge-empty warning">{phases[2].empty}</p>
+        )}
+      </section>
+    </div>
   );
 }
 
@@ -4042,29 +4279,7 @@ function AgentOutput({ language, response, stage }: { language: Language; respon
   }
 
   if (stage === "knowledge_integration") {
-    return (
-      <div className="module-output">
-        <div className="output-section artifact-card-list">
-          <span>{language === "zh" ? "文献卡片" : "Literature cards"}</span>
-          {arrayValue(payload.literature_cards).map((item, index) => (
-            <article id={`artifact-${objectField(item, "literature_id")}`} key={`${objectField(item, "literature_id")}-${index}`}>
-              <strong>{objectField(item, "title")}</strong>
-              <small>{objectField(item, "year")} · {objectField(item, "source")}</small>
-            </article>
-          ))}
-        </div>
-        <div className="output-section artifact-card-list">
-          <span>{language === "zh" ? "证据卡片" : "Evidence cards"}</span>
-          {arrayValue(payload.evidence_cards).map((item, index) => (
-            <article id={`artifact-${objectField(item, "evidence_id")}`} key={`${objectField(item, "evidence_id")}-${index}`}>
-              <strong>{objectField(item, "evidence_id")}</strong>
-              <p>{objectField(item, "claim")}</p>
-            </article>
-          ))}
-        </div>
-        <BulletList label={language === "zh" ? "知识空白" : "Knowledge gaps"} values={arrayValue(payload.knowledge_gaps).map((item) => objectField(item, "description"))} />
-      </div>
-    );
+    return <KnowledgeIntegrationOutput language={language} payload={payload} />;
   }
 
   if (stage === "hypothesis_generation") {

@@ -33,6 +33,9 @@ export interface UserInput {
     media_type: string;
     size: number;
     created_at: string;
+    message_id?: string | null;
+    upload_status?: "pending" | "completed" | "failed";
+    parse_status?: "pending" | "completed" | "failed";
   }>;
   user_constraints: {
     language: string;

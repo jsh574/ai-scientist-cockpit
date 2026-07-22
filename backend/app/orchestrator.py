@@ -77,6 +77,65 @@ class Orchestrator:
             )
         )
 
+    @staticmethod
+    def _valid_references(items: Any, key: str) -> list[dict[str, Any]]:
+        if not isinstance(items, list):
+            return []
+        return [
+            item
+            for item in items
+            if isinstance(item, dict) and str(item.get(key) or "").strip()
+        ]
+
+    def _stage_preflight_issues(
+        self,
+        stage: str,
+        context: dict[str, Any],
+    ) -> list[str]:
+        if stage != "hypothesis_generation":
+            return []
+        issues: list[str] = []
+        if not self._valid_references(context.get("knowledge_gaps"), "gap_id"):
+            issues.append(
+                "knowledge_gaps is empty or invalid. Rerun knowledge_integration before hypothesis_generation."
+            )
+        if not self._valid_references(context.get("evidence_cards"), "evidence_id"):
+            issues.append(
+                "evidence_cards is empty or invalid. Rerun knowledge_integration before hypothesis_generation."
+            )
+        return issues
+
+    def _preflight_response(
+        self,
+        task_id: str,
+        spec: Any,
+        iteration: int,
+        issues: list[str],
+    ) -> dict[str, Any]:
+        return {
+            "metadata": {
+                "task_id": task_id,
+                "agent_id": spec.agent_id,
+                "stage": spec.stage,
+                "iteration": iteration,
+                "status": "partial_success",
+            },
+            "payload": {key: [] for key in spec.writes},
+            "self_review": {
+                "passed": False,
+                "overall_score": 0,
+                "threshold": self.review_gate.threshold,
+                "dimension_scores": {
+                    "prerequisite_readiness": 0,
+                    "downstream_readiness": 0,
+                },
+                "issues": issues,
+                "suggestions": [
+                    "Rerun knowledge_integration and confirm it writes literature_cards, evidence_cards, and knowledge_gaps."
+                ],
+            },
+        }
+
     def create_task(self, request: TaskCreateRequest) -> dict[str, Any]:
         task_id = request.task_id or f"task_{uuid4().hex[:12]}"
         constraints = {
@@ -192,6 +251,42 @@ class Orchestrator:
         )
         return merged
 
+    def _handled_approval(
+        self, context: dict[str, Any], approval_id: str | None
+    ) -> dict[str, Any] | None:
+        if not approval_id:
+            return None
+        processed = (context.get("extensions") or {}).get("processed_approvals") or {}
+        stored = processed.get(approval_id)
+        return dict(stored) if isinstance(stored, dict) else None
+
+    def _remember_approval(
+        self,
+        context: dict[str, Any],
+        approval_id: str | None,
+        *,
+        stage: str,
+        decision: str,
+        status: str,
+        review: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if not approval_id:
+            return context
+        extensions = dict(context.get("extensions") or {})
+        processed = dict(extensions.get("processed_approvals") or {})
+        processed[approval_id] = {
+            "approval_id": approval_id,
+            "stage": stage,
+            "decision": decision,
+            "status": status,
+            "review": review,
+            "processed_at": utc_now(),
+        }
+        extensions["processed_approvals"] = processed
+        context["extensions"] = extensions
+        self.artifacts.save_context(str(context["task_id"]), context)
+        return context
+
     @staticmethod
     def _feedback_with_memory(
         context: dict[str, Any], stage: str, feedback: str | None
@@ -296,6 +391,7 @@ class Orchestrator:
                 )
             if effective_feedback:
                 stage_input["feedback"] = effective_feedback
+            preflight_issues = self._stage_preflight_issues(stage, context)
             self.artifacts.set_stage_status(task_id, stage, "running")
             self.artifacts.write_stage_input(task_id, stage, iteration, stage_input)
             node_run_id = self.artifacts.begin_node_run(
@@ -304,7 +400,16 @@ class Orchestrator:
             self._event(task_id, "stage_started", f"{stage} started.", stage)
 
             try:
-                if stage == "final_review":
+                if preflight_issues:
+                    raw = self._preflight_response(task_id, spec, iteration, preflight_issues)
+                    self._event(
+                        task_id,
+                        "stage_preflight_blocked",
+                        f"{stage} prerequisites are not ready.",
+                        stage,
+                        issues=preflight_issues,
+                    )
+                elif stage == "final_review":
                     raw = self._built_in_final_review(context)
                 else:
                     parameters = inspect.signature(self.registry.run).parameters.values()
@@ -458,6 +563,16 @@ class Orchestrator:
         get_agent_spec(request.stage)
         with self._task_lock(task_id):
             context = self.artifacts.load_context(task_id)
+            approval_id = str(request.approval_id or "").strip() or None
+            handled = self._handled_approval(context, approval_id)
+            if handled is not None:
+                return {
+                    "status": handled.get("status", "processed"),
+                    "review": handled.get("review"),
+                    "task_context": context,
+                    "idempotent": True,
+                    "approval_id": approval_id,
+                }
             current_stage = context.get("current_stage")
             source_review: ReviewRecord | None = None
             quality_override = current_stage == request.stage and request.decision == "accept"
@@ -477,7 +592,17 @@ class Orchestrator:
                 )
 
             if request.decision == "retry":
-                return self.run_stage(task_id, request.stage, request.comment)
+                result = self.run_stage(task_id, request.stage, request.comment)
+                latest = self.artifacts.load_context(task_id)
+                self._remember_approval(
+                    latest,
+                    approval_id,
+                    stage=request.stage,
+                    decision=request.decision,
+                    status=str(result.get("status") or "retry"),
+                    review=result.get("review") if isinstance(result.get("review"), dict) else None,
+                )
+                return {**result, "approval_id": approval_id}
 
             if request.decision == "rollback":
                 context["current_stage"] = request.stage
@@ -489,7 +614,18 @@ class Orchestrator:
                     request.comment or f"{request.stage} rolled back.",
                     request.stage,
                 )
-                return {"status": "rollback", "task_context": context}
+                context = self._remember_approval(
+                    context,
+                    approval_id,
+                    stage=request.stage,
+                    decision=request.decision,
+                    status="rollback",
+                )
+                return {
+                    "status": "rollback",
+                    "task_context": context,
+                    "approval_id": approval_id,
+                }
 
             raw = self.artifacts.latest_stage_output(task_id, request.stage)
             response = AgentResponse.model_validate(raw)
@@ -538,10 +674,19 @@ class Orchestrator:
                 human_review.comment,
                 request.stage,
             )
+            context = self._remember_approval(
+                context,
+                approval_id,
+                stage=request.stage,
+                decision=request.decision,
+                status="passed",
+                review=human_review.model_dump(),
+            )
             return {
                 "status": "passed",
                 "review": human_review.model_dump(),
                 "task_context": context,
+                "approval_id": approval_id,
             }
 
     def record_feedback(

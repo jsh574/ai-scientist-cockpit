@@ -65,13 +65,28 @@ class PersistenceTests(unittest.TestCase):
             "# Background\nA longitudinal cohort is required.".encode("utf-8"),
             "text/markdown",
             context_char_limit=10_000,
+            message_id="msg_user_001",
         )
 
         self.assertEqual(item["name"], "background.md")
+        self.assertEqual(item["message_id"], "msg_user_001")
+        self.assertEqual(item["upload_status"], "completed")
+        self.assertEqual(item["parse_status"], "completed")
         self.assertTrue((self.artifacts.task_root("task_attachment") / item["path"]).is_file())
-        self.assertEqual(len(self.artifacts.list_attachments("task_attachment")), 1)
+        persisted_attachments = self.artifacts.list_attachments("task_attachment")
+        self.assertEqual(len(persisted_attachments), 1)
+        self.assertEqual(persisted_attachments[0]["message_id"], "msg_user_001")
         self.assertIn("longitudinal cohort", context["user_input"]["question_description"])
         self.assertEqual(context["user_input"]["attachments"][0]["name"], "background.md")
+        self.assertEqual(
+            context["user_input"]["attachments"][0]["message_id"],
+            "msg_user_001",
+        )
+        self.assertNotIn("text_excerpt", context["user_input"]["attachments"][0])
+        self.assertEqual(
+            context["extensions"]["message_attachments"]["msg_user_001"][0]["attachment_id"],
+            item["attachment_id"],
+        )
 
         with self.assertRaises(ArtifactError):
             self.artifacts.add_attachment(

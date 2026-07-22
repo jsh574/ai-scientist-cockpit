@@ -201,6 +201,7 @@ class ArtifactService:
         media_type: str | None,
         *,
         context_char_limit: int,
+        message_id: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         safe_name = Path(filename).name
         if safe_name != filename or not safe_name:
@@ -229,6 +230,9 @@ class ArtifactService:
             "size": len(content),
             "text_excerpt": text[:context_char_limit],
             "created_at": utc_now(),
+            "message_id": message_id,
+            "upload_status": "completed",
+            "parse_status": "completed",
         }
         attachments = [*self.list_attachments(task_id), item]
         self.write_json(task_id, "attachments/index.json", attachments)
@@ -245,6 +249,14 @@ class ArtifactService:
             {key: value for key, value in attachment.items() if key != "text_excerpt"}
             for attachment in attachments
         ]
+        if message_id:
+            extensions = dict(context.get("extensions") or {})
+            message_attachments = dict(extensions.get("message_attachments") or {})
+            bound = list(message_attachments.get(message_id) or [])
+            bound.append({key: value for key, value in item.items() if key != "text_excerpt"})
+            message_attachments[message_id] = bound
+            extensions["message_attachments"] = message_attachments
+            context["extensions"] = extensions
         attachment_context = "\n\n".join(
             f"[{attachment['name']}]\n{attachment['text_excerpt']}" for attachment in attachments
         )[:context_char_limit]
@@ -265,7 +277,11 @@ class ArtifactService:
                 task_id=task_id,
                 type="attachment_uploaded",
                 message=f"Attachment uploaded: {safe_name}",
-                data={"attachment_id": attachment_id, "path": relative_path},
+                data={
+                    "attachment_id": attachment_id,
+                    "message_id": message_id,
+                    "path": relative_path,
+                },
             )
         )
         return item, context
