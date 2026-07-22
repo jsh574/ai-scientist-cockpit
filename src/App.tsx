@@ -5098,100 +5098,267 @@ function AgentOutput({
 
 type ResearchPlanItem = ResearchPlan["plans"][number];
 
-function normalizeResearchPlan(plan: ResearchPlanItem["plan"] | null | undefined): ResearchPlanItem["plan"] {
-  const methods = plan?.methods;
-  const datasets = plan?.datasets;
-  const experiments = plan?.experiments;
-  const mainExperiment = experiments?.main_experiment;
-  const results = plan?.results;
-  const rationale = plan?.rationale;
-  const technical = plan?.technical_details;
+interface DisplayPlanNamedItem {
+  name: string;
+  description: string;
+}
+
+interface DisplayPlanDataset {
+  id: string;
+  name: string;
+  description: string;
+  fields: string[];
+  status: string;
+}
+
+interface DisplayPlanStep {
+  id: string;
+  name: string;
+  description: string;
+  inputs: string[];
+  outputs: string[];
+}
+
+interface DisplayResearchPlan {
+  problem_statement: string;
+  paper_title: string;
+  paper_abstract: string;
+  rationale: {
+    text: string;
+    logic_chain: Array<{
+      step: number;
+      claim: string;
+      evidence_ids: string[];
+      source_ids: string[];
+    }>;
+  };
+  technical_details: {
+    required_methods: string[];
+    candidate_models_or_algorithms: string[];
+    statistical_tests: string[];
+    software_stack: string[];
+  };
+  methods: {
+    overall_design: string;
+    steps: DisplayPlanStep[];
+  };
+  datasets: {
+    source: DisplayPlanDataset[];
+    target: DisplayPlanDataset[];
+  };
+  experiments: {
+    main_experiment: {
+      objective: string;
+      independent_variables: string[];
+      dependent_variables: string[];
+      control_variables: string[];
+    };
+    metrics: DisplayPlanNamedItem[];
+    baselines: DisplayPlanNamedItem[];
+    procedure: string[];
+    ablation_or_sensitivity_analysis: string[];
+  };
+  results: {
+    result_type: string;
+    expected_findings: string[];
+    feasibility_check: string;
+    falsification_criteria: string[];
+  };
+  references: Array<{
+    source_id: string;
+    title: string;
+    authors: string[];
+    year: string;
+    doi: string;
+    url: string;
+  }>;
+  feedback_tasks: Array<{
+    priority: string;
+    objective: string;
+  }>;
+  limitations: string[];
+}
+
+function researchPlanRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function researchPlanStrings(value: unknown): string[] {
+  return arrayValue(value)
+    .map((item) => stringValue(item).trim())
+    .filter(Boolean);
+}
+
+function researchPlanNamedItems(value: unknown): DisplayPlanNamedItem[] {
+  return arrayValue(value).map((item, index) => {
+    if (typeof item === "string") {
+      return { name: item, description: "" };
+    }
+    const record = researchPlanRecord(item);
+    return {
+      name: objectField(record, "name") || objectField(record, "description") || `Item ${index + 1}`,
+      description: objectField(record, "description"),
+    };
+  });
+}
+
+function researchPlanDatasets(value: unknown, target = false): DisplayPlanDataset[] {
+  return arrayValue(value).map((item, index) => {
+    if (typeof item === "string") {
+      return {
+        id: "",
+        name: item,
+        description: "",
+        fields: [],
+        status: "",
+      };
+    }
+    const record = researchPlanRecord(item);
+    return {
+      id: objectField(record, "dataset_id"),
+      name: objectField(record, "name") || `Dataset ${index + 1}`,
+      description: objectField(record, target ? "description" : "usage"),
+      fields: researchPlanStrings(objectValue(record, target ? "fields" : "required_fields")),
+      status: target ? "" : objectField(record, "access_status"),
+    };
+  });
+}
+
+function normalizeResearchPlan(plan: unknown): DisplayResearchPlan {
+  const raw = researchPlanRecord(plan);
+  const rationale = researchPlanRecord(raw.rationale);
+  const technicalDetails = researchPlanRecord(raw.technical_details);
+  const methods = researchPlanRecord(raw.methods);
+  const datasets = researchPlanRecord(raw.datasets);
+  const experiments = researchPlanRecord(raw.experiments);
+  const mainExperiment = researchPlanRecord(experiments.main_experiment);
+  const results = researchPlanRecord(raw.results);
+
   return {
-    ...plan,
-    problem_statement: plan?.problem_statement ?? "",
-    paper_title: plan?.paper_title ?? "",
-    paper_abstract: plan?.paper_abstract ?? "",
+    problem_statement: objectField(raw, "problem_statement"),
+    paper_title: objectField(raw, "paper_title"),
+    paper_abstract: objectField(raw, "paper_abstract"),
+    rationale: {
+      text: objectField(rationale, "text"),
+      logic_chain: arrayValue(rationale.logic_chain).map((value, index) => {
+        const step = researchPlanRecord(value);
+        return {
+          step: numberValue(step.step) || index + 1,
+          claim: objectField(step, "claim"),
+          evidence_ids: researchPlanStrings(step.evidence_ids),
+          source_ids: researchPlanStrings(step.source_ids),
+        };
+      }),
+    },
     technical_details: {
-      ...technical,
-      required_methods: technical?.required_methods ?? [],
-      candidate_models_or_algorithms: technical?.candidate_models_or_algorithms ?? [],
-      statistical_tests: technical?.statistical_tests ?? [],
-      software_stack: technical?.software_stack ?? [],
+      required_methods: researchPlanStrings(technicalDetails.required_methods),
+      candidate_models_or_algorithms: researchPlanStrings(
+        technicalDetails.candidate_models_or_algorithms,
+      ),
+      statistical_tests: researchPlanStrings(technicalDetails.statistical_tests),
+      software_stack: researchPlanStrings(technicalDetails.software_stack),
     },
     methods: {
-      ...methods,
-      overall_design: methods?.overall_design ?? "",
-      steps: (methods?.steps ?? []).map((step) => ({
-        ...step,
-        input: step.input ?? [],
-        output: step.output ?? [],
-      })),
+      overall_design: objectField(methods, "overall_design"),
+      steps: arrayValue(methods.steps).map((value, index) => {
+        const step = researchPlanRecord(value);
+        const id = objectField(step, "step_id");
+        return {
+          id,
+          name: objectField(step, "name") || id || `Step ${index + 1}`,
+          description: objectField(step, "description"),
+          inputs: researchPlanStrings(step.inputs ?? step.input),
+          outputs: researchPlanStrings(step.outputs ?? step.output),
+        };
+      }),
     },
     datasets: {
-      ...datasets,
-      source: (datasets?.source ?? []).map((dataset) => ({
-        ...dataset,
-        required_fields: dataset.required_fields ?? [],
-      })),
-      target: (datasets?.target ?? []).map((dataset) => ({
-        ...dataset,
-        fields: dataset.fields ?? [],
-      })),
+      source: researchPlanDatasets(datasets.source),
+      target: researchPlanDatasets(datasets.target, true),
     },
     experiments: {
-      ...experiments,
       main_experiment: {
-        ...mainExperiment,
-        independent_variables: mainExperiment?.independent_variables ?? [],
-        dependent_variables: mainExperiment?.dependent_variables ?? [],
-        control_variables: mainExperiment?.control_variables ?? [],
+        objective: objectField(mainExperiment, "objective"),
+        independent_variables: researchPlanStrings(mainExperiment.independent_variables),
+        dependent_variables: researchPlanStrings(mainExperiment.dependent_variables),
+        control_variables: researchPlanStrings(mainExperiment.control_variables),
       },
-      metrics: experiments?.metrics ?? [],
-      baselines: experiments?.baselines ?? [],
-      procedure: experiments?.procedure ?? [],
-      ablation_or_sensitivity_analysis: experiments?.ablation_or_sensitivity_analysis ?? [],
+      metrics: researchPlanNamedItems(experiments.metrics),
+      baselines: researchPlanNamedItems(experiments.baselines),
+      procedure: researchPlanStrings(experiments.procedure),
+      ablation_or_sensitivity_analysis: researchPlanStrings(
+        experiments.ablation_or_sensitivity_analysis,
+      ),
     },
     results: {
-      ...results,
-      result_type: results?.result_type ?? "",
-      expected_findings: results?.expected_findings ?? [],
-      feasibility_check: results?.feasibility_check ?? "",
-      falsification_criteria: results?.falsification_criteria ?? [],
+      result_type: objectField(results, "result_type"),
+      expected_findings: researchPlanStrings(results.expected_findings),
+      feasibility_check: objectField(results, "feasibility_check"),
+      falsification_criteria: researchPlanStrings(results.falsification_criteria),
     },
-    rationale: {
-      ...rationale,
-      text: rationale?.text ?? "",
-      logic_chain: (rationale?.logic_chain ?? []).map((step) => ({
-        ...step,
-        evidence_ids: step.evidence_ids ?? [],
-        source_ids: step.source_ids ?? [],
-      })),
-    },
-    references: (plan?.references ?? []).map((reference) => ({
-      ...reference,
-      authors: reference.authors ?? [],
-      used_for: reference.used_for ?? [],
-    })),
-    feedback_tasks: (plan?.feedback_tasks ?? []).map((task) => ({
-      ...task,
-      input_requirements: task.input_requirements ?? [],
-    })),
-    limitations: plan?.limitations ?? [],
-  } as ResearchPlanItem["plan"];
+    references: arrayValue(raw.references).map((value) => {
+      const reference = researchPlanRecord(value);
+      return {
+        source_id: objectField(reference, "source_id"),
+        title: objectField(reference, "title"),
+        authors: researchPlanStrings(reference.authors),
+        year: stringValue(reference.year),
+        doi: objectField(reference, "doi"),
+        url: objectField(reference, "url"),
+      };
+    }),
+    feedback_tasks: arrayValue(raw.feedback_tasks).map((value) => {
+      const task = researchPlanRecord(value);
+      return {
+        priority: objectField(task, "priority"),
+        objective: objectField(task, "objective"),
+      };
+    }),
+    limitations: researchPlanStrings(raw.limitations),
+  };
+}
+
+function displayPlanNamedItem(item: DisplayPlanNamedItem): string {
+  return item.description ? `${item.name}: ${item.description}` : item.name;
+}
+
+function displayPlanDataset(item: DisplayPlanDataset): string {
+  const details = [item.description, item.status, item.fields.join(", ")].filter(Boolean);
+  return details.length ? `${item.name}: ${details.join(" · ")}` : item.name;
 }
 
 function planMarkdown(item: ResearchPlanItem) {
   const plan = normalizeResearchPlan(item.plan);
-  const section = (title: string, values: string[]) => `\n## ${title}\n${values.length ? values.map((value) => `- ${value}`).join("\n") : "- --"}\n`;
+  const section = (title: string, values: string[]) => `
+## ${title}
+${values.length ? values.map((value) => `- ${value}`).join("\n") : "- --"}
+`;
   return [
     `# ${plan.paper_title || item.hypothesis_id}`,
-    `\n**Hypothesis:** ${item.hypothesis_id}`,
-    `\n**Status:** ${item.status}`,
-    `\n## Problem\n${plan.problem_statement}`,
-    `\n## Overall Design\n${plan.methods.overall_design}`,
+    `
+**Hypothesis:** ${item.hypothesis_id}`,
+    `
+**Status:** ${item.status}`,
+    `
+## Problem
+${plan.problem_statement}`,
+    `
+## Rationale
+${plan.rationale.text}`,
+    `
+## Overall Design
+${plan.methods.overall_design}`,
     section("Methods", plan.methods.steps.map((step) => `${step.name}: ${step.description}`)),
-    section("Datasets", plan.datasets.source.map((dataset) => `${dataset.name}: ${dataset.usage} (${dataset.access_status})`)),
-    section("Metrics", plan.experiments.metrics.map((metric) => `${metric.name}: ${metric.description}`)),
+    section("Required Methods", plan.technical_details.required_methods),
+    section("Models or Algorithms", plan.technical_details.candidate_models_or_algorithms),
+    section("Statistical Tests", plan.technical_details.statistical_tests),
+    section("Software Stack", plan.technical_details.software_stack),
+    section("Source Datasets", plan.datasets.source.map(displayPlanDataset)),
+    section("Target Datasets", plan.datasets.target.map(displayPlanDataset)),
+    section("Metrics", plan.experiments.metrics.map(displayPlanNamedItem)),
+    section("Baselines", plan.experiments.baselines.map(displayPlanNamedItem)),
     section("Procedure", plan.experiments.procedure),
     section("Expected Findings", plan.results.expected_findings),
     section("Falsification Criteria", plan.results.falsification_criteria),
@@ -5201,7 +5368,7 @@ function planMarkdown(item: ResearchPlanItem) {
 }
 
 function ResearchPlanOutput({ language, researchPlan }: { language: Language; researchPlan?: ResearchPlan }) {
-  const plans = researchPlan?.plans ?? [];
+  const plans = Array.isArray(researchPlan?.plans) ? researchPlan.plans : [];
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [copied, setCopied] = useState(false);
   const selected = plans[Math.min(selectedIndex, Math.max(0, plans.length - 1))];
@@ -5257,63 +5424,40 @@ function ResearchPlanOutput({ language, researchPlan }: { language: Language; re
       <KeyValue label={language === "zh" ? "研究问题" : "Problem"} value={plan.problem_statement} />
       <KeyValue label={language === "zh" ? "论文题目" : "Paper title"} value={plan.paper_title} />
       <KeyValue label={language === "zh" ? "摘要" : "Abstract"} value={plan.paper_abstract} />
-      <KeyValue label={language === "zh" ? "科学依据" : "Rationale"} value={plan.rationale.text} />
+      <KeyValue label={language === "zh" ? "研究依据" : "Rationale"} value={plan.rationale.text} />
 
       <section className="plan-section">
         <h4>{language === "zh" ? "研究设计" : "Research design"}</h4>
-        <p>{plan.methods.overall_design}</p>
+        <p>{plan.methods.overall_design || "--"}</p>
         <div className="plan-timeline">
           {plan.methods.steps.map((step, index) => (
-            <article key={`${step.step_id}-${index}`}>
+            <article key={`${step.id || step.name}-${index}`}>
               <b>{String(index + 1).padStart(2, "0")}</b>
-              <div><strong>{step.name}</strong><p>{step.description}</p><small>{step.input.join(", ")} → {step.output.join(", ")}</small></div>
+              <div><strong>{step.name}</strong><p>{step.description}</p><small>{step.inputs.join(", ") || "--"} → {step.outputs.join(", ") || "--"}</small></div>
             </article>
           ))}
         </div>
       </section>
 
       <section className="plan-section plan-grid">
-        <div>
-          <h4>{language === "zh" ? "技术路线" : "Technical route"}</h4>
-          <BulletList label={language === "zh" ? "方法" : "Methods"} values={plan.technical_details.required_methods} />
-          <BulletList label={language === "zh" ? "模型/算法" : "Models/algorithms"} values={plan.technical_details.candidate_models_or_algorithms} />
-        </div>
-        <div>
-          <h4>{language === "zh" ? "统计与软件" : "Statistics and software"}</h4>
-          <BulletList label={language === "zh" ? "统计检验" : "Statistical tests"} values={plan.technical_details.statistical_tests} />
-          <BulletList label={language === "zh" ? "软件栈" : "Software stack"} values={plan.technical_details.software_stack} />
-        </div>
+        <div><h4>{language === "zh" ? "技术路线" : "Technical approach"}</h4><PillList label={language === "zh" ? "必要方法" : "Required methods"} values={plan.technical_details.required_methods} /><PillList label={language === "zh" ? "模型或算法" : "Models or algorithms"} values={plan.technical_details.candidate_models_or_algorithms} /></div>
+        <div><h4>{language === "zh" ? "统计与软件" : "Statistics and software"}</h4><PillList label={language === "zh" ? "统计检验" : "Statistical tests"} values={plan.technical_details.statistical_tests} /><PillList label={language === "zh" ? "软件栈" : "Software stack"} values={plan.technical_details.software_stack} /></div>
       </section>
 
       <section className="plan-section plan-grid">
-        <div><h4>{language === "zh" ? "实验变量" : "Variables"}</h4><PillList label={language === "zh" ? "自变量" : "Independent"} values={plan.experiments.main_experiment.independent_variables} /><PillList label={language === "zh" ? "因变量" : "Dependent"} values={plan.experiments.main_experiment.dependent_variables} /><PillList label={language === "zh" ? "控制变量" : "Controls"} values={plan.experiments.main_experiment.control_variables} /></div>
-        <div><h4>{language === "zh" ? "指标与基线" : "Metrics and baselines"}</h4><BulletList label={language === "zh" ? "指标" : "Metrics"} values={plan.experiments.metrics.map((item) => `${item.name}: ${item.description}`)} /><BulletList label={language === "zh" ? "基线" : "Baselines"} values={plan.experiments.baselines.map((item) => `${item.name}: ${item.description}`)} /></div>
+        <div><h4>{language === "zh" ? "实验变量" : "Variables"}</h4><KeyValue label={language === "zh" ? "目标" : "Objective"} value={plan.experiments.main_experiment.objective} /><PillList label={language === "zh" ? "自变量" : "Independent"} values={plan.experiments.main_experiment.independent_variables} /><PillList label={language === "zh" ? "因变量" : "Dependent"} values={plan.experiments.main_experiment.dependent_variables} /><PillList label={language === "zh" ? "控制变量" : "Controls"} values={plan.experiments.main_experiment.control_variables} /></div>
+        <div><h4>{language === "zh" ? "指标与基线" : "Metrics and baselines"}</h4><BulletList label={language === "zh" ? "指标" : "Metrics"} values={plan.experiments.metrics.map(displayPlanNamedItem)} /><BulletList label={language === "zh" ? "基线" : "Baselines"} values={plan.experiments.baselines.map(displayPlanNamedItem)} /></div>
       </section>
 
       <section className="plan-section">
         <h4>{language === "zh" ? "数据" : "Data"}</h4>
-        <div className="dataset-grid">
-          {plan.datasets.source.map((dataset, index) => (
-            <article key={`${dataset.dataset_id}-${index}`}><strong>{dataset.name}</strong><p>{dataset.usage}</p><small>{dataset.access_status} · {dataset.required_fields.join(", ")}</small></article>
-          ))}
-          {plan.datasets.target.map((dataset, index) => (
-            <article key={`${dataset.name}-${index}`}><strong>{dataset.name}</strong><p>{dataset.description}</p><small>{dataset.fields.join(", ")}</small></article>
-          ))}
-        </div>
-      </section>
-
-      <section className="plan-section">
-        <h4>{language === "zh" ? "实验流程" : "Experiment procedure"}</h4>
-        <div className="plan-procedure">
-          {plan.experiments.procedure.length ? plan.experiments.procedure.map((step, index) => (
-            <article key={`${step}-${index}`}><b>{String(index + 1).padStart(2, "0")}</b><p>{step}</p></article>
-          )) : <article><b>--</b><p>--</p></article>}
-        </div>
+        <BulletList label={language === "zh" ? "源数据" : "Source datasets"} values={plan.datasets.source.map(displayPlanDataset)} />
+        <BulletList label={language === "zh" ? "目标数据" : "Target datasets"} values={plan.datasets.target.map(displayPlanDataset)} />
       </section>
 
       <section className="plan-section plan-grid">
-        <div><h4>{language === "zh" ? "预期结果" : "Expected results"}</h4><BulletList label={plan.results.result_type} values={plan.results.expected_findings} /><KeyValue label={language === "zh" ? "可行性" : "Feasibility"} value={plan.results.feasibility_check} /></div>
-        <div><h4>{language === "zh" ? "证伪与敏感性" : "Falsification and sensitivity"}</h4><BulletList label={language === "zh" ? "失败判据" : "Falsification"} values={plan.results.falsification_criteria} /><BulletList label={language === "zh" ? "消融/敏感性" : "Ablation/sensitivity"} values={plan.experiments.ablation_or_sensitivity_analysis} /></div>
+        <div><h4>{language === "zh" ? "实验过程" : "Procedure"}</h4><BulletList label={language === "zh" ? "步骤" : "Steps"} values={plan.experiments.procedure} /><BulletList label={language === "zh" ? "消融/敏感性" : "Ablation/sensitivity"} values={plan.experiments.ablation_or_sensitivity_analysis} /></div>
+        <div><h4>{language === "zh" ? "预期结果" : "Expected results"}</h4><BulletList label={plan.results.result_type || (language === "zh" ? "预期发现" : "Expected findings")} values={plan.results.expected_findings} /><KeyValue label={language === "zh" ? "可行性" : "Feasibility"} value={plan.results.feasibility_check} /><BulletList label={language === "zh" ? "失败判据" : "Falsification"} values={plan.results.falsification_criteria} /></div>
       </section>
 
       <section className="plan-section">
@@ -5334,25 +5478,14 @@ function ResearchPlanOutput({ language, researchPlan }: { language: Language; re
         </div>
         <div className="reference-list">
           {plan.references.map((reference, index) => (
-            <article key={`${reference.source_id}-${index}`}><strong>{reference.title}</strong><p>{reference.authors.join(", ")} · {reference.year}</p><small>{reference.used_for.join(", ")}</small><a href={reference.url || (reference.doi ? `https://doi.org/${reference.doi}` : undefined)} target="_blank" rel="noreferrer">{reference.doi || reference.source_id}</a></article>
+            <article key={`${reference.source_id}-${index}`}><strong>{reference.title || reference.source_id}</strong><p>{reference.authors.join(", ") || "--"} · {reference.year || "--"}</p><a href={reference.url || (reference.doi ? `https://doi.org/${reference.doi}` : undefined)} target="_blank" rel="noreferrer">{reference.doi || reference.source_id}</a></article>
           ))}
         </div>
       </section>
 
       <section className="plan-section plan-grid">
         <BulletList label={language === "zh" ? "限制" : "Limitations"} values={plan.limitations} />
-        <div>
-          <h4>{language === "zh" ? "反馈任务" : "Feedback tasks"}</h4>
-          <div className="feedback-task-list">
-            {plan.feedback_tasks.length ? plan.feedback_tasks.map((item, index) => (
-              <article key={`${item.task_id}-${index}`}>
-                <strong>{item.task_id || item.task_type}</strong>
-                <p>[{item.priority}] {item.objective}</p>
-                <small>{item.input_requirements.join(", ") || "--"} → {item.expected_output || "--"}</small>
-              </article>
-            )) : <article><strong>--</strong><p>--</p></article>}
-          </div>
-        </div>
+        <BulletList label={language === "zh" ? "反馈任务" : "Feedback tasks"} values={plan.feedback_tasks.map((item) => `[${item.priority || "-"}] ${item.objective}`)} />
       </section>
 
       <details className="json-fallback-panel">
