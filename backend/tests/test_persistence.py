@@ -172,6 +172,8 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(chunks[0]["attachment_id"], item["attachment_id"])
         self.assertEqual(chunks[0]["stage"], "hypothesis_generation")
         self.assertIn("citation_id", chunks[0])
+        self.assertIn("source_type", chunks[0])
+        self.assertIn("source_path", chunks[0])
         self.assertIn("Cytokine", chunks[0]["text"])
 
     def test_feedback_updates_runtime_controls_without_creating_a_new_task(self) -> None:

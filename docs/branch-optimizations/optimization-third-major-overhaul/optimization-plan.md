@@ -599,6 +599,155 @@
 
 - TypeScript 类型检查通过。
 
+### 2026-07-22：剩余计划第一轮收口 - 阶段标准化、调试解释与 citation 定位
+
+本次把“剩余优化拆两次完成”的第一轮落到代码层，优先处理运行链路可信度和调试可解释性。
+
+改动内容：
+
+- 知识整合 workflow progress 统一补充标准三阶段字段：
+  - `literature_search`
+  - `evidence_integration`
+  - `knowledge_gap_synthesis`
+- 保留真实内部 `node_id`，同时在事件 payload 中增加 `phase_id/phase_index/phase_label`，避免破坏现有 resume checkpoint。
+- workflow run checkpoint 同时保存原始 node checkpoint 和标准 phase checkpoint，页面刷新和后续恢复都可以按标准阶段读取。
+- 前端知识整合 partial 面板优先识别标准 `phase_id`，不再只依赖原始 `literature_extract/evidence_extract/gap_synthesis`。
+- 附件 chunk citation 增加解析定位字段：
+  - `source_type`
+  - `source_path`
+  - `page`
+  - `section`
+  - `table_index`
+- NodeDebugger 的 citation 面板新增“定位 / Source”按钮，可打开包含当前 citation 和 parsed JSON 的定位弹窗。
+- NodeDebugger 新增节点诊断区：
+  - 汇总 self review issues。
+  - 汇总 review issues。
+  - 汇总 `stage_preflight_blocked/node_failed/node_revision_required` 等阻断事件。
+  - 显示当前节点相关 progress、partial output、阻断和调度事件。
+
+实现方式：
+
+- 在 `WorkflowRunManager._handle_progress()` 中维护知识整合内部 node 到标准 phase 的映射。
+- 在 `ArtifactService.search_attachment_chunks()` 中把 parsed chunk 的定位字段向 citation 结果透传。
+- 在 `NodeDebugger` 中复用已有 `events`，不新增后端 API，按当前 node/stage 过滤相关事件。
+- 在 `AttachmentCitationList` 中复用已有 `fetchArtifactJson()` 和全局 `JsonModal` 打开 parsed source。
+
+改后效果：
+
+- 知识整合的“三阶段”不再只是前端推断，而是在 workflow event 和 checkpoint 层都有标准字段。
+- 调试节点时可以直接看到“为什么阻断/失败/要求重跑”，不必在事件流和 JSON 中来回查找。
+- 附件引用从“看到 chunk 文本”升级为“能定位到 parsed JSON 来源”，为后续页码/段落跳转打基础。
+
+已执行验证：
+
+- `npm run typecheck`
+- `python -m unittest backend.tests.test_workflow_runs backend.tests.test_persistence -v`
+- `python -m unittest discover -s backend/tests -v`
+- `python -m py_compile backend/app/workflow_runs.py backend/app/artifact_service.py`
+
+验证结果：
+
+- TypeScript 类型检查通过。
+- 后端 unittest 51 个全部通过。
+- Python 编译检查通过。
+
+### 2026-07-22：剩余计划第二轮收口 - 富文本 @ 与 Agent Manifest 单一源
+
+本次继续完成剩余优化的第二轮，重点收口输入框 @ 体验和多 Agent 协议治理。
+
+改动内容：
+
+- Composer 输入框新增富文本高亮镜像层：
+  - 底层仍使用 textarea，保留中文输入法、换行、粘贴和现有发送逻辑。
+  - 视觉层把 `@controller/@knowledge/@中文别名` 等 mention 渲染成蓝色一体化 token。
+  - placeholder 明确提示“输入 @ 可定向到总控或 Agent”。
+- 保留现有 @ 候选菜单、蓝色目标 pill 和发送路由逻辑，避免为了视觉效果破坏稳定语义。
+- 新增 `agents/agent-manifest.v1.json`：
+  - 覆盖 6 个阶段。
+  - 包含 `agent_id/display_name/aliases/entrypoint/reads/writes/progress_nodes/retry_policy/hybrid_review/description`。
+  - 将知识整合标准 progress nodes 固化为 `literature_search/evidence_integration/knowledge_gap_synthesis`。
+- 后端 `AGENT_SPECS` 优先从 `agent-manifest.v1.json` 派生。
+- 保留 `DEFAULT_AGENT_SPECS` fallback，避免部署环境缺少 manifest 时直接无法启动。
+- 新增 `scripts/validate_agent_manifest.py`，校验 manifest、后端 `AGENT_SPECS` 和旧 `agents/registry.json` 的读写契约是否漂移。
+- 新增 `test_agent_manifest.py`，把 manifest 单一源纳入后端 unittest。
+
+实现方式：
+
+- 富文本 @ 没有直接切换为高风险 contenteditable，而是采用“高亮镜像层 + textarea 输入层”的保守实现。
+- mention token 高亮复用现有 alias 表，保证视觉识别和路由识别使用同一批 token。
+- `backend.app.agent_protocol` 在 import 时读取 manifest 并构造 `NodeSpec`，同时检查阶段完整性和顺序。
+- manifest 校验脚本可单独运行，也可在 CI 中作为轻量协议漂移检查。
+
+改后效果：
+
+- 用户在输入框内能看到蓝色 @ token，定向操作不再像普通字符串。
+- 新增或修改 Agent 时，有一份更完整的 manifest 可作为协议入口，减少 `AGENT_SPECS/stageMeta/registry/schema` 多处漂移风险。
+- 后续要继续做动态 DAG、Agent-to-Agent Request、Agent 能力调度时，可以从 manifest 的 `aliases/progress_nodes/reads/writes` 继续扩展。
+
+已执行验证：
+
+- `python scripts/validate_agent_manifest.py`
+- `python -m unittest discover -s backend/tests -v`
+- `npm run typecheck`
+
+验证结果：
+
+- Agent manifest 校验通过。
+- 后端 unittest 52 个全部通过。
+- TypeScript 类型检查通过。
+
+### 2026-07-22：自查修复 - 文件上传链路与 @ 定向路由
+
+本次针对新暴露的“文件上传系统还有问题”和“@ 系列好像没有用”做前端链路自查，重点修复输入框发送边界。
+
+发现问题：
+
+- 输入框底部的文件提示把历史已上传附件和本次待发送文件混在一起，容易让用户误以为旧附件仍在待发送队列。
+- 已有任务后，无 `@` 的输入会走总控问答，但该路径没有上传 pending files，导致“选了文件，发送后总控看不到文件”。
+- 运行中 `@agent` 指令要求必须有文本，`@knowledge + 仅附件` 会直接返回，表现为 `@` 没反应。
+- 总控问答路径不支持 file-only，发送按钮可用但实际函数提前返回。
+- `@` 识别使用普通字符串包含，容易误判，也会让视觉高亮和真实路由边界不一致。
+- 非运行态 `@agent` 反馈中，若附件上传成功但反馈保存失败，消息附件可能被错误标为上传失败。
+
+改动内容：
+
+- 新增统一前端附件同步 helper：
+  - 上传成功后合并 `attachments`，避免重复追加。
+  - 回写当前用户消息的附件状态为 completed。
+  - 上传成功后只移除本次已发送的 pending files。
+  - 上传失败时把同一条消息的附件标为 failed。
+- 四条输入入口全部接入附件上传：
+  - 首次创建任务。
+  - 已有任务后向总控提问。
+  - 运行中 `@agent` 指令排队。
+  - 非运行态 `@agent` 反馈并触发目标模块重跑。
+- 总控问答和运行中 `@agent` 支持“仅附件”发送，会自动生成明确的默认说明文本。
+- 首次任务也支持“仅附件”启动，会自动生成“基于附件提炼研究问题并启动协作流程”的默认任务描述。
+- 输入框底部文件提示只显示本次待发送文件，历史附件继续由消息气泡和 System/附件页展示。
+- `@` token 识别改为带边界的 alias 匹配，路由判断、清理 token、蓝色高亮使用同一套规则。
+- `@` 候选菜单取消“必须已有任务”的显示门槛，用户输入 `@` 后即可看到总控和 Agent 选项。
+- 富文本 textarea 镜像层增加滚动同步，长文本下蓝色 `@` token 不会和真实输入滚动错位。
+- 移除常驻目标按钮条，只保留输入 `@` 后的候选菜单与必要的轻量目标提示，降低运行中输入框噪声。
+
+改后效果：
+
+- 用户上传文件后，无论发送给总控还是 `@agent`，附件都会进入后端任务上下文和附件索引。
+- 工作流运行中可以用 `@knowledge/@plan` 等把文字或文件排队给指定模块，不再统一变成笼统的“修改建议”。
+- 不写 `@` 时默认交给总控回答；写了 `@agent` 时才进入定向模块反馈/排队逻辑。
+- 输入框里的 `@` 在视觉和路由上保持一致：点击候选后形成蓝色 token，发送前会从正文中剥离，不污染科学问题或反馈内容。
+
+已执行验证：
+
+- `npm run typecheck`
+- `python -m unittest discover -s backend/tests -v`
+- `python scripts\validate_agent_manifest.py`
+
+验证结果：
+
+- TypeScript 类型检查通过。
+- 后端 unittest 52 个全部通过。
+- Agent manifest 校验通过。
+
 ### 2026-07-22：运行中交互、@定向与知识整合阶段反馈修复
 
 本次修复针对第三次大优化后暴露出的三个前端交互回归：知识整合长时间无可见产出、输入框 `@agent` 定向能力不明显、运行中输入被一律当作“修改建议/排队指令”。

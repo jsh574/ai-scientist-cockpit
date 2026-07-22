@@ -2506,6 +2506,48 @@ textarea:disabled {
   color: #a0a7b1;
 }
 
+.composer-input-wrap {
+  position: relative;
+  min-height: 76px;
+}
+
+.composer-input-highlight {
+  position: absolute;
+  inset: 0;
+  min-height: 76px;
+  max-height: 180px;
+  overflow: hidden;
+  padding: 15px 16px 8px;
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.58;
+  pointer-events: none;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.composer-mention-token {
+  display: inline;
+  color: var(--blue);
+  background: color-mix(in srgb, var(--blue) 9%, var(--surface));
+  border-radius: 5px;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--blue) 9%, var(--surface));
+  font-weight: 820;
+}
+
+.composer textarea.rich-composer-textarea {
+  position: relative;
+  z-index: 1;
+  color: transparent;
+  caret-color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.composer textarea.rich-composer-textarea::placeholder {
+  color: #a0a7b1;
+  opacity: 1;
+}
+
 .message-status-group {
   display: inline-flex;
   align-items: center;
@@ -3740,6 +3782,64 @@ textarea:disabled {
   border-radius: 9px;
 }
 
+.node-insight-panel {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.node-insight-panel > div {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding: 10px;
+  background: var(--surface-subtle);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+
+.node-insight-panel strong {
+  font-size: 12px;
+}
+
+.node-insight-panel ul {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.node-insight-panel article {
+  display: grid;
+  grid-template-columns: minmax(92px, 0.45fr) minmax(0, 1fr) auto;
+  gap: 7px;
+  align-items: center;
+  min-width: 0;
+  padding: 6px 0;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+}
+
+.node-insight-panel article:first-of-type {
+  border-top: 0;
+}
+
+.node-insight-panel article span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-insight-panel article small {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
 .node-validation.invalid {
   border-left-color: var(--red);
 }
@@ -3865,6 +3965,12 @@ textarea:disabled {
   border-radius: 6px;
   font-size: 10px;
   font-weight: 780;
+}
+
+.attachment-citation-panel article > small {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
 }
 
 .attachment-citation-panel p {

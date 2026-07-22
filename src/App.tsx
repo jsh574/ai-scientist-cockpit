@@ -226,6 +226,19 @@ function pendingFileAttachments(files: File[], messageId: string): RemoteAttachm
   }));
 }
 
+function failedFileAttachments(files: File[], messageId: string): RemoteAttachment[] {
+  return pendingFileAttachments(files, messageId).map((attachment) => ({
+    ...attachment,
+    upload_status: "failed",
+    parse_status: "failed",
+  }));
+}
+
+function mergeRemoteAttachments(current: RemoteAttachment[], incoming: RemoteAttachment[]) {
+  const known = new Set(current.map((item) => item.attachment_id));
+  return [...current, ...incoming.filter((item) => !known.has(item.attachment_id))];
+}
+
 interface MessageIndexPreview {
   id: string;
   index: number;
@@ -302,10 +315,12 @@ const allComposerMentionAliases = [
   ...Object.values(stageMentionAliases).flat(),
 ].sort((left, right) => right.length - left.length);
 const activeComposerMentionPattern = /(^|\s)@([A-Za-z0-9_\-\u4e00-\u9fff]*)$/;
+const mentionTrailingBoundary = String.raw`(?=$|[\s,.;:!?，。；：！？、])`;
 
 function includesComposerMention(message: string, aliases: string[]) {
-  const lowered = message.toLowerCase();
-  return aliases.some((alias) => lowered.includes(alias.toLowerCase()));
+  return aliases.some((alias) =>
+    new RegExp(`(^|\\s)${escapeRegex(alias)}${mentionTrailingBoundary}`, "i").test(message),
+  );
 }
 
 function mentionsController(message: string) {
@@ -327,7 +342,9 @@ function escapeRegex(value: string) {
 
 function stripComposerMentions(message: string) {
   return allComposerMentionAliases
-    .reduce((current, alias) => current.replace(new RegExp(escapeRegex(alias), "gi"), " "), message)
+    .reduce((current, alias) =>
+      current.replace(new RegExp(`(^|\\s)${escapeRegex(alias)}${mentionTrailingBoundary}`, "gi"), " "),
+    message)
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -335,6 +352,24 @@ function stripComposerMentions(message: string) {
 function getActiveComposerMentionQuery(message: string) {
   const match = message.match(activeComposerMentionPattern);
   return match ? match[2].toLowerCase() : null;
+}
+
+function renderComposerDraftHighlight(message: string): ReactNode[] {
+  if (!message) return [];
+  const aliases = allComposerMentionAliases.map(escapeRegex).join("|");
+  if (!aliases) return [message];
+  const pattern = new RegExp(`(^|\\s)(${aliases})${mentionTrailingBoundary}`, "gi");
+  const nodes: ReactNode[] = [];
+  let lastIndex = 0;
+  message.replace(pattern, (match, prefix: string, token: string, offset: number) => {
+    if (offset > lastIndex) nodes.push(message.slice(lastIndex, offset));
+    if (prefix) nodes.push(prefix);
+    nodes.push(<span className="composer-mention-token" key={`${token}-${offset}`}>{token}</span>);
+    lastIndex = offset + match.length;
+    return match;
+  });
+  if (lastIndex < message.length) nodes.push(message.slice(lastIndex));
+  return nodes;
 }
 
 function nodeEventSummary(event: EventLog, language: Language) {
@@ -462,6 +497,7 @@ function mergeKnowledgePartialPayload(
   if (typeof event.data?.progress === "number") next._progress = event.data.progress;
   if (payload && typeof payload === "object") {
     Object.assign(next, payload);
+    if (typeof payload.phase_id === "string") next._active_phase = payload.phase_id;
   }
   return next;
 }
@@ -1203,6 +1239,7 @@ function App() {
   const [streamConnected, setStreamConnected] = useState(false);
   const threadAreaRef = useRef<HTMLElement | null>(null);
   const threadEndRef = useRef<HTMLDivElement | null>(null);
+  const composerHighlightRef = useRef<HTMLDivElement | null>(null);
   const taskIdRef = useRef(context.task_id);
   const activeProjectIdRef = useRef(activeProjectId);
   const runsByTaskRef = useRef<Record<string, WorkflowRun | null>>({});
@@ -1238,11 +1275,11 @@ function App() {
   );
   const progress = Math.round((completedCount / stages.length) * 100);
   const currentStageLabel = finished ? statusLabel[language].completed : stageLabel[language][activeStage];
-  const uploadedLabel = [...attachments.map((item) => item.name), ...files.map((file) => file.name)].join(", ") || t.noFiles;
+  const pendingFilesLabel = files.map((file) => file.name).join(", ") || t.noFiles;
   const composerCleanDraft = stripComposerMentions(questionDraft);
   const composerCanSubmit = hasSubmittedQuestion
     ? Boolean(composerCleanDraft || files.length)
-    : Boolean(questionDraft.trim());
+    : Boolean(composerCleanDraft || files.length);
   const composerMentionsController = mentionsController(questionDraft);
   const composerMentionsStage = mentionsStage(questionDraft);
   const composerTargetStage = mentionedStage(questionDraft, feedbackTarget);
@@ -1253,7 +1290,7 @@ function App() {
       : "";
   const composerMentionQuery = getActiveComposerMentionQuery(questionDraft);
   const composerMentionOptions = useMemo<ComposerMentionOption[]>(() => {
-    if (composerMentionQuery === null || !hasSubmittedQuestion) return [];
+    if (composerMentionQuery === null) return [];
     const options: ComposerMentionOption[] = [
       {
         token: "@controller",
@@ -1278,8 +1315,8 @@ function App() {
         || option.label.toLowerCase().includes(query)
         || option.aliases.some((alias) => alias.toLowerCase().includes(query)))
       .slice(0, 7);
-  }, [composerMentionQuery, hasSubmittedQuestion, language]);
-  const showComposerTargetControls = hasSubmittedQuestion && !running && !iterationEnded;
+  }, [composerMentionQuery, language]);
+  const showComposerTargetControls = false;
   const showComposerRunHint = false;
   const composerSendTitle = running
     ? composerCanSubmit
@@ -1643,6 +1680,26 @@ function App() {
   const patchMessage = useCallback((id: string, patch: Partial<ThreadMessage>) => {
     setMessages((current) => current.map((message) => (message.id === id ? { ...message, ...patch } : message)));
   }, []);
+
+  const uploadPendingFilesForMessage = useCallback(
+    async (taskId: string, selectedFiles: File[], messageId: string) => {
+      if (!selectedFiles.length) return null;
+      const uploaded = await uploadTaskAttachments(taskId, selectedFiles, messageId);
+      setAttachments((current) => mergeRemoteAttachments(current, uploaded.attachments));
+      patchMessage(messageId, { attachments: uploaded.attachments });
+      setFiles((current) => current.filter((file) => !selectedFiles.includes(file)));
+      return uploaded.task_context;
+    },
+    [patchMessage],
+  );
+
+  const markMessageAttachmentUploadFailed = useCallback(
+    (messageId: string, selectedFiles: File[]) => {
+      if (!selectedFiles.length) return;
+      patchMessage(messageId, { attachments: failedFileAttachments(selectedFiles, messageId) });
+    },
+    [patchMessage],
+  );
 
   const beginMessageAction = useCallback((id: string) => {
     if (pendingActionIdsRef.current.has(id)) return false;
@@ -2114,10 +2171,15 @@ function App() {
   );
 
   const startDemo = useCallback(async () => {
-    const question = questionDraft.trim();
+    const selectedFiles = [...files];
+    const typedQuestion = stripComposerMentions(questionDraft.trim());
+    const question = typedQuestion || (selectedFiles.length
+      ? language === "zh"
+        ? "请基于我上传的附件，提炼研究问题并启动 AI Scientist 协作流程。"
+        : "Use the uploaded attachments to extract the research question and start the AI Scientist workflow."
+      : "");
     if (running || !question) return;
 
-    const selectedFiles = [...files];
     const userMessageId = makeMessageId("user");
     const localTask = buildFreshTask(question);
     setRunning(true);
@@ -2164,22 +2226,12 @@ function App() {
 
     if (selectedFiles.length) {
       try {
-        const uploaded = await uploadTaskAttachments(fresh.task_id, selectedFiles, userMessageId);
-        fresh = uploaded.task_context;
+        fresh = await uploadPendingFilesForMessage(fresh.task_id, selectedFiles, userMessageId) ?? fresh;
         setContext(fresh);
-        setAttachments((current) => [...current, ...uploaded.attachments]);
-        patchMessage(userMessageId, { attachments: uploaded.attachments });
-        setFiles([]);
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         setRuntimeError(detail);
-        patchMessage(userMessageId, {
-          attachments: pendingFileAttachments(selectedFiles, userMessageId).map((attachment) => ({
-            ...attachment,
-            upload_status: "failed",
-            parse_status: "failed",
-          })),
-        });
+        markMessageAttachmentUploadFailed(userMessageId, selectedFiles);
         pushMessage({
           kind: "controller",
           body: language === "zh"
@@ -2211,7 +2263,7 @@ function App() {
         status: "failed",
       });
     }
-  }, [appendEvent, approval, buildFreshTask, continueFrom, files, language, memory, monitorWorkflowRun, patchMessage, pushMessage, questionDraft, reasoning, running, t.controllerStarted]);
+  }, [appendEvent, approval, buildFreshTask, continueFrom, files, language, markMessageAttachmentUploadFailed, memory, monitorWorkflowRun, pushMessage, questionDraft, reasoning, running, t.controllerStarted, uploadPendingFilesForMessage]);
 
   const approveReview = useCallback(async (stageOverride?: StageId, sourceMessageId?: string) => {
     const stage = stageOverride ?? reviewStage;
@@ -2429,14 +2481,12 @@ function App() {
       attachments: pendingFileAttachments(selectedFiles, userMessageId),
     });
     let rerunContext = context;
+    let uploadedOk = false;
     try {
       if (selectedFiles.length) {
-        const uploaded = await uploadTaskAttachments(context.task_id, selectedFiles, userMessageId);
-        rerunContext = uploaded.task_context;
-        setAttachments((current) => [...current, ...uploaded.attachments]);
-        patchMessage(userMessageId, { attachments: uploaded.attachments });
-        setFiles([]);
+        rerunContext = await uploadPendingFilesForMessage(context.task_id, selectedFiles, userMessageId) ?? rerunContext;
       }
+      uploadedOk = true;
       rerunContext = (await recordFeedback(context.task_id, targetStage, note, {
         mode: runMode,
         reasoningLevel: reasoning,
@@ -2445,15 +2495,7 @@ function App() {
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       setRuntimeError(detail);
-      if (selectedFiles.length) {
-        patchMessage(userMessageId, {
-          attachments: pendingFileAttachments(selectedFiles, userMessageId).map((attachment) => ({
-            ...attachment,
-            upload_status: "failed",
-            parse_status: "failed",
-          })),
-        });
-      }
+      if (!uploadedOk) markMessageAttachmentUploadFailed(userMessageId, selectedFiles);
       pushMessage({
         kind: "controller",
         body: language === "zh" ? `反馈保存失败：${detail}` : `Feedback failed: ${detail}`,
@@ -2490,33 +2532,50 @@ function App() {
     hasSubmittedQuestion,
     files,
     language,
+    markMessageAttachmentUploadFailed,
     memory,
     monitorWorkflowRun,
-    patchMessage,
     pushMessage,
     questionDraft,
     reasoning,
     runMode,
     running,
+    uploadPendingFilesForMessage,
   ]);
 
   const submitRunInstruction = useCallback(async () => {
-    const comment = stripComposerMentions(questionDraft.trim());
-    if (!activeRun || !comment) return;
+    const typedComment = stripComposerMentions(questionDraft.trim());
+    if (!activeRun || (!typedComment && !files.length)) return;
+    const selectedFiles = [...files];
+    const userMessageId = makeMessageId("user");
+    const targetStage = mentionedStage(questionDraft, feedbackTarget);
+    const comment = typedComment || (language === "zh"
+      ? "请结合本次新增附件，在下一个安全节点边界重新检查该模块。"
+      : "Use the newly attached files to re-check this module at the next safe node boundary.");
+    let uploadedOk = false;
+    pushMessage({
+      id: userMessageId,
+      kind: "user",
+      title: language === "zh" ? `给${stageLabel.zh[targetStage]}的运行指令` : `Instruction for ${stageLabel.en[targetStage]}`,
+      body: comment,
+      stage: targetStage,
+      attachments: pendingFileAttachments(selectedFiles, userMessageId),
+    });
     try {
-      const targetStage = mentionedStage(questionDraft, feedbackTarget);
+      if (selectedFiles.length) {
+        const updatedContext = await uploadPendingFilesForMessage(activeRun.task_id, selectedFiles, userMessageId);
+        if (updatedContext) {
+          setContext(updatedContext);
+          setVersions(updatedContext.versions);
+        }
+      }
+      uploadedOk = true;
       const updated = await queueRunInstruction(
         activeRun.run_id,
         comment,
         targetStage,
       );
       trackWorkflowRun(updated.task_id, updated);
-      pushMessage({
-        kind: "user",
-        title: language === "zh" ? `给${stageLabel.zh[targetStage]}的运行指令` : `Instruction for ${stageLabel.en[targetStage]}`,
-        body: comment,
-        stage: targetStage,
-      });
       pushMessage({
         kind: "controller",
         body: language === "zh"
@@ -2526,9 +2585,26 @@ function App() {
       });
       setQuestionDraft("");
     } catch (error) {
-      setRuntimeError(error instanceof Error ? error.message : String(error));
+      const detail = error instanceof Error ? error.message : String(error);
+      setRuntimeError(detail);
+      if (!uploadedOk) markMessageAttachmentUploadFailed(userMessageId, selectedFiles);
+      pushMessage({
+        kind: "controller",
+        body: language === "zh" ? `运行指令提交失败：${detail}` : `Instruction failed: ${detail}`,
+        status: "failed",
+      });
     }
-  }, [activeRun, feedbackTarget, language, pushMessage, questionDraft, trackWorkflowRun]);
+  }, [
+    activeRun,
+    feedbackTarget,
+    files,
+    language,
+    markMessageAttachmentUploadFailed,
+    pushMessage,
+    questionDraft,
+    trackWorkflowRun,
+    uploadPendingFilesForMessage,
+  ]);
 
   const continueIteration = useCallback(async () => {
     const controllerSuggestion = controllerFinalReview?.suggestions?.join("\n").trim();
@@ -2593,27 +2669,59 @@ function App() {
   }, [context, iterationBusy, language, pushMessage, running]);
 
   const submitControllerQuestion = useCallback(async () => {
-    const question = stripComposerMentions(questionDraft.trim());
-    if (!question) return;
-    setQuestionDraft("");
+    const typedQuestion = stripComposerMentions(questionDraft.trim());
+    if (!typedQuestion && !files.length) return;
+    const selectedFiles = [...files];
+    const userMessageId = makeMessageId("user");
+    const question = typedQuestion || (language === "zh"
+      ? "我上传了新的附件，请先阅读并告诉我这些材料会如何影响当前项目。"
+      : "I uploaded new attachments. Review them and tell me how they affect the current project.");
     setRuntimeError("");
     pushMessage({
+      id: userMessageId,
       kind: "user",
       title: language === "zh" ? "向总控提问" : "Controller question",
       body: question,
+      attachments: pendingFileAttachments(selectedFiles, userMessageId),
     });
+    let uploadedOk = false;
     try {
+      if (selectedFiles.length) {
+        const updatedContext = await uploadPendingFilesForMessage(context.task_id, selectedFiles, userMessageId);
+        if (updatedContext) {
+          setContext(updatedContext);
+          setVersions(updatedContext.versions);
+        }
+      }
+      uploadedOk = true;
       const result = await routeControllerMessage(context.task_id, question, false);
       setContext(result.task_context);
+      setVersions(result.task_context.versions);
       pushMessage({
         kind: "controller",
         body: result.route.answer || result.route.reason,
         status: "passed",
       });
+      setQuestionDraft("");
     } catch (error) {
-      setRuntimeError(error instanceof Error ? error.message : String(error));
+      const detail = error instanceof Error ? error.message : String(error);
+      setRuntimeError(detail);
+      if (!uploadedOk) markMessageAttachmentUploadFailed(userMessageId, selectedFiles);
+      pushMessage({
+        kind: "controller",
+        body: language === "zh" ? `总控处理失败：${detail}` : `Controller failed: ${detail}`,
+        status: "failed",
+      });
     }
-  }, [context.task_id, language, pushMessage, questionDraft]);
+  }, [
+    context.task_id,
+    files,
+    language,
+    markMessageAttachmentUploadFailed,
+    pushMessage,
+    questionDraft,
+    uploadPendingFilesForMessage,
+  ]);
 
   const submitComposer = useCallback(() => {
     if (running && activeRun) {
@@ -3015,31 +3123,43 @@ function App() {
                     ))}
                   </div>
                 ) : null}
-                <textarea
-                  aria-label={!hasSubmittedQuestion ? t.questionPlaceholder : language === "zh" ? "输入修改意见" : "Enter revision feedback"}
-                  disabled={context.current_stage === "human_review" || iterationReviewReady}
-                  onChange={(event) => setQuestionDraft(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" && !event.shiftKey) {
-                      event.preventDefault();
-                      submitComposer();
-                    }
-                  }}
-                  placeholder={!hasSubmittedQuestion
-                    ? t.questionPlaceholder
-                    : iterationEnded
-                      ? language === "zh"
-                        ? "询问总控：假设依据、证据关系、计划细节或最终结论"
-                        : "Ask about hypotheses, evidence, plan details, or conclusions"
-                      : iterationReviewReady
+                <div className="composer-input-wrap">
+                  <div aria-hidden="true" className="composer-input-highlight" ref={composerHighlightRef}>
+                    {questionDraft ? renderComposerDraftHighlight(questionDraft) : null}
+                  </div>
+                  <textarea
+                    aria-label={!hasSubmittedQuestion ? t.questionPlaceholder : language === "zh" ? "输入修改意见" : "Enter revision feedback"}
+                    className="rich-composer-textarea"
+                    disabled={context.current_stage === "human_review" || iterationReviewReady}
+                    spellCheck={false}
+                    onChange={(event) => setQuestionDraft(event.target.value)}
+                    onScroll={(event) => {
+                      if (composerHighlightRef.current) {
+                        composerHighlightRef.current.scrollTop = event.currentTarget.scrollTop;
+                      }
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && !event.shiftKey) {
+                        event.preventDefault();
+                        submitComposer();
+                      }
+                    }}
+                    placeholder={!hasSubmittedQuestion
+                      ? t.questionPlaceholder
+                      : iterationEnded
                         ? language === "zh"
-                          ? "请先在上方总控评价卡片选择继续迭代或结束迭代"
-                          : "Choose continue or end iteration in the controller review card"
-                        : language === "zh"
-                          ? "说明希望如何改进当前项目"
-                          : "Describe how this project should be improved"}
-                  value={questionDraft}
-                />
+                          ? "询问总控：假设依据、证据关系、计划细节或最终结论"
+                          : "Ask about hypotheses, evidence, plan details, or conclusions"
+                        : iterationReviewReady
+                          ? language === "zh"
+                            ? "请先在上方总控评价卡片选择继续迭代或结束迭代"
+                            : "Choose continue or end iteration in the controller review card"
+                          : language === "zh"
+                            ? "说明希望如何改进当前项目，输入 @ 可定向到总控或 Agent"
+                            : "Describe improvements, or type @ to target the controller or an Agent"}
+                    value={questionDraft}
+                  />
+                </div>
                 <div className="composer-footer">
                   <label className="attach-button">
                     <input
@@ -3055,9 +3175,9 @@ function App() {
                     <span className="tooltip">{t.addFile}</span>
                   </label>
 
-                  <span className="file-hint" title={uploadedLabel}>
+                  <span className="file-hint" title={pendingFilesLabel}>
                     <Paperclip size={14} />
-                    {uploadedLabel}
+                    {pendingFilesLabel}
                   </span>
 
                   <ControllerSettings
@@ -3377,7 +3497,7 @@ function SystemPage({
 
       <ControllerConsole context={context} language={language} onWorkflowRun={onWorkflowRun} />
 
-      <NodeDebugger context={context} language={language} onOpenJson={onOpenJson} onWorkflowRun={onWorkflowRun} />
+      <NodeDebugger context={context} events={events} language={language} onOpenJson={onOpenJson} onWorkflowRun={onWorkflowRun} />
 
       <div className="runtime-metrics">
         <StatusMetric label={zh ? "当前阶段" : "Current stage"} value={context.current_stage} />
@@ -3602,9 +3722,14 @@ interface AttachmentChunkCitation {
   file_id?: string;
   file_type?: string;
   name?: string;
+  page?: number;
   parsed_path?: string;
   score?: number;
+  section?: string;
+  source_path?: string;
+  source_type?: string;
   stage?: string;
+  table_index?: number;
   text?: string;
 }
 
@@ -3628,9 +3753,14 @@ function attachmentChunksFromInput(input: Record<string, unknown> | null | undef
       file_id: stringOrUndefined(chunk.file_id),
       file_type: stringOrUndefined(chunk.file_type),
       name: stringOrUndefined(chunk.name),
+      page: typeof chunk.page === "number" ? chunk.page : undefined,
       parsed_path: stringOrUndefined(chunk.parsed_path),
       score: typeof chunk.score === "number" ? chunk.score : undefined,
+      section: stringOrUndefined(chunk.section),
+      source_path: stringOrUndefined(chunk.source_path),
+      source_type: stringOrUndefined(chunk.source_type),
       stage: stringOrUndefined(chunk.stage),
+      table_index: typeof chunk.table_index === "number" ? chunk.table_index : undefined,
       text: stringOrUndefined(chunk.text),
     }));
 }
@@ -3642,14 +3772,24 @@ function stringOrUndefined(value: unknown) {
 function AttachmentCitationList({
   chunks,
   language,
+  onError,
   onOpenJson,
+  taskId,
 }: {
   chunks: AttachmentChunkCitation[];
   language: Language;
+  onError: (error: string) => void;
   onOpenJson: (title: string, data: unknown) => void;
+  taskId: string;
 }) {
   if (!chunks.length) return null;
   const zh = language === "zh";
+  const openParsedChunk = (chunk: AttachmentChunkCitation, citationId: string) => {
+    if (!chunk.parsed_path) return;
+    void fetchArtifactJson(taskId, chunk.parsed_path)
+      .then((parsed) => onOpenJson(`${citationId} parsed source`, { citation: chunk, parsed }))
+      .catch((error) => onError(error instanceof Error ? error.message : String(error)));
+  };
   return (
     <section className="attachment-citation-panel">
       <div>
@@ -3664,10 +3804,18 @@ function AttachmentCitationList({
               <code>{citationId}</code>
               <span>{chunk.name ?? "--"}{chunk.file_type ? ` · ${chunk.file_type}` : ""}</span>
               {typeof chunk.score === "number" ? <b>{chunk.score.toFixed(3)}</b> : null}
+              {chunk.parsed_path ? (
+                <button type="button" onClick={() => openParsedChunk(chunk, citationId)}>
+                  {zh ? "定位" : "Source"}
+                </button>
+              ) : null}
               <button type="button" onClick={() => onOpenJson(`${citationId} chunk`, chunk)}>
                 JSON
               </button>
             </header>
+            <small>
+              {[chunk.source_type, chunk.source_path, chunk.page ? `p.${chunk.page}` : "", chunk.section, typeof chunk.table_index === "number" ? `table ${chunk.table_index}` : ""].filter(Boolean).join(" · ") || (zh ? "无解析定位" : "No parsed location")}
+            </small>
             <p>{trimPreview(chunk.text, 260)}</p>
           </article>
         );
@@ -3678,11 +3826,13 @@ function AttachmentCitationList({
 
 function NodeDebugger({
   context,
+  events,
   language,
   onOpenJson,
   onWorkflowRun,
 }: {
   context: TaskContext;
+  events: EventLog[];
   language: Language;
   onOpenJson: (title: string, data: unknown) => void;
   onWorkflowRun: (run: WorkflowRun) => void;
@@ -3780,6 +3930,43 @@ function NodeDebugger({
     }
   };
   const attachmentChunks = attachmentChunksFromInput(detail?.input);
+  const nodeEvents = useMemo(() => {
+    const phaseAliases: Record<StageId, string[]> = {
+      question_understanding: ["question_understanding"],
+      knowledge_integration: [
+        "knowledge_integration",
+        "query_planning",
+        "source_search",
+        "source_verify",
+        "relevance_filter",
+        "literature_extract",
+        "evidence_extract",
+        "gap_synthesis",
+        "quality_review",
+        "literature_search",
+        "evidence_integration",
+        "knowledge_gap_synthesis",
+      ],
+      hypothesis_generation: ["hypothesis_generation"],
+      evidence_mapping: ["evidence_mapping"],
+      research_planning: ["research_planning"],
+      final_review: ["final_review"],
+    };
+    const aliases = new Set(phaseAliases[nodeId]);
+    return events
+      .filter((event) =>
+        event.stage === nodeId
+        || aliases.has(String(event.data?.node_id ?? "").split(":", 1)[0])
+        || aliases.has(String(event.data?.payload?.phase_id ?? "")))
+      .slice(0, 12);
+  }, [events, nodeId]);
+  const diagnosisItems = [
+    ...(detail?.output?.self_review.issues ?? []),
+    ...(detail?.review?.issues ?? []),
+    ...nodeEvents
+      .filter((event) => ["stage_preflight_blocked", "node_failed", "node_revision_required"].includes(event.type))
+      .map((event) => event.message),
+  ].filter(Boolean).slice(0, 8);
 
   return (
     <section className="runtime-section node-debugger">
@@ -3807,6 +3994,30 @@ function NodeDebugger({
           <p>{validation.missing_fields.length ? `${zh ? "缺少" : "Missing"}: ${validation.missing_fields.join(", ")}` : (zh ? "所有声明字段均可读取。" : "All declared inputs are readable.")}</p>
           <small>{zh ? "重跑将影响" : "A rerun would affect"}: {validation.would_invalidate.join(", ")}</small>
         </div>
+      ) : null}
+      {diagnosisItems.length || nodeEvents.length ? (
+        <section className="node-insight-panel">
+          {diagnosisItems.length ? (
+            <div>
+              <strong>{zh ? "阻断/风险解释" : "Blockers and risks"}</strong>
+              <ul>
+                {diagnosisItems.map((item, index) => <li key={`${item}-${index}`}>{item}</li>)}
+              </ul>
+            </div>
+          ) : null}
+          {nodeEvents.length ? (
+            <div>
+              <strong>{zh ? "相关事件" : "Related events"}</strong>
+              {nodeEvents.map((event) => (
+                <article key={eventKey(event)}>
+                  <code>{event.data?.payload?.phase_id ? String(event.data.payload.phase_id) : event.data?.node_id ?? event.type}</code>
+                  <span>{event.message}</span>
+                  <small>{event.type} · {new Date(event.created_at).toLocaleTimeString()}</small>
+                </article>
+              ))}
+            </div>
+          ) : null}
+        </section>
       ) : null}
       <div className="node-operator-console">
         <div>
@@ -3842,7 +4053,13 @@ function NodeDebugger({
           {detail ? (
             <>
               <div><strong>{detail.metadata.status}</strong><span>{detail.metadata.workflow_run_id || "standalone"}</span></div>
-              <AttachmentCitationList chunks={attachmentChunks} language={language} onOpenJson={onOpenJson} />
+              <AttachmentCitationList
+                chunks={attachmentChunks}
+                language={language}
+                onError={setError}
+                onOpenJson={onOpenJson}
+                taskId={context.task_id}
+              />
               <details open><summary>Input</summary><pre>{JSON.stringify(detail.input, null, 2)}</pre></details>
               <details><summary>Output</summary><pre>{JSON.stringify(detail.output, null, 2)}</pre></details>
               <details><summary>Review</summary><pre>{JSON.stringify(detail.review, null, 2)}</pre></details>
@@ -4618,11 +4835,16 @@ function KnowledgeIntegrationOutput({
   const gaps = arrayValue(payload.knowledge_gaps);
   const retrievedSources = arrayValue(payload.retrieved_sources);
   const activeNode = stringValue(payload._active_node);
-  const activePhase = activeNode === "evidence_extract"
+  const standardPhase = stringValue(payload._active_phase) || stringValue(payload.phase_id);
+  const activePhase = standardPhase === "evidence_integration"
     ? "evidence"
-    : activeNode === "gap_synthesis" || activeNode === "quality_review"
+    : standardPhase === "knowledge_gap_synthesis"
       ? "gaps"
-      : "literature";
+      : activeNode === "evidence_extract"
+        ? "evidence"
+        : activeNode === "gap_synthesis" || activeNode === "quality_review"
+          ? "gaps"
+          : "literature";
   const literatureProgressCount = literature.length
     || retrievedSources.length
     || numberValue(payload.relevant_sources)
