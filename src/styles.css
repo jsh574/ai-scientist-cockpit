@@ -2073,6 +2073,26 @@ textarea:disabled {
   color: var(--green);
 }
 
+.knowledge-phase.active {
+  border-color: color-mix(in srgb, var(--blue) 36%, var(--line));
+  background: color-mix(in srgb, var(--blue) 7%, var(--surface));
+}
+
+.knowledge-phase.active > i,
+.knowledge-phase.active svg,
+.knowledge-phase.active > b {
+  color: var(--blue);
+}
+
+.knowledge-phase.pending {
+  opacity: 0.72;
+}
+
+.knowledge-phase.pending > b,
+.knowledge-phase.pending svg {
+  color: var(--muted);
+}
+
 .knowledge-phase.empty {
   border-color: color-mix(in srgb, var(--red) 24%, var(--line));
 }
@@ -2108,6 +2128,17 @@ textarea:disabled {
 .knowledge-section {
   display: grid;
   gap: 8px;
+}
+
+.knowledge-progress-note {
+  margin: 0;
+  padding: 9px 10px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--blue) 5%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--blue) 18%, var(--line));
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.55;
 }
 
 .knowledge-section > header {
@@ -2501,32 +2532,159 @@ textarea:disabled {
   color: #9a6200;
 }
 
-.feedback-target {
+.mention-strip {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 8px 10px 6px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--line);
+}
+
+.mention-strip button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  min-height: 30px;
+  gap: 4px;
+  padding: 0 9px;
+  color: var(--muted);
+  background: var(--surface-subtle);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 760;
+  white-space: nowrap;
+}
+
+.mention-strip button {
+  cursor: pointer;
+}
+
+.mention-strip button:hover:not(:disabled),
+.mention-strip button.active {
+  color: var(--text);
+  background: color-mix(in srgb, var(--blue) 9%, var(--surface));
+  border-color: color-mix(in srgb, var(--blue) 42%, var(--line));
+}
+
+.mention-strip button.controller.active {
+  color: var(--blue);
+}
+
+.mention-strip button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.composer-run-hint {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  min-height: 38px;
-  padding: 7px 10px 0 16px;
+  min-height: 34px;
+  gap: 8px;
+  padding: 7px 12px;
   color: var(--muted);
+  background: color-mix(in srgb, var(--surface-subtle) 74%, transparent);
   border-bottom: 1px solid var(--line);
-  font-size: 12px;
+  font-size: 11px;
+  font-weight: 720;
 }
 
-.feedback-target select {
-  max-width: min(260px, 58%);
-  height: 30px;
-  padding: 0 28px 0 9px;
+.composer-run-hint b {
+  flex: 0 0 auto;
+  padding: 3px 7px;
+  color: var(--blue);
+  background: color-mix(in srgb, var(--blue) 8%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--blue) 30%, var(--line));
+  border-radius: 999px;
+  font-size: 10px;
+}
+
+.composer-selected-target {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  max-width: calc(100% - 20px);
+  gap: 5px;
+  margin: 8px 10px 0;
+  padding: 4px 8px;
+  color: var(--blue);
+  background: color-mix(in srgb, var(--blue) 8%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--blue) 30%, var(--line));
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.composer-selected-target span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mention-suggestions {
+  display: grid;
+  gap: 4px;
+  margin: 8px 10px 0;
+  padding: 5px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow-soft);
+}
+
+.mention-suggestions button {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-height: 38px;
+  padding: 6px 8px;
   color: var(--text);
-  background: var(--control-bg);
-  border: 1px solid transparent;
+  background: transparent;
+  border: 0;
   border-radius: 6px;
-  outline: none;
+  text-align: left;
+  cursor: pointer;
+}
+
+.mention-suggestions button:hover {
+  background: color-mix(in srgb, var(--blue) 7%, var(--surface));
+}
+
+.mention-suggestions button.controller svg,
+.mention-suggestions button.controller code {
+  color: var(--blue);
+}
+
+.mention-suggestions span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.mention-suggestions strong,
+.mention-suggestions small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mention-suggestions strong {
   font-size: 12px;
 }
 
-.feedback-target select:focus {
-  border-color: rgba(35, 104, 216, 0.42);
+.mention-suggestions small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.mention-suggestions code {
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .composer-footer {
@@ -3781,9 +3939,34 @@ textarea:disabled {
   grid-template-columns: 18px minmax(0, 1fr) 72px;
 }
 
+.attachment-runtime-table .runtime-row {
+  grid-template-columns: 18px minmax(0, 1fr) minmax(132px, auto) 34px;
+}
+
 .artifact-runtime-table .runtime-row > span {
   color: var(--muted);
   text-align: right;
+}
+
+.icon-row-button {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  color: var(--text);
+  background: var(--surface-subtle);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+
+.icon-row-button:hover:not(:disabled) {
+  color: var(--blue);
+  border-color: color-mix(in srgb, var(--blue) 36%, var(--line));
+}
+
+.icon-row-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
 }
 
 .api-runtime-table .runtime-row {

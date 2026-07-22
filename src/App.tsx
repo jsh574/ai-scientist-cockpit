@@ -11,6 +11,7 @@ import {
   Activity,
   Archive,
   ArrowDown,
+  AtSign,
   Brain,
   Check,
   CheckCircle2,
@@ -50,6 +51,7 @@ import {
   evaluateResearchPlan,
   executeNode,
   exportTaskBundle,
+  fetchArtifactJson,
   finishTaskIteration,
   fetchArtifacts,
   fetchHealthStatus,
@@ -183,11 +185,13 @@ interface ThreadMessage {
   id: string;
   kind: MessageKind;
   stage?: StageId;
+  title?: string;
   body?: string;
   attachments?: RemoteAttachment[];
   activity?: string;
   activityNode?: string;
   activityProgress?: number;
+  partialPayload?: Record<string, unknown>;
   workflowRunId?: string;
   iteration?: number;
   response?: AgentResponse | null;
@@ -237,6 +241,15 @@ interface PickerOption<T extends string> {
   description?: string;
 }
 
+interface ComposerMentionOption {
+  token: string;
+  label: string;
+  description: string;
+  stage?: StageId;
+  controller?: boolean;
+  aliases: string[];
+}
+
 interface ProjectSession {
   id: string;
   title: string;
@@ -267,15 +280,61 @@ const eventKey = (event: EventLog) => {
   return runId && sequence ? `${runId}:${sequence}` : event.event_id;
 };
 
-function mentionedStage(message: string, fallback: StageId): StageId {
+const controllerMentionAliases = ["@controller", "@control", "@orchestrator", "@总控", "@控制器"];
+const stageMentionAliases: Record<StageId, string[]> = {
+  question_understanding: ["@question", "@understanding", "@question_understanding", "@问题理解", "@理解"],
+  knowledge_integration: ["@knowledge", "@knowledge_integration", "@literature", "@文献", "@知识整合"],
+  hypothesis_generation: ["@hypothesis", "@hypothesis_generation", "@假设", "@假设生成"],
+  evidence_mapping: ["@evidence", "@evidence_mapping", "@证据", "@证据梳理"],
+  research_planning: ["@plan", "@planning", "@research_planning", "@计划", "@研究计划"],
+  final_review: ["@final", "@review", "@final_review", "@总评", "@最终输出"],
+};
+const stageMentionTokens: Record<StageId, string> = {
+  question_understanding: "@question",
+  knowledge_integration: "@knowledge",
+  hypothesis_generation: "@hypothesis",
+  evidence_mapping: "@evidence",
+  research_planning: "@plan",
+  final_review: "@final",
+};
+const allComposerMentionAliases = [
+  ...controllerMentionAliases,
+  ...Object.values(stageMentionAliases).flat(),
+].sort((left, right) => right.length - left.length);
+const activeComposerMentionPattern = /(^|\s)@([A-Za-z0-9_\-\u4e00-\u9fff]*)$/;
+
+function includesComposerMention(message: string, aliases: string[]) {
   const lowered = message.toLowerCase();
-  const targets: Array<[string, StageId]> = [
-    ["@knowledge", "knowledge_integration"],
-    ["@hypothesis", "hypothesis_generation"],
-    ["@evidence", "evidence_mapping"],
-    ["@planning", "research_planning"],
-  ];
-  return targets.find(([mention]) => lowered.includes(mention))?.[1] ?? fallback;
+  return aliases.some((alias) => lowered.includes(alias.toLowerCase()));
+}
+
+function mentionsController(message: string) {
+  return includesComposerMention(message, controllerMentionAliases);
+}
+
+function mentionsStage(message: string) {
+  return stageOrder.some((stage) => includesComposerMention(message, stageMentionAliases[stage]));
+}
+
+function mentionedStage(message: string, fallback: StageId): StageId {
+  const match = stageOrder.find((stage) => includesComposerMention(message, stageMentionAliases[stage]));
+  return match ?? fallback;
+}
+
+function escapeRegex(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stripComposerMentions(message: string) {
+  return allComposerMentionAliases
+    .reduce((current, alias) => current.replace(new RegExp(escapeRegex(alias), "gi"), " "), message)
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getActiveComposerMentionQuery(message: string) {
+  const match = message.match(activeComposerMentionPattern);
+  return match ? match[2].toLowerCase() : null;
 }
 
 function nodeEventSummary(event: EventLog, language: Language) {
@@ -390,6 +449,23 @@ function upsertStageMessage(
   return next;
 }
 
+function mergeKnowledgePartialPayload(
+  existing: Record<string, unknown> | undefined,
+  event: EventLog,
+) {
+  if (event.stage !== "knowledge_integration") return existing;
+  const next: Record<string, unknown> = { ...(existing ?? {}) };
+  const nodeId = event.data?.node_id;
+  const payload = event.data?.payload;
+  if (nodeId) next._active_node = nodeId;
+  if (typeof event.data?.kind === "string") next._event_kind = event.data.kind;
+  if (typeof event.data?.progress === "number") next._progress = event.data.progress;
+  if (payload && typeof payload === "object") {
+    Object.assign(next, payload);
+  }
+  return next;
+}
+
 function applyWorkflowEventToMessages(
   current: ThreadMessage[],
   event: EventLog,
@@ -431,6 +507,7 @@ function applyWorkflowEventToMessages(
     activity: getWorkflowActivity(event, language),
     activityNode: getNodeActivityLabel(event, language),
     activityProgress: typeof event.data?.progress === "number" ? event.data.progress : existing?.activityProgress,
+    partialPayload: mergeKnowledgePartialPayload(sameRun ? existing?.partialPayload : undefined, event),
     workflowRunId: runId,
     durationMs,
   };
@@ -1162,9 +1239,59 @@ function App() {
   const progress = Math.round((completedCount / stages.length) * 100);
   const currentStageLabel = finished ? statusLabel[language].completed : stageLabel[language][activeStage];
   const uploadedLabel = [...attachments.map((item) => item.name), ...files.map((file) => file.name)].join(", ") || t.noFiles;
+  const composerCleanDraft = stripComposerMentions(questionDraft);
   const composerCanSubmit = hasSubmittedQuestion
-    ? Boolean(questionDraft.trim() || files.length)
+    ? Boolean(composerCleanDraft || files.length)
     : Boolean(questionDraft.trim());
+  const composerMentionsController = mentionsController(questionDraft);
+  const composerMentionsStage = mentionsStage(questionDraft);
+  const composerTargetStage = mentionedStage(questionDraft, feedbackTarget);
+  const composerRouteLabel = composerMentionsController
+    ? (language === "zh" ? "总控" : "Controller")
+    : composerMentionsStage
+      ? stageLabel[language][composerTargetStage]
+      : "";
+  const composerMentionQuery = getActiveComposerMentionQuery(questionDraft);
+  const composerMentionOptions = useMemo<ComposerMentionOption[]>(() => {
+    if (composerMentionQuery === null || !hasSubmittedQuestion) return [];
+    const options: ComposerMentionOption[] = [
+      {
+        token: "@controller",
+        label: language === "zh" ? "总控" : "Controller",
+        description: language === "zh" ? "提问、澄清意图或让总控判断下一步" : "Ask, clarify intent, or let the controller decide next steps",
+        controller: true,
+        aliases: controllerMentionAliases,
+      },
+      ...stageOrder.filter((stage) => stage !== "final_review").map((stage) => ({
+        token: stageMentionTokens[stage],
+        label: stageLabel[language][stage],
+        description: language === "zh" ? `${stageMeta[stage].agent} 定向反馈或重跑` : `Direct feedback or rerun for ${stageMeta[stage].agent}`,
+        stage,
+        aliases: stageMentionAliases[stage],
+      })),
+    ];
+    const query = composerMentionQuery.toLowerCase();
+    return options
+      .filter((option) =>
+        !query
+        || option.token.toLowerCase().includes(query)
+        || option.label.toLowerCase().includes(query)
+        || option.aliases.some((alias) => alias.toLowerCase().includes(query)))
+      .slice(0, 7);
+  }, [composerMentionQuery, hasSubmittedQuestion, language]);
+  const showComposerTargetControls = hasSubmittedQuestion && !running && !iterationEnded;
+  const showComposerRunHint = false;
+  const composerSendTitle = running
+    ? composerCanSubmit
+      ? language === "zh" ? "发送给总控或 @ 指定模块" : "Send to the controller or targeted @ module"
+      : language === "zh" ? "停止当前工作流" : "Stop workflow immediately"
+    : !hasSubmittedQuestion
+      ? t.start
+      : iterationEnded
+        ? language === "zh" ? "向总控提问" : "Ask controller"
+        : composerMentionsStage
+          ? language === "zh" ? "发送给指定模块" : "Send to targeted module"
+          : language === "zh" ? "向总控提问" : "Ask controller";
   const latestEvent = events[0]?.message;
   const maxIterations = health?.max_iterations ?? 10;
   const readyAgentCount = health?.ready_agent_count ?? 0;
@@ -1179,6 +1306,16 @@ function App() {
       return true;
     }).slice(0, 6);
   }, [activeRun, events]);
+
+  const insertComposerMention = useCallback((token: string) => {
+    setQuestionDraft((current) => {
+      if (activeComposerMentionPattern.test(current)) {
+        return current.replace(activeComposerMentionPattern, `$1${token} `);
+      }
+      const cleanCurrent = stripComposerMentions(current);
+      return cleanCurrent ? `${token} ${cleanCurrent}` : `${token} `;
+    });
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -2271,9 +2408,9 @@ function App() {
   );
 
   const submitProjectFeedback = useCallback(async () => {
-    const typedNote = questionDraft.trim();
+    const typedNote = stripComposerMentions(questionDraft.trim());
     if (running || (!typedNote && !files.length) || !hasSubmittedQuestion || context.current_stage === "human_review") return;
-    const targetStage = mentionedStage(typedNote, feedbackTarget);
+    const targetStage = mentionedStage(questionDraft, feedbackTarget);
     const targetIndex = stageOrder.indexOf(targetStage);
     if (targetIndex < 0) return;
 
@@ -2286,6 +2423,7 @@ function App() {
     pushMessage({
       id: userMessageId,
       kind: "user",
+      title: language === "zh" ? `给${stageLabel.zh[targetStage]}的反馈` : `Feedback for ${stageLabel.en[targetStage]}`,
       body: note,
       stage: targetStage,
       attachments: pendingFileAttachments(selectedFiles, userMessageId),
@@ -2363,17 +2501,22 @@ function App() {
   ]);
 
   const submitRunInstruction = useCallback(async () => {
-    const comment = questionDraft.trim();
+    const comment = stripComposerMentions(questionDraft.trim());
     if (!activeRun || !comment) return;
     try {
-      const targetStage = mentionedStage(comment, feedbackTarget);
+      const targetStage = mentionedStage(questionDraft, feedbackTarget);
       const updated = await queueRunInstruction(
         activeRun.run_id,
         comment,
         targetStage,
       );
       trackWorkflowRun(updated.task_id, updated);
-      pushMessage({ kind: "user", body: comment, stage: targetStage });
+      pushMessage({
+        kind: "user",
+        title: language === "zh" ? `给${stageLabel.zh[targetStage]}的运行指令` : `Instruction for ${stageLabel.en[targetStage]}`,
+        body: comment,
+        stage: targetStage,
+      });
       pushMessage({
         kind: "controller",
         body: language === "zh"
@@ -2450,11 +2593,15 @@ function App() {
   }, [context, iterationBusy, language, pushMessage, running]);
 
   const submitControllerQuestion = useCallback(async () => {
-    const question = questionDraft.trim();
-    if (!question || running) return;
+    const question = stripComposerMentions(questionDraft.trim());
+    if (!question) return;
     setQuestionDraft("");
     setRuntimeError("");
-    pushMessage({ kind: "user", body: question });
+    pushMessage({
+      kind: "user",
+      title: language === "zh" ? "向总控提问" : "Controller question",
+      body: question,
+    });
     try {
       const result = await routeControllerMessage(context.task_id, question, false);
       setContext(result.task_context);
@@ -2466,11 +2613,14 @@ function App() {
     } catch (error) {
       setRuntimeError(error instanceof Error ? error.message : String(error));
     }
-  }, [context.task_id, pushMessage, questionDraft, running]);
+  }, [context.task_id, language, pushMessage, questionDraft]);
 
   const submitComposer = useCallback(() => {
     if (running && activeRun) {
-      void submitRunInstruction();
+      if (composerMentionsStage && !composerMentionsController) void submitRunInstruction();
+      else void submitControllerQuestion();
+    } else if (hasSubmittedQuestion && (composerMentionsController || !composerMentionsStage)) {
+      void submitControllerQuestion();
     } else if (iterationEnded) {
       void submitControllerQuestion();
     } else if (hasSubmittedQuestion) {
@@ -2478,7 +2628,7 @@ function App() {
     } else {
       void startDemo();
     }
-  }, [activeRun, hasSubmittedQuestion, iterationEnded, running, startDemo, submitControllerQuestion, submitProjectFeedback, submitRunInstruction]);
+  }, [activeRun, composerMentionsController, composerMentionsStage, hasSubmittedQuestion, iterationEnded, running, startDemo, submitControllerQuestion, submitProjectFeedback, submitRunInstruction]);
 
   const activeStageRun = stages.find((stage) => stage.id === activeStage) ?? stages[0];
   const visibleMessages = iterationReviewReady
@@ -2803,20 +2953,67 @@ function App() {
                   addPendingFiles(Array.from(event.dataTransfer.files ?? []));
                 }}
               >
-                {hasSubmittedQuestion && !iterationEnded ? (
-                  <label className="feedback-target">
-                    <span>{language === "zh" ? "反馈目标" : "Feedback target"}</span>
-                    <select
-                      aria-label={language === "zh" ? "选择反馈目标模块" : "Select feedback target module"}
-                      disabled={context.current_stage === "human_review"}
-                      onChange={(event) => setFeedbackTarget(event.target.value as StageId)}
-                      value={feedbackTarget}
+                {showComposerTargetControls ? (
+                  <div className="mention-strip" aria-label={language === "zh" ? "定向发送目标" : "Directed send target"}>
+                    <button
+                      className={composerMentionsController ? "active controller" : "controller"}
+                      disabled={context.current_stage === "human_review" || iterationReviewReady}
+                      type="button"
+                      onClick={() => insertComposerMention("@controller")}
                     >
-                      {stageOrder.map((stage) => (
-                        <option key={stage} value={stage}>{stageLabel[language][stage]}</option>
-                      ))}
-                    </select>
-                  </label>
+                      <AtSign size={13} />
+                      {language === "zh" ? "总控" : "Controller"}
+                    </button>
+                    {stageOrder.filter((stage) => stage !== "final_review").map((stage) => (
+                      <button
+                        className={!composerMentionsController && composerTargetStage === stage ? "active" : ""}
+                        disabled={context.current_stage === "human_review" || iterationReviewReady}
+                        key={stage}
+                        type="button"
+                        onClick={() => {
+                          setFeedbackTarget(stage);
+                          insertComposerMention(stageMentionTokens[stage]);
+                        }}
+                      >
+                        <AtSign size={13} />
+                        {stageLabel[language][stage]}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+                {showComposerRunHint ? (
+                  <div className="composer-run-hint">
+                    <span>{language === "zh" ? "运行中，输入会作为指令排队" : "Running. Your input will be queued as an instruction."}</span>
+                    {composerRouteLabel ? <b>{composerRouteLabel}</b> : null}
+                  </div>
+                ) : null}
+                {composerRouteLabel ? (
+                  <div className="composer-selected-target">
+                    <AtSign size={13} />
+                    <span>{composerRouteLabel}</span>
+                  </div>
+                ) : null}
+                {composerMentionOptions.length ? (
+                  <div className="mention-suggestions" role="listbox">
+                    {composerMentionOptions.map((option) => (
+                      <button
+                        className={option.controller ? "controller" : ""}
+                        key={option.token}
+                        type="button"
+                        onClick={() => {
+                          if (option.stage) setFeedbackTarget(option.stage);
+                          insertComposerMention(option.token);
+                        }}
+                      >
+                        <AtSign size={14} />
+                        <span>
+                          <strong>{option.label}</strong>
+                          <small>{option.description}</small>
+                        </span>
+                        <code>{option.token}</code>
+                      </button>
+                    ))}
+                  </div>
                 ) : null}
                 <textarea
                   aria-label={!hasSubmittedQuestion ? t.questionPlaceholder : language === "zh" ? "输入修改意见" : "Enter revision feedback"}
@@ -2890,16 +3087,10 @@ function App() {
                     className="send-button"
                     disabled={context.current_stage === "human_review" || iterationReviewReady || (!running && !composerCanSubmit)}
                     type="button"
-                    onClick={running ? () => void cancelActiveRun() : submitComposer}
-                    title={running
-                      ? language === "zh" ? "立即终止工作流" : "Stop workflow immediately"
-                      : !hasSubmittedQuestion
-                        ? t.start
-                        : iterationEnded
-                          ? language === "zh" ? "向总控提问" : "Ask controller"
-                          : language === "zh" ? "发送反馈并重跑" : "Send feedback and rerun"}
+                    onClick={running && !composerCanSubmit ? () => void cancelActiveRun() : submitComposer}
+                    title={composerSendTitle}
                   >
-                    {running ? <Square fill="currentColor" size={15} /> : <Send size={17} />}
+                    {running && !composerCanSubmit ? <Square fill="currentColor" size={15} /> : <Send size={17} />}
                   </button>
                 </div>
                 {files.length ? (
@@ -2937,7 +3128,9 @@ function App() {
             health={health}
             maxIterations={maxIterations}
             onExport={() => void exportTaskBundle(context.task_id).catch((error) => setRuntimeError(String(error)))}
+            onOpenJson={(title, data) => setJsonOpen({ title, data })}
             onRefresh={() => void refreshRuntimeData()}
+            onRuntimeError={(error) => setRuntimeError(error)}
             onWorkflowRun={handleExternalWorkflowRun}
             runtimeError={runtimeError}
             stages={stages}
@@ -3125,7 +3318,9 @@ function SystemPage({
   language,
   maxIterations,
   onExport,
+  onOpenJson,
   onRefresh,
+  onRuntimeError,
   onWorkflowRun,
   runtimeError,
   stages,
@@ -3140,7 +3335,9 @@ function SystemPage({
   language: Language;
   maxIterations: number;
   onExport: () => void;
+  onOpenJson: (title: string, data: unknown) => void;
   onRefresh: () => void;
+  onRuntimeError: (error: string) => void;
   onWorkflowRun: (run: WorkflowRun) => void;
   runtimeError: string;
   stages: StageRun[];
@@ -3148,6 +3345,12 @@ function SystemPage({
   versionDiff: VersionDiffResult | null;
 }) {
   const zh = language === "zh";
+  const openParsedAttachment = (attachment: RemoteAttachment) => {
+    if (!attachment.parsed_path) return;
+    void fetchArtifactJson(context.task_id, attachment.parsed_path)
+      .then((data) => onOpenJson(`${attachment.name} parsed JSON`, data))
+      .catch((error) => onRuntimeError(error instanceof Error ? error.message : String(error)));
+  };
   return (
     <section className="system-page">
       <header className="system-header">
@@ -3248,12 +3451,24 @@ function SystemPage({
           <h3>{zh ? "已上传附件" : "Uploaded attachments"}</h3>
           <span>{attachments.length}</span>
         </div>
-        <div className="runtime-table artifact-runtime-table">
+        <div className="runtime-table artifact-runtime-table attachment-runtime-table">
           {attachments.length ? attachments.map((attachment) => (
             <div className="runtime-row" key={attachment.attachment_id}>
               <Paperclip size={15} />
               <code>{attachment.name}</code>
-              <span>{attachment.parse_status ?? "completed"} · {attachment.file_type ?? formatBytes(attachment.size)}</span>
+              <span>
+                {attachment.parse_status ?? "completed"} · {attachment.file_type ?? formatBytes(attachment.size)}
+                {attachment.chunk_count ? ` · ${attachment.chunk_count} chunks` : ""}
+              </span>
+              <button
+                className="icon-row-button"
+                disabled={!attachment.parsed_path || attachment.parse_status === "failed"}
+                title={zh ? "查看解析 JSON" : "View parsed JSON"}
+                type="button"
+                onClick={() => openParsedAttachment(attachment)}
+              >
+                <FileJson size={13} />
+              </button>
             </div>
           )) : <p className="runtime-empty">{zh ? "当前任务还没有持久化附件。" : "This task has no persisted attachments."}</p>}
         </div>
@@ -4167,7 +4382,7 @@ function ThreadMessageCard({
         <div className="message-avatar">你</div>
         <div className="message-bubble">
           <header>
-            <strong>{message.stage ? t.userRevision : t.userQuestion}</strong>
+            <strong>{message.title ?? (message.stage ? t.userRevision : t.userQuestion)}</strong>
             <time>{formatTime(message.createdAt)}</time>
           </header>
           {message.body ? <RichMessageBody text={message.body} /> : null}
@@ -4282,7 +4497,14 @@ function ThreadMessageCard({
           </button>
         ) : null}
 
-        {stage ? <AgentOutput language={language} response={message.response ?? null} stage={stage} /> : null}
+        {stage ? (
+          <AgentOutput
+            language={language}
+            partialPayload={message.partialPayload}
+            response={message.response ?? null}
+            stage={stage}
+          />
+        ) : null}
 
         {stage && message.response ? (
           <footer className="message-footer">
@@ -4384,21 +4606,36 @@ function ThreadMessageCard({
 
 function KnowledgeIntegrationOutput({
   language,
+  partial = false,
   payload,
 }: {
   language: Language;
+  partial?: boolean;
   payload: Record<string, unknown>;
 }) {
   const literature = arrayValue(payload.literature_cards);
   const evidence = arrayValue(payload.evidence_cards);
   const gaps = arrayValue(payload.knowledge_gaps);
+  const retrievedSources = arrayValue(payload.retrieved_sources);
+  const activeNode = stringValue(payload._active_node);
+  const activePhase = activeNode === "evidence_extract"
+    ? "evidence"
+    : activeNode === "gap_synthesis" || activeNode === "quality_review"
+      ? "gaps"
+      : "literature";
+  const literatureProgressCount = literature.length
+    || retrievedSources.length
+    || numberValue(payload.relevant_sources)
+    || numberValue(payload.verified_sources)
+    || numberValue(payload.candidate_sources);
   const phases = [
     {
       id: "literature",
       icon: FileJson,
       title: language === "zh" ? "文献检索" : "Literature search",
       subtitle: language === "zh" ? "形成可追踪的文献卡片" : "Build traceable literature cards",
-      count: literature.length,
+      count: literatureProgressCount,
+      ready: literature.length > 0,
       empty: language === "zh" ? "尚未返回文献卡片。" : "No literature cards returned.",
     },
     {
@@ -4407,6 +4644,7 @@ function KnowledgeIntegrationOutput({
       title: language === "zh" ? "证据整合" : "Evidence integration",
       subtitle: language === "zh" ? "抽取可被下游引用的证据结论" : "Extract evidence claims for downstream use",
       count: evidence.length,
+      ready: evidence.length > 0,
       empty: language === "zh" ? "尚未返回证据卡片。" : "No evidence cards returned.",
     },
     {
@@ -4415,17 +4653,24 @@ function KnowledgeIntegrationOutput({
       title: language === "zh" ? "知识空白合成" : "Knowledge gap synthesis",
       subtitle: language === "zh" ? "确定假设生成必须引用的 gap_id" : "Identify gap_id references required by hypotheses",
       count: gaps.length,
+      ready: gaps.length > 0,
       empty: language === "zh" ? "尚未返回知识空白，假设生成会被后端门禁拦截。" : "No knowledge gaps returned; hypothesis generation will be blocked.",
     },
   ];
+  const visibleSections = partial ? phases.filter((phase) => phase.id !== "gaps") : phases;
 
   return (
-    <div className="module-output knowledge-output">
+    <div className={`module-output knowledge-output ${partial ? "partial" : ""}`}>
       <div className="knowledge-phase-strip">
         {phases.map((phase, index) => {
           const Icon = phase.icon;
+          const phaseState = phase.ready
+            ? "ready"
+            : partial
+              ? phase.id === activePhase ? "active" : "pending"
+              : "empty";
           return (
-            <div className={`knowledge-phase ${phase.count ? "ready" : "empty"}`} key={phase.id}>
+            <div className={`knowledge-phase ${phaseState}`} key={phase.id}>
               <i>{index + 1}</i>
               <Icon size={15} />
               <div>
@@ -4437,7 +4682,15 @@ function KnowledgeIntegrationOutput({
           );
         })}
       </div>
+      {partial ? (
+        <p className="knowledge-progress-note">
+          {language === "zh"
+            ? "知识整合正在运行，先展示已完成的检索与证据阶段；知识空白会在最终结果完成后展示。"
+            : "Knowledge integration is running. Search and evidence phases are shown first; gaps appear with the final result."}
+        </p>
+      ) : null}
 
+      {visibleSections.some((phase) => phase.id === "literature") ? (
       <section className="knowledge-section">
         <header>
           <span>{language === "zh" ? "文献卡片" : "Literature cards"}</span>
@@ -4457,10 +4710,18 @@ function KnowledgeIntegrationOutput({
             ))}
           </div>
         ) : (
-          <p className="knowledge-empty">{phases[0].empty}</p>
+          <p className="knowledge-empty">
+            {partial && literatureProgressCount
+              ? language === "zh"
+                ? `已检索到 ${literatureProgressCount} 条候选/相关来源，正在抽取文献卡片。`
+                : `${literatureProgressCount} candidate or relevant sources found; extracting literature cards.`
+              : phases[0].empty}
+          </p>
         )}
       </section>
+      ) : null}
 
+      {visibleSections.some((phase) => phase.id === "evidence") ? (
       <section className="knowledge-section">
         <header>
           <span>{language === "zh" ? "证据卡片" : "Evidence cards"}</span>
@@ -4483,7 +4744,9 @@ function KnowledgeIntegrationOutput({
           <p className="knowledge-empty">{phases[1].empty}</p>
         )}
       </section>
+      ) : null}
 
+      {visibleSections.some((phase) => phase.id === "gaps") ? (
       <section className="knowledge-section">
         <header>
           <span>{language === "zh" ? "知识空白" : "Knowledge gaps"}</span>
@@ -4503,12 +4766,26 @@ function KnowledgeIntegrationOutput({
           <p className="knowledge-empty warning">{phases[2].empty}</p>
         )}
       </section>
+      ) : null}
     </div>
   );
 }
 
-function AgentOutput({ language, response, stage }: { language: Language; response: AgentResponse | null; stage: StageId }) {
+function AgentOutput({
+  language,
+  partialPayload,
+  response,
+  stage,
+}: {
+  language: Language;
+  partialPayload?: Record<string, unknown>;
+  response: AgentResponse | null;
+  stage: StageId;
+}) {
   if (!response) {
+    if (stage === "knowledge_integration" && partialPayload) {
+      return <KnowledgeIntegrationOutput language={language} partial payload={partialPayload} />;
+    }
     return (
       <div className="output-skeleton">
         <Loader2 className="spin" size={16} />

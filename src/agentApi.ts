@@ -568,6 +568,11 @@ export async function fetchArtifacts(taskId: string): Promise<RemoteArtifact[]> 
   return result.artifacts;
 }
 
+export async function fetchArtifactJson(taskId: string, artifactPath: string): Promise<unknown> {
+  const encodedPath = artifactPath.split("/").map(encodeURIComponent).join("/");
+  return requestJson(`/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodedPath}`);
+}
+
 export async function fetchVersions(taskId: string) {
   const result = await requestJson<{ versions: TaskContext["versions"] }>(
     `/api/tasks/${encodeURIComponent(taskId)}/versions`,

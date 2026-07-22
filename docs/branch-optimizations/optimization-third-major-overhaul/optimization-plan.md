@@ -599,6 +599,59 @@
 
 - TypeScript 类型检查通过。
 
+### 2026-07-22：运行中交互、@定向与知识整合阶段反馈修复
+
+本次修复针对第三次大优化后暴露出的三个前端交互回归：知识整合长时间无可见产出、输入框 `@agent` 定向能力不明显、运行中输入被一律当作“修改建议/排队指令”。
+
+改动内容：
+
+- 知识整合消息支持消费 workflow `partial_output` 事件。
+- `ThreadMessage` 新增 `partialPayload`，保存知识整合运行中的检索、文献卡片、证据卡片等阶段性 payload。
+- `KnowledgeIntegrationOutput` 新增 partial 模式：
+  - 运行中先显示三阶段状态条。
+  - 运行中展开“文献检索”和“证据整合”两段。
+  - “知识空白”详情只在最终 response 完成后展示。
+- 输入框恢复 `@` 定向入口：
+  - 输入 `@` 后显示总控和各 Agent 候选项。
+  - 点击候选项后插入规范 token，例如 `@controller`、`@knowledge`。
+  - 已选定向目标以蓝色 pill 显示，降低常驻控件占用。
+- 运行中发送逻辑改为：
+  - 无 `@agent`：发送给总控，由总控回答或判断意图。
+  - `@controller`：发送给总控。
+  - `@knowledge` / `@hypothesis` 等模块：作为定向运行指令排队到对应 Agent 的安全节点边界。
+- 非运行中已有任务时，默认无 `@` 也先进入总控问答；只有显式 `@agent` 才触发对应模块反馈和重跑。
+- 用户消息新增 `title` 字段：
+  - 总控问答显示“向总控提问”。
+  - 模块反馈显示“给某模块的反馈”。
+  - 运行中定向指令显示“给某模块的运行指令”。
+  - 不再因为消息带有 `stage` 就统一显示为“修改建议”。
+- 运行中发送按钮语义修复：
+  - 输入框有内容时按钮用于发送。
+  - 输入框为空时按钮才用于停止当前工作流。
+
+实现方式：
+
+- 在 `applyWorkflowEventToMessages()` 中合并知识整合 workflow event payload，避免 partial output 丢失在事件流里。
+- 在 `AgentOutput()` 中，如果知识整合尚无最终 response 但已有 partial payload，则渲染 partial 知识整合面板，而不是通用 loading。
+- 新增 `getActiveComposerMentionQuery()` 和 mention option 列表，根据输入框末尾的 `@xxx` 触发候选菜单。
+- 调整 `submitComposer()` 分流顺序，把“无 @ 默认总控”作为主路径，把“显式 @agent”作为定向模块路径。
+- 调整发送按钮 `onClick/title/icon`，让 running 状态不再强制等同于 cancel。
+
+改后效果：
+
+- 知识整合运行中不会长时间只显示“正在生成”，用户能先看到检索和证据阶段的阶段性结果或进度。
+- `@` 定向能力重新变成输入框的一等交互，而不是隐藏在固定目标控件里。
+- 用户运行中提问不会被误标成“修改建议”，也不会被无条件排队到某个模块。
+- 总控的存在感增强：默认对话由总控接收，定向 Agent 需要用户显式 `@`。
+
+已执行验证：
+
+- `npm run typecheck`
+
+验证结果：
+
+- TypeScript 类型检查通过。
+
 ### 2026-07-22：NodeDebugger 附件 citation 可视化
 
 本次推进 Batch 10 的第一阶段，重点解决“后端已经把附件 chunks 注入 node input，但前端仍需要在原始 JSON 里翻找引用片段”的问题。
