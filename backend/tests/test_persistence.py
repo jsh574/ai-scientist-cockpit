@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+import zipfile
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -37,6 +39,21 @@ class PersistenceTests(unittest.TestCase):
                 original_question="How should this scientific question be tested?",
             )
         )
+
+    @staticmethod
+    def minimal_docx(text: str) -> bytes:
+        buffer = BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr(
+                "word/document.xml",
+                (
+                    '<?xml version="1.0" encoding="UTF-8"?>'
+                    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                    f"<w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body>"
+                    "</w:document>"
+                ),
+            )
+        return buffer.getvalue()
 
     def test_archived_tasks_are_hidden_by_default_and_can_be_restored(self) -> None:
         self.create("task_active")
@@ -91,9 +108,9 @@ class PersistenceTests(unittest.TestCase):
         with self.assertRaises(ArtifactError):
             self.artifacts.add_attachment(
                 "task_attachment",
-                "unsafe.pdf",
-                b"pdf",
-                "application/pdf",
+                "unsafe.exe",
+                b"exe",
+                "application/octet-stream",
                 context_char_limit=10_000,
             )
         with self.assertRaises(ArtifactError):
@@ -104,6 +121,30 @@ class PersistenceTests(unittest.TestCase):
                 "text/plain",
                 context_char_limit=10_000,
             )
+
+    def test_docx_attachment_is_parsed_and_contextualized(self) -> None:
+        self.create("task_docx")
+        item, context = self.artifacts.add_attachment(
+            "task_docx",
+            "protocol.docx",
+            self.minimal_docx("Measure cytokines before tau PET follow-up."),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            context_char_limit=10_000,
+            message_id="msg_docx",
+        )
+
+        self.assertEqual(item["file_type"], "docx")
+        self.assertEqual(item["parse_status"], "completed")
+        self.assertEqual(len(item["hash"]), 64)
+        self.assertGreater(item["chunk_count"], 0)
+        parsed = self.artifacts.read_json("task_docx", item["parsed_path"])
+        self.assertEqual(parsed["metadata"]["file_type"], "docx")
+        self.assertIn("cytokines", parsed["sections"][0]["text"])
+        self.assertIn("cytokines", context["user_input"]["question_description"])
+        self.assertEqual(
+            context["user_input"]["attachments"][0]["parsed_path"],
+            item["parsed_path"],
+        )
 
     def test_feedback_updates_runtime_controls_without_creating_a_new_task(self) -> None:
         context = self.create("task_controls")

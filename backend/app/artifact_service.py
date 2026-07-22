@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import tempfile
@@ -9,13 +10,29 @@ import time
 import zipfile
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree
 from uuid import uuid4
 
 from .contracts import TaskEvent, utc_now
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,96}$")
 _SAFE_RELATIVE_PART = re.compile(r"^[^<>:\"|?*\x00-\x1f]+$")
-_ALLOWED_ATTACHMENT_EXTENSIONS = {".txt", ".md", ".csv", ".json"}
+_ALLOWED_ATTACHMENT_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".csv",
+    ".json",
+    ".pdf",
+    ".docx",
+    ".pptx",
+    ".xlsx",
+}
+_TEXT_ATTACHMENT_EXTENSIONS = {".txt", ".md", ".csv", ".json"}
+_LEGACY_OFFICE_EXTENSIONS = {".doc", ".ppt", ".xls"}
+
+
+def allowed_attachment_extensions() -> list[str]:
+    return sorted(_ALLOWED_ATTACHMENT_EXTENSIONS)
 
 
 class ArtifactError(RuntimeError):
@@ -101,6 +118,185 @@ class ArtifactService:
         finally:
             if os.path.exists(temp_name):
                 os.unlink(temp_name)
+
+    @staticmethod
+    def _xml_text(content: bytes) -> str:
+        try:
+            root = ElementTree.fromstring(content)
+        except ElementTree.ParseError:
+            return ""
+        parts = [
+            node.text.strip()
+            for node in root.iter()
+            if node.text and node.text.strip()
+        ]
+        return "\n".join(parts)
+
+    @staticmethod
+    def _chunks(text: str, *, chunk_size: int = 1800) -> list[dict[str, Any]]:
+        compact = re.sub(r"\n{3,}", "\n\n", text).strip()
+        if not compact:
+            return []
+        return [
+            {"chunk_id": f"chunk_{index + 1:03d}", "text": compact[start:start + chunk_size]}
+            for index, start in enumerate(range(0, len(compact), chunk_size))
+        ]
+
+    @staticmethod
+    def _parse_text_attachment(content: bytes, extension: str) -> tuple[str, dict[str, Any]]:
+        try:
+            text = content.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ArtifactError("Attachment must be UTF-8 text") from exc
+        parsed: dict[str, Any] = {
+            "metadata": {"parser": "utf8_text", "file_type": extension.lstrip(".")},
+            "sections": [{"section_id": "text", "title": "Text", "text": text}],
+            "pages": [],
+            "tables": [],
+            "images": [],
+            "chunks": ArtifactService._chunks(text),
+        }
+        return text, parsed
+
+    @staticmethod
+    def _parse_docx(content: bytes) -> tuple[str, dict[str, Any]]:
+        with tempfile.SpooledTemporaryFile() as handle:
+            handle.write(content)
+            handle.seek(0)
+            with zipfile.ZipFile(handle) as archive:
+                text = ArtifactService._xml_text(archive.read("word/document.xml"))
+        parsed = {
+            "metadata": {"parser": "zip_xml", "file_type": "docx"},
+            "sections": [{"section_id": "document", "title": "Document", "text": text}],
+            "pages": [],
+            "tables": [],
+            "images": [],
+            "chunks": ArtifactService._chunks(text),
+        }
+        return text, parsed
+
+    @staticmethod
+    def _parse_pptx(content: bytes) -> tuple[str, dict[str, Any]]:
+        with tempfile.SpooledTemporaryFile() as handle:
+            handle.write(content)
+            handle.seek(0)
+            with zipfile.ZipFile(handle) as archive:
+                slide_names = sorted(
+                    name
+                    for name in archive.namelist()
+                    if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
+                )
+                pages = []
+                texts = []
+                for index, name in enumerate(slide_names, start=1):
+                    slide_text = ArtifactService._xml_text(archive.read(name))
+                    texts.append(slide_text)
+                    pages.append({"page": index, "text": slide_text})
+        text = "\n\n".join(part for part in texts if part)
+        parsed = {
+            "metadata": {"parser": "zip_xml", "file_type": "pptx", "slide_count": len(pages)},
+            "sections": [{"section_id": "slides", "title": "Slides", "text": text}],
+            "pages": pages,
+            "tables": [],
+            "images": [],
+            "chunks": ArtifactService._chunks(text),
+        }
+        return text, parsed
+
+    @staticmethod
+    def _parse_xlsx(content: bytes) -> tuple[str, dict[str, Any]]:
+        with tempfile.SpooledTemporaryFile() as handle:
+            handle.write(content)
+            handle.seek(0)
+            with zipfile.ZipFile(handle) as archive:
+                shared_strings: list[str] = []
+                if "xl/sharedStrings.xml" in archive.namelist():
+                    shared_strings = ArtifactService._xml_text(
+                        archive.read("xl/sharedStrings.xml")
+                    ).splitlines()
+                sheet_names = sorted(
+                    name
+                    for name in archive.namelist()
+                    if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name)
+                )
+                tables = []
+                texts = []
+                for index, name in enumerate(sheet_names, start=1):
+                    raw = ArtifactService._xml_text(archive.read(name)).splitlines()
+                    values = [
+                        shared_strings[int(value)]
+                        if value.isdigit() and int(value) < len(shared_strings)
+                        else value
+                        for value in raw
+                    ]
+                    sheet_text = "\n".join(value for value in values if value)
+                    texts.append(sheet_text)
+                    tables.append({"table_id": f"sheet_{index}", "name": Path(name).stem, "text": sheet_text})
+        text = "\n\n".join(part for part in texts if part)
+        parsed = {
+            "metadata": {"parser": "zip_xml", "file_type": "xlsx", "sheet_count": len(tables)},
+            "sections": [{"section_id": "workbook", "title": "Workbook", "text": text}],
+            "pages": [],
+            "tables": tables,
+            "images": [],
+            "chunks": ArtifactService._chunks(text),
+        }
+        return text, parsed
+
+    @staticmethod
+    def _parse_pdf(content: bytes) -> tuple[str, dict[str, Any]]:
+        text = ""
+        pages: list[dict[str, Any]] = []
+        try:
+            from pypdf import PdfReader  # type: ignore
+
+            with tempfile.SpooledTemporaryFile() as handle:
+                handle.write(content)
+                handle.seek(0)
+                reader = PdfReader(handle)
+                for index, page in enumerate(reader.pages, start=1):
+                    page_text = page.extract_text() or ""
+                    pages.append({"page": index, "text": page_text})
+                text = "\n\n".join(page["text"] for page in pages if page["text"])
+            parser = "pypdf"
+        except Exception:
+            parser = "pdf_byte_fallback"
+            decoded = content.decode("latin-1", errors="ignore")
+            text = "\n".join(re.findall(r"\(([^()]{1,200})\)", decoded))
+        parsed = {
+            "metadata": {"parser": parser, "file_type": "pdf", "page_count": len(pages)},
+            "sections": [{"section_id": "pdf_text", "title": "PDF text", "text": text}],
+            "pages": pages,
+            "tables": [],
+            "images": [],
+            "chunks": ArtifactService._chunks(text),
+        }
+        return text, parsed
+
+    @staticmethod
+    def _parse_attachment(
+        content: bytes, extension: str
+    ) -> tuple[str, dict[str, Any], str | None]:
+        try:
+            if extension in _TEXT_ATTACHMENT_EXTENSIONS:
+                text, parsed = ArtifactService._parse_text_attachment(content, extension)
+            elif extension == ".docx":
+                text, parsed = ArtifactService._parse_docx(content)
+            elif extension == ".pptx":
+                text, parsed = ArtifactService._parse_pptx(content)
+            elif extension == ".xlsx":
+                text, parsed = ArtifactService._parse_xlsx(content)
+            elif extension == ".pdf":
+                text, parsed = ArtifactService._parse_pdf(content)
+            else:
+                raise ArtifactError(f"Unsupported attachment parser for {extension}")
+            if not text.strip():
+                return text, parsed, "No extractable text was found"
+            return text, parsed, None
+        except ArtifactError:
+            raise
+        except Exception as exc:
+            raise ArtifactError(f"Attachment parse failed: {type(exc).__name__}: {exc}") from exc
 
     def write_json(self, task_id: str, relative_path: str, value: Any) -> Path:
         path = self._resolve(task_id, relative_path, create_parent=True)
@@ -207,32 +403,41 @@ class ArtifactService:
         if safe_name != filename or not safe_name:
             raise ArtifactError("Attachment filename must not contain a path")
         extension = Path(safe_name).suffix.lower()
+        if extension in _LEGACY_OFFICE_EXTENSIONS:
+            raise ArtifactError(
+                f"Legacy Office format {extension} is not supported. Convert it to the matching .docx, .pptx, or .xlsx file."
+            )
         if extension not in _ALLOWED_ATTACHMENT_EXTENSIONS:
             allowed = ", ".join(sorted(_ALLOWED_ATTACHMENT_EXTENSIONS))
             raise ArtifactError(f"Unsupported attachment type. Allowed: {allowed}")
-        try:
-            text = content.decode("utf-8-sig")
-        except UnicodeDecodeError as exc:
-            raise ArtifactError("Attachment must be UTF-8 text") from exc
+        text, parsed, parse_error = self._parse_attachment(content, extension)
 
         attachment_id = f"att_{uuid4().hex[:12]}"
         stored_name = f"{attachment_id}_{safe_name}"
         relative_path = f"attachments/{stored_name}"
+        parsed_relative_path = f"attachments/parsed/{attachment_id}.parsed.json"
         path = self._resolve(task_id, relative_path, create_parent=True)
         with self._lock:
             self._atomic_write_bytes(path, content)
+        self.write_json(task_id, parsed_relative_path, parsed)
 
         item = {
             "attachment_id": attachment_id,
+            "file_id": attachment_id,
             "name": safe_name,
             "path": relative_path,
+            "parsed_path": parsed_relative_path,
             "media_type": media_type or "text/plain",
+            "file_type": extension.lstrip("."),
             "size": len(content),
+            "hash": hashlib.sha256(content).hexdigest(),
             "text_excerpt": text[:context_char_limit],
             "created_at": utc_now(),
             "message_id": message_id,
             "upload_status": "completed",
-            "parse_status": "completed",
+            "parse_status": "failed" if parse_error else "completed",
+            "parse_error": parse_error,
+            "chunk_count": len(parsed.get("chunks") or []),
         }
         attachments = [*self.list_attachments(task_id), item]
         self.write_json(task_id, "attachments/index.json", attachments)
@@ -258,7 +463,8 @@ class ArtifactService:
             extensions["message_attachments"] = message_attachments
             context["extensions"] = extensions
         attachment_context = "\n\n".join(
-            f"[{attachment['name']}]\n{attachment['text_excerpt']}" for attachment in attachments
+            f"[{attachment['name']}]\n{attachment.get('text_excerpt') or ''}" for attachment in attachments
+            if attachment.get("text_excerpt")
         )[:context_char_limit]
         user_input["question_description"] = "\n\n".join(
             part

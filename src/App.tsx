@@ -122,6 +122,25 @@ const activeWorkflowStatuses = new Set([
   "paused",
   "cancelling",
 ]);
+const fallbackAttachmentExtensions = [".txt", ".md", ".csv", ".json", ".pdf", ".docx", ".pptx", ".xlsx"];
+const attachmentAccept = [
+  ".txt",
+  ".md",
+  ".csv",
+  ".json",
+  ".pdf",
+  ".docx",
+  ".pptx",
+  ".xlsx",
+  "text/plain",
+  "text/markdown",
+  "text/csv",
+  "application/json",
+  "application/pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+].join(",");
 
 interface StarterQuestion {
   domain: string;
@@ -1097,6 +1116,7 @@ function App() {
   const [activeRun, setActiveRun] = useState<WorkflowRun | null>(null);
   const [runsByTask, setRunsByTask] = useState<Record<string, WorkflowRun | null>>({});
   const [pendingActionIds, setPendingActionIds] = useState<Set<string>>(() => new Set());
+  const [composerDragActive, setComposerDragActive] = useState(false);
   const [chatScrollState, setChatScrollState] = useState<ChatScrollState>({
     isNearBottom: true,
     autoFollowEnabled: true,
@@ -1203,6 +1223,32 @@ function App() {
       hasUnreadOutput: isNearBottom ? false : chatScrollStateRef.current.hasUnreadOutput,
     });
   }, [updateChatScrollState]);
+
+  const addPendingFiles = useCallback((selected: File[]) => {
+    if (!selected.length) return;
+    const allowed = new Set(health?.attachments.allowed_extensions ?? fallbackAttachmentExtensions);
+    const maxBytes = health?.attachments.max_bytes ?? 2_000_000;
+    const invalid = selected.find((file) => {
+      const dot = file.name.lastIndexOf(".");
+      const extension = dot >= 0 ? file.name.slice(dot).toLowerCase() : "";
+      return !allowed.has(extension) || file.size > maxBytes;
+    });
+    if (invalid) {
+      setRuntimeError(language === "zh"
+        ? `无法添加 ${invalid.name}：仅支持 ${[...allowed].join("、")}，单个文件不超过 ${formatBytes(maxBytes)}。`
+        : `Cannot add ${invalid.name}. Use ${[...allowed].join(", ")} files up to ${formatBytes(maxBytes)} each.`);
+      return;
+    }
+    setRuntimeError("");
+    setFiles((current) => {
+      const known = new Set(current.map((file) => `${file.name}:${file.size}:${file.lastModified}`));
+      return [...current, ...selected.filter((file) => !known.has(`${file.name}:${file.size}:${file.lastModified}`))];
+    });
+  }, [health?.attachments.allowed_extensions, health?.attachments.max_bytes, language]);
+
+  const removePendingFile = useCallback((target: File) => {
+    setFiles((current) => current.filter((file) => file !== target));
+  }, []);
 
   const refreshRuntimeData = useCallback(async () => {
     if (!hasSubmittedQuestion) return;
@@ -2721,7 +2767,33 @@ function App() {
             </section>
 
             <section className="composer-shell">
-              <div className="composer">
+              <div
+                className={`composer ${composerDragActive ? "drag-active" : ""}`}
+                onDragEnter={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  if (event.dataTransfer.types.includes("Files")) setComposerDragActive(true);
+                }}
+                onDragOver={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  if (event.dataTransfer.types.includes("Files")) setComposerDragActive(true);
+                }}
+                onDragLeave={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  const related = event.relatedTarget;
+                  if (!(related instanceof globalThis.Node) || !event.currentTarget.contains(related)) {
+                    setComposerDragActive(false);
+                  }
+                }}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  setComposerDragActive(false);
+                  addPendingFiles(Array.from(event.dataTransfer.files ?? []));
+                }}
+              >
                 {hasSubmittedQuestion && !iterationEnded ? (
                   <label className="feedback-target">
                     <span>{language === "zh" ? "反馈目标" : "Feedback target"}</span>
@@ -2766,28 +2838,10 @@ function App() {
                   <label className="attach-button">
                     <input
                       multiple
-                      accept=".txt,.md,.csv,.json,text/plain,text/markdown,text/csv,application/json"
+                      accept={attachmentAccept}
                       type="file"
                       onChange={(event) => {
-                        const selected = Array.from(event.target.files ?? []);
-                        const allowed = new Set(health?.attachments.allowed_extensions ?? [".txt", ".md", ".csv", ".json"]);
-                        const maxBytes = health?.attachments.max_bytes ?? 2_000_000;
-                        const invalid = selected.find((file) => {
-                          const dot = file.name.lastIndexOf(".");
-                          const extension = dot >= 0 ? file.name.slice(dot).toLowerCase() : "";
-                          return !allowed.has(extension) || file.size > maxBytes;
-                        });
-                        if (invalid) {
-                          setRuntimeError(language === "zh"
-                            ? `无法添加 ${invalid.name}：仅支持 ${[...allowed].join("、")}，单个文件不超过 ${formatBytes(maxBytes)}。`
-                            : `Cannot add ${invalid.name}. Use ${[...allowed].join(", ")} files up to ${formatBytes(maxBytes)} each.`);
-                        } else {
-                          setRuntimeError("");
-                          setFiles((current) => {
-                            const known = new Set(current.map((file) => `${file.name}:${file.size}:${file.lastModified}`));
-                            return [...current, ...selected.filter((file) => !known.has(`${file.name}:${file.size}:${file.lastModified}`))];
-                          });
-                        }
+                        addPendingFiles(Array.from(event.target.files ?? []));
                         event.currentTarget.value = "";
                       }}
                     />
@@ -2839,6 +2893,27 @@ function App() {
                     {running ? <Square fill="currentColor" size={15} /> : <Send size={17} />}
                   </button>
                 </div>
+                {files.length ? (
+                  <div className="pending-file-list" aria-label={language === "zh" ? "待发送附件" : "Pending attachments"}>
+                    {files.map((file) => (
+                      <span key={`${file.name}:${file.size}:${file.lastModified}`}>
+                        <Paperclip size={13} />
+                        <b title={file.name}>{file.name}</b>
+                        <small>{formatBytes(file.size)}</small>
+                        <button
+                          aria-label={language === "zh" ? `移除 ${file.name}` : `Remove ${file.name}`}
+                          type="button"
+                          onClick={() => removePendingFile(file)}
+                        >
+                          <X size={13} />
+                        </button>
+                      </span>
+                    ))}
+                    <button className="pending-file-clear" type="button" onClick={() => setFiles([])}>
+                      {language === "zh" ? "清空" : "Clear"}
+                    </button>
+                  </div>
+                ) : null}
               </div>
               </section>
             </div>
@@ -3162,7 +3237,7 @@ function SystemPage({
             <div className="runtime-row" key={attachment.attachment_id}>
               <Paperclip size={15} />
               <code>{attachment.name}</code>
-              <span>{formatBytes(attachment.size)}</span>
+              <span>{attachment.parse_status ?? "completed"} · {attachment.file_type ?? formatBytes(attachment.size)}</span>
             </div>
           )) : <p className="runtime-empty">{zh ? "当前任务还没有持久化附件。" : "This task has no persisted attachments."}</p>}
         </div>
@@ -4005,9 +4080,13 @@ function ThreadMessageCard({
                       ? language === "zh" ? "上传中" : "Uploading"
                       : attachment.upload_status === "failed"
                         ? language === "zh" ? "失败" : "Failed"
+                        : attachment.parse_status === "failed"
+                          ? language === "zh" ? "解析失败" : "Parse failed"
                         : attachment.parse_status === "pending"
                           ? language === "zh" ? "解析中" : "Parsing"
-                          : formatBytes(attachment.size)}
+                          : attachment.chunk_count
+                            ? `${formatBytes(attachment.size)} · ${attachment.chunk_count}`
+                            : formatBytes(attachment.size)}
                   </small>
                 </span>
               ))}

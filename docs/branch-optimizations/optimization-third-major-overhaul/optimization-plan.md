@@ -599,6 +599,116 @@
 
 - TypeScript 类型检查通过。
 
+### 2026-07-22：文件上传格式扩展和基础解析架构
+
+本次推进 Batch 5 的第一阶段，先把“更多文件格式可上传、可解析、可进入 Task Context”的基础链路打通。复杂 OCR、图片抽取、表格结构化检索后续再做。
+
+改动内容：
+
+- 后端附件支持格式从 `.txt/.md/.csv/.json` 扩展为：
+  - `.txt`
+  - `.md`
+  - `.csv`
+  - `.json`
+  - `.pdf`
+  - `.docx`
+  - `.pptx`
+  - `.xlsx`
+- `.doc/.ppt/.xls` 旧 Office 格式仍不支持，并返回明确转换提示。
+- 附件元数据新增：
+  - `file_id`
+  - `file_type`
+  - `hash`
+  - `parsed_path`
+  - `parse_error`
+  - `chunk_count`
+- 每个附件会保存原始文件和解析结果：
+  - 原始文件：`attachments/{attachment_id}_{filename}`
+  - 解析结果：`attachments/parsed/{attachment_id}.parsed.json`
+- 解析结果标准化为：
+  - `metadata`
+  - `sections`
+  - `pages`
+  - `tables`
+  - `images`
+  - `chunks`
+- DOCX/PPTX/XLSX 采用 zip XML 基础文本抽取。
+- PDF 优先尝试 `pypdf`，不可用时使用保守字节文本回退。
+- `/api/health` 的 `attachments.allowed_extensions` 改为来自后端统一列表。
+- 前端文件选择 `accept` 和 fallback allowed extensions 同步扩展。
+- 前端附件 chip 和系统页附件列表显示解析状态、文件类型和 chunk 数。
+
+实现方式：
+
+- 在 `ArtifactService` 中新增附件解析辅助方法。
+- 上传时先解析，再写入原文件和 parsed JSON。
+- Task Context 继续注入解析后的文本摘要，保证 Agent 仍能通过 `user_input.question_description` 读取附件背景。
+- `user_input.attachments` 不暴露 `text_excerpt`，只保留文件引用和解析元数据。
+- 保留原有附件索引 `attachments/index.json`，避免迁移历史任务结构。
+
+改后效果：
+
+- 用户可以上传 PDF、DOCX、PPTX、XLSX 等科研常见文件。
+- Agent 上下文可以拿到这些文件的基础文本内容。
+- 系统能记录文件 hash、解析状态、解析结果路径和 chunk 数，为后续检索/引用链路做准备。
+- 解析失败时有 `parse_status` 和 `parse_error`，不会只显示“上传失败”这一种笼统状态。
+
+已执行验证：
+
+- `test_docx_attachment_is_parsed_and_contextualized`
+  - 验证 DOCX 能解析文本。
+  - 验证 parsed JSON 被写入。
+  - 验证解析文本进入 Task Context。
+  - 验证附件元数据包含 `file_type/hash/chunk_count/parsed_path`。
+- `python -m unittest discover -s backend/tests -v`
+- `python -m py_compile backend/app/artifact_service.py backend/app/main.py`
+- `npm run typecheck`
+
+验证结果：
+
+- 后端 unittest 48 个全部通过。
+- Python 编译检查通过。
+- TypeScript 类型检查通过。
+
+### 2026-07-22：拖拽上传和待发送附件体验
+
+本次推进 Batch 6 的第一阶段，重点修复输入框文件交互不够自然、待发送文件不可单独管理的问题。
+
+改动内容：
+
+- Composer 支持文件拖拽进入和拖拽释放。
+- 拖拽文件悬停时显示高亮态和 drop 提示。
+- 点击添加文件和拖拽添加文件共用同一套校验逻辑。
+- 支持多文件去重，避免同一文件重复加入待发送列表。
+- 待发送附件在输入框下方以 chip 形式展示。
+- 每个待发送附件可单独移除。
+- 支持一键清空待发送附件。
+- 文件类型和大小校验继续读取后端 `/api/health` 返回的 `allowed_extensions/max_bytes`，离线 fallback 同步包含 PDF/Office 新格式。
+
+实现方式：
+
+- 新增 `composerDragActive` 状态。
+- 新增 `addPendingFiles()`，集中处理类型校验、大小校验、去重和错误提示。
+- 新增 `removePendingFile()`，用于单个文件移除。
+- Composer 根节点增加 `dragenter/dragover/dragleave/drop` 事件。
+- 原文件 input 的 `onChange` 改为调用 `addPendingFiles()`。
+- 新增 `.pending-file-list` 和 `.composer.drag-active` 样式。
+
+改后效果：
+
+- 用户可以直接把 PDF/DOCX/PPTX/XLSX 等文件拖到输入框加入待发送附件。
+- 发送前能看清楚哪些文件会随本条消息提交。
+- 添加错文件时可以单独移除，不需要清空整个输入。
+- 文件校验逻辑不会因为点击上传和拖拽上传两套入口而分叉。
+
+已执行验证：
+
+- `npm run typecheck`
+
+验证结果：
+
+- TypeScript 类型检查通过。
+
 ### 2026-07-22：聊天滚动控制修复
 
 本次推进 Batch 7，修复新消息和 Agent 输出到达时无条件把用户拉到底部的问题。

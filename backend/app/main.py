@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from .adapters import REAL_AGENT_STAGES, AgentRegistry, ProjectLLMClient
 from .controller_assistant import ControllerAssistant
 from .agent_protocol import AGENT_SPECS, STAGE_ORDER, slice_context
-from .artifact_service import ArtifactError, ArtifactService
+from .artifact_service import ArtifactError, ArtifactService, allowed_attachment_extensions
 from .contracts import (
     FeedbackRequest,
     ControllerRouteRequest,
@@ -121,7 +121,7 @@ def health() -> dict[str, Any]:
         },
         "attachments": {
             "max_bytes": settings.attachment_max_bytes,
-            "allowed_extensions": [".txt", ".md", ".csv", ".json"],
+            "allowed_extensions": allowed_attachment_extensions(),
         },
         "llm": {
             "timeout_seconds": float(os.getenv("LLM_TIMEOUT_SECONDS", "120")),

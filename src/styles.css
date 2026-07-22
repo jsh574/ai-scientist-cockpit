@@ -2425,6 +2425,7 @@ textarea:disabled {
 }
 
 .composer {
+  position: relative;
   width: min(920px, 100%);
   margin: 0 auto;
   overflow: visible;
@@ -2432,6 +2433,28 @@ textarea:disabled {
   border: 1px solid var(--line-strong);
   border-radius: var(--radius);
   box-shadow: 0 18px 52px rgba(17, 24, 39, 0.11);
+}
+
+.composer.drag-active {
+  border-color: color-mix(in srgb, var(--blue) 48%, var(--line));
+  box-shadow:
+    0 18px 52px rgba(17, 24, 39, 0.11),
+    0 0 0 3px color-mix(in srgb, var(--blue) 14%, transparent);
+}
+
+.composer.drag-active::after {
+  position: absolute;
+  inset: 8px;
+  display: grid;
+  place-items: center;
+  color: var(--blue);
+  background: color-mix(in srgb, var(--surface) 86%, transparent);
+  border: 1px dashed color-mix(in srgb, var(--blue) 46%, var(--line));
+  border-radius: 8px;
+  content: "Drop files to attach";
+  font-size: 13px;
+  font-weight: 800;
+  pointer-events: none;
 }
 
 .composer textarea {
@@ -3197,6 +3220,64 @@ textarea:disabled {
   color: var(--muted);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.pending-file-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  padding: 0 10px 10px;
+}
+
+.pending-file-list > span,
+.pending-file-clear {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  min-height: 30px;
+  gap: 6px;
+  padding: 0 8px;
+  color: var(--text-secondary);
+  background: var(--surface-subtle);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  font-size: 12px;
+}
+
+.pending-file-list b {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pending-file-list small {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.pending-file-list button {
+  display: inline-grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 50%;
+}
+
+.pending-file-list button:hover {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 9%, transparent);
+}
+
+.pending-file-clear {
+  color: var(--muted);
+  font-weight: 760;
 }
 
 .json-tree-children {

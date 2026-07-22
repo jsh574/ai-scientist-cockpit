@@ -76,14 +76,20 @@ export interface TaskStageDetail {
 
 export interface RemoteAttachment {
   attachment_id: string;
+  file_id?: string;
   name: string;
   path: string;
+  parsed_path?: string;
   media_type: string;
+  file_type?: string;
   size: number;
+  hash?: string;
   created_at: string;
   message_id?: string | null;
   upload_status?: "pending" | "completed" | "failed";
   parse_status?: "pending" | "completed" | "failed";
+  parse_error?: string | null;
+  chunk_count?: number;
 }
 
 export type WorkflowRunStatus =
