@@ -598,6 +598,136 @@
 验证结果：
 
 - TypeScript 类型检查通过。
+
+### 2026-07-22：聊天滚动控制修复
+
+本次推进 Batch 7，修复新消息和 Agent 输出到达时无条件把用户拉到底部的问题。
+
+改动内容：
+
+- 新增 `ChatScrollState`：
+  - `isNearBottom`
+  - `autoFollowEnabled`
+  - `hasUnreadOutput`
+  - `isAgentStreaming`
+- 将原来的 `messages/running` 变化后无条件 `scrollIntoView()` 改为条件跟随。
+- 用户接近底部时继续自动跟随新输出。
+- 用户主动向上滚动后停止自动跟随。
+- 新输出到来但用户不在底部时，只显示“新输出 / New output”按钮。
+- 用户点击按钮后平滑回到底部，并恢复自动跟随。
+- 用户手动滚回底部后，自动清除未读状态。
+- 新增底部 sticky 按钮样式，运行中显示小圆点，提示仍有 Agent 输出在生成。
+
+实现方式：
+
+- 新增 `threadAreaRef` 指向真实滚动容器。
+- 新增 `syncChatScrollPosition()` 计算距离底部是否小于 96px。
+- 新增 `scrollToLatest()` 作为所有“回到最新输出”的唯一入口。
+- 保留原有 `threadEndRef`，但只在允许自动跟随或用户点击按钮时使用。
+- `updateChatScrollState()` 内部做状态比较，避免滚动事件造成重复渲染。
+
+改后效果：
+
+- 用户在阅读历史 Agent 输出、文献卡片、证据卡片、研究计划时，不会被新消息强制拉到底部。
+- 仍在底部等待输出的用户，体验保持原来的自动跟随。
+- 多 Agent 连续输出时，用户可以通过悬浮按钮明确回到最新内容。
+
+已执行验证：
+
+- `npm run typecheck`
+
+验证结果：
+
+- TypeScript 类型检查通过。
+
+### 2026-07-22：研究计划完整展示与通用 JSON 兜底
+
+本次推进 Batch 4，解决研究计划 Agent 已经返回较完整 JSON，但前端只消费部分字段的问题。
+
+改动内容：
+
+- 强化 `normalizeResearchPlan()`，补全以下字段默认值：
+  - `technical_details`
+  - `datasets.target`
+  - `rationale.text`
+  - `rationale.logic_chain.source_ids`
+  - `references.used_for`
+  - `feedback_tasks.input_requirements`
+- 研究计划专用展示新增：
+  - 科学依据
+  - 技术路线
+  - 统计检验和软件栈
+  - 目标数据集
+  - 实验流程
+  - 证据逻辑链
+  - 参考文献用途
+  - 反馈任务详情
+- 新增通用递归 `JsonTree` 渲染器。
+- 研究计划卡片底部新增“完整 JSON 兜底”，可展开查看原始 plan。
+- 原有 JSON Modal 从纯 `<pre>` 改为结构化树形展示，并保留 Raw JSON 折叠区。
+
+实现方式：
+
+- 专用 UI 继续优先展示高价值字段，避免用户只看到原始 JSON。
+- `JsonTree` 对数组和对象默认展开前两层，深层按需展开。
+- JSON 树和 Raw JSON 共用紧凑样式，避免长字段撑破弹窗或消息气泡。
+- 不改后端 research plan schema，不影响 Agent 输出协议。
+
+改后效果：
+
+- 研究计划中的关键字段不再因为前端没有专用组件而静默丢失。
+- 新增字段即使没有专用 UI，也能通过通用 JSON 兜底被用户找到。
+- JSON Modal 对所有阶段输出都更容易阅读和定位字段路径。
+
+已执行验证：
+
+- `npm run typecheck`
+
+验证结果：
+
+- TypeScript 类型检查通过。
+
+### 2026-07-22：聊天滚动控制修复
+
+本次推进 Batch 7，修复新消息和 Agent 输出到达时无条件把用户拉到底部的问题。
+
+改动内容：
+
+- 新增 `ChatScrollState`：
+  - `isNearBottom`
+  - `autoFollowEnabled`
+  - `hasUnreadOutput`
+  - `isAgentStreaming`
+- 将原来的 `messages/running` 变化后无条件 `scrollIntoView()` 改为条件跟随：
+  - 用户接近底部时，继续自动跟随新输出。
+  - 用户主动向上滚动后，停止自动跟随。
+  - 新输出到来但用户不在底部时，只显示“新输出 / New output”按钮。
+  - 用户点击按钮后平滑回到底部，并恢复自动跟随。
+  - 用户手动滚回底部后，自动清除未读状态。
+- 对话区域增加滚动监听，统一维护当前滚动状态。
+- 新增底部 sticky 按钮样式，运行中显示小圆点，提示仍有 Agent 输出在生成。
+
+实现方式：
+
+- 新增 `threadAreaRef` 指向真实滚动容器。
+- 新增 `syncChatScrollPosition()` 计算距离底部是否小于 96px。
+- 新增 `scrollToLatest()` 作为所有“回到最新输出”的唯一入口。
+- 保留原有 `threadEndRef`，但只在允许自动跟随或用户点击按钮时使用。
+- `updateChatScrollState()` 内部做状态比较，避免滚动事件造成重复渲染。
+
+改后效果：
+
+- 用户在阅读历史 Agent 输出、文献卡片、证据卡片、研究计划时，不会被新消息强制拉到底部。
+- 仍在底部等待输出的用户，体验保持原来的自动跟随。
+- 多 Agent 连续输出时，用户可以通过悬浮按钮明确回到最新内容。
+
+已执行验证：
+
+- `npm run typecheck`
+
+验证结果：
+
+- TypeScript 类型检查通过。
 - 后端 unittest 从 44 个增加到 45 个，全部通过。
 - Python 编译检查通过。
 

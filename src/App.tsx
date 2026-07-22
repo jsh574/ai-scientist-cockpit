@@ -181,6 +181,13 @@ interface ThreadMessage {
   createdAt: string;
 }
 
+interface ChatScrollState {
+  isNearBottom: boolean;
+  autoFollowEnabled: boolean;
+  hasUnreadOutput: boolean;
+  isAgentStreaming: boolean;
+}
+
 function pendingFileAttachments(files: File[], messageId: string): RemoteAttachment[] {
   const now = new Date().toISOString();
   return files.map((file, index) => ({
@@ -1090,12 +1097,25 @@ function App() {
   const [activeRun, setActiveRun] = useState<WorkflowRun | null>(null);
   const [runsByTask, setRunsByTask] = useState<Record<string, WorkflowRun | null>>({});
   const [pendingActionIds, setPendingActionIds] = useState<Set<string>>(() => new Set());
+  const [chatScrollState, setChatScrollState] = useState<ChatScrollState>({
+    isNearBottom: true,
+    autoFollowEnabled: true,
+    hasUnreadOutput: false,
+    isAgentStreaming: false,
+  });
   const [streamConnected, setStreamConnected] = useState(false);
+  const threadAreaRef = useRef<HTMLElement | null>(null);
   const threadEndRef = useRef<HTMLDivElement | null>(null);
   const taskIdRef = useRef(context.task_id);
   const activeProjectIdRef = useRef(activeProjectId);
   const runsByTaskRef = useRef<Record<string, WorkflowRun | null>>({});
   const pendingActionIdsRef = useRef<Set<string>>(new Set());
+  const chatScrollStateRef = useRef<ChatScrollState>({
+    isNearBottom: true,
+    autoFollowEnabled: true,
+    hasUnreadOutput: false,
+    isAgentStreaming: false,
+  });
   const streamConnectedByTaskRef = useRef<Record<string, boolean>>({});
   const restoredLanguageRef = useRef<Language | null>(null);
   const restoredTaskIdsRef = useRef<Set<string>>(new Set());
@@ -1146,6 +1166,44 @@ function App() {
     window.localStorage.setItem("eurekaloop-theme", theme);
   }, [theme]);
 
+  const updateChatScrollState = useCallback((patch: Partial<ChatScrollState>) => {
+    const next = { ...chatScrollStateRef.current, ...patch };
+    const previous = chatScrollStateRef.current;
+    if (
+      next.isNearBottom === previous.isNearBottom
+      && next.autoFollowEnabled === previous.autoFollowEnabled
+      && next.hasUnreadOutput === previous.hasUnreadOutput
+      && next.isAgentStreaming === previous.isAgentStreaming
+    ) {
+      return;
+    }
+    chatScrollStateRef.current = next;
+    setChatScrollState(next);
+  }, []);
+
+  const scrollToLatest = useCallback((behavior: ScrollBehavior = "smooth") => {
+    updateChatScrollState({
+      autoFollowEnabled: true,
+      hasUnreadOutput: false,
+      isNearBottom: true,
+    });
+    window.requestAnimationFrame(() => {
+      threadEndRef.current?.scrollIntoView({ behavior, block: "end" });
+    });
+  }, [updateChatScrollState]);
+
+  const syncChatScrollPosition = useCallback(() => {
+    const area = threadAreaRef.current;
+    if (!area) return;
+    const distanceToBottom = area.scrollHeight - area.scrollTop - area.clientHeight;
+    const isNearBottom = distanceToBottom < 96;
+    updateChatScrollState({
+      isNearBottom,
+      autoFollowEnabled: isNearBottom,
+      hasUnreadOutput: isNearBottom ? false : chatScrollStateRef.current.hasUnreadOutput,
+    });
+  }, [updateChatScrollState]);
+
   const refreshRuntimeData = useCallback(async () => {
     if (!hasSubmittedQuestion) return;
     setRuntimeError("");
@@ -1187,10 +1245,17 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (messages.length) {
-      threadEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    updateChatScrollState({ isAgentStreaming: running });
+  }, [running, updateChatScrollState]);
+
+  useEffect(() => {
+    if (!messages.length) return;
+    if (chatScrollStateRef.current.autoFollowEnabled || chatScrollStateRef.current.isNearBottom) {
+      scrollToLatest("smooth");
+      return;
     }
-  }, [messages, running]);
+    updateChatScrollState({ hasUnreadOutput: true });
+  }, [messages, scrollToLatest, updateChatScrollState]);
 
   useEffect(() => {
     const now = new Date().toISOString();
@@ -2554,7 +2619,12 @@ function App() {
               </div>
             </header>
 
-            <section className="thread-area" aria-label={language === "zh" ? "对话记录" : "Conversation"}>
+            <section
+              className="thread-area"
+              aria-label={language === "zh" ? "对话记录" : "Conversation"}
+              ref={threadAreaRef}
+              onScroll={syncChatScrollPosition}
+            >
               {messages.length === 0 ? (
                 <ResearchStarter
                   constraints={context.user_input.user_constraints}
@@ -2635,6 +2705,19 @@ function App() {
                 ) : null}
                 <div ref={threadEndRef} />
               </div>
+              {messages.length && (!chatScrollState.isNearBottom || chatScrollState.hasUnreadOutput) ? (
+                <button
+                  className={`scroll-latest-button ${chatScrollState.hasUnreadOutput ? "unread" : ""}`}
+                  type="button"
+                  onClick={() => scrollToLatest()}
+                >
+                  <ArrowDown size={15} />
+                  {chatScrollState.hasUnreadOutput
+                    ? language === "zh" ? "新输出" : "New output"
+                    : language === "zh" ? "回到最新" : "Latest"}
+                  {chatScrollState.isAgentStreaming ? <i /> : null}
+                </button>
+              ) : null}
             </section>
 
             <section className="composer-shell">
@@ -4338,11 +4421,19 @@ function normalizeResearchPlan(plan: ResearchPlanItem["plan"] | null | undefined
   const mainExperiment = experiments?.main_experiment;
   const results = plan?.results;
   const rationale = plan?.rationale;
+  const technical = plan?.technical_details;
   return {
     ...plan,
     problem_statement: plan?.problem_statement ?? "",
     paper_title: plan?.paper_title ?? "",
     paper_abstract: plan?.paper_abstract ?? "",
+    technical_details: {
+      ...technical,
+      required_methods: technical?.required_methods ?? [],
+      candidate_models_or_algorithms: technical?.candidate_models_or_algorithms ?? [],
+      statistical_tests: technical?.statistical_tests ?? [],
+      software_stack: technical?.software_stack ?? [],
+    },
     methods: {
       ...methods,
       overall_design: methods?.overall_design ?? "",
@@ -4357,6 +4448,10 @@ function normalizeResearchPlan(plan: ResearchPlanItem["plan"] | null | undefined
       source: (datasets?.source ?? []).map((dataset) => ({
         ...dataset,
         required_fields: dataset.required_fields ?? [],
+      })),
+      target: (datasets?.target ?? []).map((dataset) => ({
+        ...dataset,
+        fields: dataset.fields ?? [],
       })),
     },
     experiments: {
@@ -4381,16 +4476,22 @@ function normalizeResearchPlan(plan: ResearchPlanItem["plan"] | null | undefined
     },
     rationale: {
       ...rationale,
+      text: rationale?.text ?? "",
       logic_chain: (rationale?.logic_chain ?? []).map((step) => ({
         ...step,
         evidence_ids: step.evidence_ids ?? [],
+        source_ids: step.source_ids ?? [],
       })),
     },
     references: (plan?.references ?? []).map((reference) => ({
       ...reference,
       authors: reference.authors ?? [],
+      used_for: reference.used_for ?? [],
     })),
-    feedback_tasks: plan?.feedback_tasks ?? [],
+    feedback_tasks: (plan?.feedback_tasks ?? []).map((task) => ({
+      ...task,
+      input_requirements: task.input_requirements ?? [],
+    })),
     limitations: plan?.limitations ?? [],
   } as ResearchPlanItem["plan"];
 }
@@ -4472,6 +4573,7 @@ function ResearchPlanOutput({ language, researchPlan }: { language: Language; re
       <KeyValue label={language === "zh" ? "研究问题" : "Problem"} value={plan.problem_statement} />
       <KeyValue label={language === "zh" ? "论文题目" : "Paper title"} value={plan.paper_title} />
       <KeyValue label={language === "zh" ? "摘要" : "Abstract"} value={plan.paper_abstract} />
+      <KeyValue label={language === "zh" ? "科学依据" : "Rationale"} value={plan.rationale.text} />
 
       <section className="plan-section">
         <h4>{language === "zh" ? "研究设计" : "Research design"}</h4>
@@ -4487,6 +4589,19 @@ function ResearchPlanOutput({ language, researchPlan }: { language: Language; re
       </section>
 
       <section className="plan-section plan-grid">
+        <div>
+          <h4>{language === "zh" ? "技术路线" : "Technical route"}</h4>
+          <BulletList label={language === "zh" ? "方法" : "Methods"} values={plan.technical_details.required_methods} />
+          <BulletList label={language === "zh" ? "模型/算法" : "Models/algorithms"} values={plan.technical_details.candidate_models_or_algorithms} />
+        </div>
+        <div>
+          <h4>{language === "zh" ? "统计与软件" : "Statistics and software"}</h4>
+          <BulletList label={language === "zh" ? "统计检验" : "Statistical tests"} values={plan.technical_details.statistical_tests} />
+          <BulletList label={language === "zh" ? "软件栈" : "Software stack"} values={plan.technical_details.software_stack} />
+        </div>
+      </section>
+
+      <section className="plan-section plan-grid">
         <div><h4>{language === "zh" ? "实验变量" : "Variables"}</h4><PillList label={language === "zh" ? "自变量" : "Independent"} values={plan.experiments.main_experiment.independent_variables} /><PillList label={language === "zh" ? "因变量" : "Dependent"} values={plan.experiments.main_experiment.dependent_variables} /><PillList label={language === "zh" ? "控制变量" : "Controls"} values={plan.experiments.main_experiment.control_variables} /></div>
         <div><h4>{language === "zh" ? "指标与基线" : "Metrics and baselines"}</h4><BulletList label={language === "zh" ? "指标" : "Metrics"} values={plan.experiments.metrics.map((item) => `${item.name}: ${item.description}`)} /><BulletList label={language === "zh" ? "基线" : "Baselines"} values={plan.experiments.baselines.map((item) => `${item.name}: ${item.description}`)} /></div>
       </section>
@@ -4497,6 +4612,18 @@ function ResearchPlanOutput({ language, researchPlan }: { language: Language; re
           {plan.datasets.source.map((dataset, index) => (
             <article key={`${dataset.dataset_id}-${index}`}><strong>{dataset.name}</strong><p>{dataset.usage}</p><small>{dataset.access_status} · {dataset.required_fields.join(", ")}</small></article>
           ))}
+          {plan.datasets.target.map((dataset, index) => (
+            <article key={`${dataset.name}-${index}`}><strong>{dataset.name}</strong><p>{dataset.description}</p><small>{dataset.fields.join(", ")}</small></article>
+          ))}
+        </div>
+      </section>
+
+      <section className="plan-section">
+        <h4>{language === "zh" ? "实验流程" : "Experiment procedure"}</h4>
+        <div className="plan-procedure">
+          {plan.experiments.procedure.length ? plan.experiments.procedure.map((step, index) => (
+            <article key={`${step}-${index}`}><b>{String(index + 1).padStart(2, "0")}</b><p>{step}</p></article>
+          )) : <article><b>--</b><p>--</p></article>}
         </div>
       </section>
 
@@ -4510,17 +4637,44 @@ function ResearchPlanOutput({ language, researchPlan }: { language: Language; re
         <div className="trace-links">
           {plan.rationale.logic_chain.flatMap((step) => step.evidence_ids).filter((id, index, values) => values.indexOf(id) === index).map((id) => <a href={`#artifact-${id}`} key={id}>{id}</a>)}
         </div>
+        <div className="logic-chain-list">
+          {plan.rationale.logic_chain.length ? plan.rationale.logic_chain.map((step, index) => (
+            <article key={`${step.step}-${index}`}>
+              <b>{step.step ?? index + 1}</b>
+              <div>
+                <strong>{step.claim}</strong>
+                <small>{[...step.evidence_ids, ...step.source_ids].join(" · ") || "--"}</small>
+              </div>
+            </article>
+          )) : null}
+        </div>
         <div className="reference-list">
           {plan.references.map((reference, index) => (
-            <article key={`${reference.source_id}-${index}`}><strong>{reference.title}</strong><p>{reference.authors.join(", ")} · {reference.year}</p><a href={reference.url || (reference.doi ? `https://doi.org/${reference.doi}` : undefined)} target="_blank" rel="noreferrer">{reference.doi || reference.source_id}</a></article>
+            <article key={`${reference.source_id}-${index}`}><strong>{reference.title}</strong><p>{reference.authors.join(", ")} · {reference.year}</p><small>{reference.used_for.join(", ")}</small><a href={reference.url || (reference.doi ? `https://doi.org/${reference.doi}` : undefined)} target="_blank" rel="noreferrer">{reference.doi || reference.source_id}</a></article>
           ))}
         </div>
       </section>
 
       <section className="plan-section plan-grid">
         <BulletList label={language === "zh" ? "限制" : "Limitations"} values={plan.limitations} />
-        <BulletList label={language === "zh" ? "反馈任务" : "Feedback tasks"} values={plan.feedback_tasks.map((item) => `[${item.priority}] ${item.objective}`)} />
+        <div>
+          <h4>{language === "zh" ? "反馈任务" : "Feedback tasks"}</h4>
+          <div className="feedback-task-list">
+            {plan.feedback_tasks.length ? plan.feedback_tasks.map((item, index) => (
+              <article key={`${item.task_id}-${index}`}>
+                <strong>{item.task_id || item.task_type}</strong>
+                <p>[{item.priority}] {item.objective}</p>
+                <small>{item.input_requirements.join(", ") || "--"} → {item.expected_output || "--"}</small>
+              </article>
+            )) : <article><strong>--</strong><p>--</p></article>}
+          </div>
+        </div>
       </section>
+
+      <details className="json-fallback-panel">
+        <summary>{language === "zh" ? "完整 JSON 兜底" : "Complete JSON fallback"}</summary>
+        <JsonTree data={selected.plan ?? selected} rootLabel={language === "zh" ? "研究计划" : "research_plan"} />
+      </details>
     </div>
   );
 }
@@ -4552,6 +4706,50 @@ function BulletList({ label, values }: { label: string; values: unknown[] }) {
       <ul>
         {values.length ? values.map((value, index) => <li key={`${String(value)}-${index}`}>{String(value)}</li>) : <li>--</li>}
       </ul>
+    </div>
+  );
+}
+
+function JsonTree({
+  data,
+  depth = 0,
+  rootLabel = "root",
+}: {
+  data: unknown;
+  depth?: number;
+  rootLabel?: string;
+}) {
+  if (Array.isArray(data)) {
+    return (
+      <details className="json-tree-node" open={depth < 2}>
+        <summary><code>{rootLabel}</code><span>Array[{data.length}]</span></summary>
+        <div className="json-tree-children">
+          {data.length ? data.map((item, index) => (
+            <JsonTree data={item} depth={depth + 1} key={`${rootLabel}-${index}`} rootLabel={String(index)} />
+          )) : <span className="json-tree-empty">[]</span>}
+        </div>
+      </details>
+    );
+  }
+
+  if (data && typeof data === "object") {
+    const entries = Object.entries(data as Record<string, unknown>);
+    return (
+      <details className="json-tree-node" open={depth < 2}>
+        <summary><code>{rootLabel}</code><span>Object{`{${entries.length}}`}</span></summary>
+        <div className="json-tree-children">
+          {entries.length ? entries.map(([key, value]) => (
+            <JsonTree data={value} depth={depth + 1} key={key} rootLabel={key} />
+          )) : <span className="json-tree-empty">{`{}`}</span>}
+        </div>
+      </details>
+    );
+  }
+
+  return (
+    <div className="json-tree-leaf">
+      <code>{rootLabel}</code>
+      <span>{data === null ? "null" : JSON.stringify(data) ?? String(data)}</span>
     </div>
   );
 }
@@ -5069,9 +5267,15 @@ function JsonModal({ data, onClose, title }: { data: unknown; onClose: () => voi
             <X size={18} />
           </button>
         </div>
-        <pre className="json-block">
-          <code>{JSON.stringify(data, null, 2)}</code>
-        </pre>
+        <div className="json-tree-panel">
+          <JsonTree data={data} rootLabel="payload" />
+        </div>
+        <details className="raw-json-panel">
+          <summary>Raw JSON</summary>
+          <pre className="json-block">
+            <code>{JSON.stringify(data, null, 2)}</code>
+          </pre>
+        </details>
       </section>
     </div>
   );
