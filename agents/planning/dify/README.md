@@ -29,27 +29,23 @@ one hypothesis_evidence_package -> one plan_result
 
 ## 当前主工作流阶段
 
-`Research Planning Agent.yml` 仍然是单假设工作流，但内部已经拆成多阶段：
+`Research Planning Agent.yml` 仍然是单假设工作流。A/B 已经完成候选设计和选择后，C 使用快速终稿路径：
 
 ```text
 Start
 -> Normalize Evidence Context
--> Build Evidence Brief JSON
--> Draft Plan Skeleton JSON
--> Generate Full Plan Result JSON
--> Critic and Repair Plan Result JSON
+-> Generate Final Plan Fast
+-> Normalize Final Plan Contract
 -> End
 ```
 
 各阶段职责：
 
-- `Normalize Evidence Context`：Code 节点，解析 Start 输入，压缩成 `normalized_evidence_context`，包含 evidence_rows、source_literature、knowledge_gaps、guardrails。
-- `Build Evidence Brief JSON`：LLM 节点，区分 supporting、opposing、uncertain 证据，并显式写出 missing_evidence。
-- `Draft Plan Skeleton JSON`：LLM 节点，先生成变量、验证策略、数据需求、分析计划、失败判据和 feedback_tasks 骨架。
-- `Generate Full Plan Result JSON`：LLM 节点，按 `experiment_planner_plan_result_v1` 生成完整单假设计划。
-- `Critic and Repair Plan Result JSON`：LLM 节点，静默检查引用来源、证据 ID、feedback_tasks、方法步骤和 falsification criteria，并只返回修复后的最终 `plan_result`。
+- `Normalize Evidence Context`：Code 节点，解析 Start 输入，压缩 evidence、literature、knowledge gaps、guardrails，并保留 `planning_constraints.selected_design`。
+- `Generate Final Plan Fast`：唯一的 LLM 节点。存在 B 选中设计时只负责补齐执行、统计、证伪、资源和反馈细节；C-only 时从假设、证据和 `validation_idea` 直接生成。
+- `Normalize Final Plan Contract`：Code 节点，确定性归一化身份字段并验证 `plan_result` 契约。
 
-这个设计借鉴了 PaperQA2/STORM/AI Scientist/Agent Laboratory/OpenScholar 的常见拆分方式：先整理证据和结构，再写最终计划，最后做自检修复。Dify 不负责多 hypothesis 循环，也不负责文件系统/MCP。
+该调整把 C 从四次串行 LLM 调用缩减为一次；最终质量控制依赖 A/B 的显式设计评审、严格 structured output、证据 allowlist、本地 hard gate 和最终 Contract Code。Dify 不负责多 hypothesis 循环，也不负责文件系统/MCP。
 ## 官方 Research Agent Process Example 对比
 
 `dify/example/Example research agent process flow.yml` 是一个 Dify `advanced-chat` deep research 示例，核心编排是：
@@ -70,8 +66,8 @@ Start -> Exa Answer -> Intent analysis -> Answer stream
 
 可以借鉴但暂不直接照搬的优化：
 
-- 可以引入“反思/差距分析”思想，把当前 `Draft Plan Skeleton JSON` 扩展为更明确的 `known / missing / next_validation_tasks`，但仍只能基于输入证据包。
-- 可以增加一个轻量的 progress payload 设计，让前端展示“证据摘要、计划骨架、最终质检”三个阶段，而不是直接展示原始 text chunk。
+- 可以在 B 的评审结果中继续加强 `known / missing / next_validation_tasks`，但仍只能基于输入证据包。
+- 前端应展示 A 候选、B 评审和 C 终稿等结构化阶段，不直接展示原始 text chunk。
 - 如果未来总控允许 planning agent 主动补证据，再考虑引入 Dify loop/agent/tool；当前比赛初版不建议，因为会破坏上游 agent 边界和引用可控性。
 
 ## Dify DSL 语法规则
@@ -96,6 +92,9 @@ Start -> Exa Answer -> Intent analysis -> Answer stream
 - `hypothesis_evidence_package`：当前单个假设证据包 JSON 字符串
 - `planning_constraints`：研究计划生成约束 JSON 字符串
 - `user_constraints`：用户约束 JSON 字符串
+
+Workflow A 还必须接收 `variant_mode` 和可选的 `_feedback`。总控在首轮传空字符串，在后续轮次传本轮合并后的操作者/审核意见；三个 A 变体共享同一份 `_feedback`，并在不改变 hypothesis 身份和证据边界的前提下据此修订候选设计。
+
 
 注意：不再向 Dify 传 `hypothesis_evidence_packages` 复数数组。
 

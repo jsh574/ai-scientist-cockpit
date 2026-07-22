@@ -5,6 +5,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import yaml
+
 
 def test_cli_writes_failed_response_when_dify_is_not_configured():
     output = Path("samples/test-artifacts") / f"cli-test-output-{os.getpid()}.json"
@@ -117,30 +119,57 @@ def test_primary_dify_yml_uses_single_hypothesis_contract():
     assert "structured_output_enabled: true" in text
 
 
-def test_primary_dify_yml_has_multi_stage_planning_pipeline():
+def test_primary_dify_yml_has_fast_single_llm_planning_pipeline():
     yml_path = Path("dify/Research Planning Agent.yml")
 
     text = yml_path.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(text)
+    graph = workflow["workflow"]["graph"]
+    nodes = {node["id"]: node for node in graph["nodes"]}
 
-    assert "id: normalize_evidence" in text
-    assert "title: Normalize Evidence Context" in text
-    assert "normalized_evidence_context:" in text
-    assert "{{#normalize_evidence.normalized_evidence_context#}}" in text
-    assert "id: evidence_brief" in text
-    assert "title: Build Evidence Brief JSON" in text
-    assert "{{#evidence_brief.text#}}" in text
-    assert "id: plan_skeleton" in text
-    assert "title: Draft Plan Skeleton JSON" in text
-    assert "{{#plan_skeleton.text#}}" in text
-    assert "id: full_plan" in text
-    assert "title: Generate Full Plan Result JSON" in text
-    assert "id: critic_repair" in text
-    assert "title: Critic and Repair Plan Result JSON" in text
-    assert "{{#full_plan.text#}}" in text
-    assert "variable: plan_result" in text
-    assert text.count("type: llm") >= 4
-    assert "type: code" in text
-
+    assert set(nodes) == {
+        "start",
+        "normalize_evidence",
+        "full_plan",
+        "final_contract",
+        "end",
+    }
+    assert [node["data"]["type"] for node in graph["nodes"]].count("llm") == 1
+    assert [(edge["source"], edge["target"]) for edge in graph["edges"]] == [
+        ("start", "normalize_evidence"),
+        ("normalize_evidence", "full_plan"),
+        ("full_plan", "final_contract"),
+        ("final_contract", "end"),
+    ]
+    assert nodes["full_plan"]["data"]["title"] == "Generate Final Plan Fast"
+    completion = nodes["full_plan"]["data"]["model"]["completion_params"]
+    assert completion["enable_thinking"] is False
+    assert completion["response_format"] == "json_object"
+    assert completion["max_tokens"] <= 8192
+    prompts = "\n".join(
+        item["text"] for item in nodes["full_plan"]["data"]["prompt_template"]
+    )
+    assert "selected_design" in prompts
+    assert "C-only" in prompts
+    assert nodes["final_contract"]["data"]["variables"][0]["value_selector"] == [
+        "full_plan",
+        "structured_output",
+    ]
+    assert [item["variable"] for item in nodes["start"]["data"]["variables"]] == [
+        "task_id",
+        "iteration",
+        "hypothesis_id",
+        "question_card",
+        "hypothesis_evidence_package",
+        "planning_constraints",
+        "user_constraints",
+    ]
+    assert [item["variable"] for item in nodes["end"]["data"]["outputs"]] == [
+        "plan_result",
+        "contract_report",
+    ]
+    assert not {"evidence_brief", "plan_skeleton", "critic_repair"} & set(nodes)
+    assert ".text#}}" not in text
 
 def test_primary_dify_yml_avoids_manual_yaml_anchors_for_import_safety():
     yml_path = Path("dify/Research Planning Agent.yml")
@@ -170,7 +199,6 @@ def test_short_sample_file_exists_and_is_smaller_than_full_sample():
     full_path = Path("samples/input/module5_input_sample.json")
 
     short_data = json.loads(short_path.read_text(encoding="utf-8"))
-    full_data = json.loads(full_path.read_text(encoding="utf-8"))
 
     assert short_data["task_id"] == "task_short_001"
     assert short_data["user_constraints"]["max_hypotheses"] == 2

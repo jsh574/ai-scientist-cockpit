@@ -1,0 +1,665 @@
+app:
+  description: Compares bounded design candidates for one existing hypothesis and selects, revises, pauses, or rejects them using explicit rubric gates.
+  icon: ⚖️
+  icon_background: '#FEF3C7'
+  icon_type: emoji
+  mode: workflow
+  name: Planning Design Judge Selector
+  use_icon_as_answer_icon: false
+dependencies:
+- current_identifier: null
+  type: marketplace
+  value:
+    marketplace_plugin_unique_identifier: langgenius/tongyi:0.2.4@72bdf0d70a10b1b9f64746ccd1bd792397598f4536872b310e77532af02ad6a6
+    version: null
+kind: app
+version: 0.6.0
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      enabled: false
+    retriever_resource:
+      enabled: false
+    opening_statement: ''
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+  graph:
+    edges:
+    - data:
+        isInIteration: false
+        sourceType: start
+        targetType: code
+      id: start-source-prepare-target
+      source: start
+      sourceHandle: source
+      target: prepare_selection
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: code
+        targetType: llm
+      id: prepare-source-judge-target
+      source: prepare_selection
+      sourceHandle: source
+      target: judge_selector
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: llm
+        targetType: code
+      id: judge-source-validate-target
+      source: judge_selector
+      sourceHandle: source
+      target: selection_guard
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: code
+        targetType: end
+      id: validate-source-end-target
+      source: selection_guard
+      sourceHandle: source
+      target: end
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    nodes:
+    - data:
+        desc: Receives several design_candidate JSON objects for one existing hypothesis.
+        selected: false
+        title: Start
+        type: start
+        variables:
+        - label: task_id
+          max_length: 128
+          options: []
+          required: true
+          type: text-input
+          variable: task_id
+        - label: iteration
+          max_length: 32
+          options: []
+          required: true
+          type: number
+          variable: iteration
+        - label: hypothesis_id
+          max_length: 128
+          options: []
+          required: true
+          type: text-input
+          variable: hypothesis_id
+        - label: design_candidates
+          max_length: 100000
+          options: []
+          required: true
+          type: paragraph
+          variable: design_candidates
+        - label: hypothesis_evidence_package
+          max_length: 50000
+          options: []
+          required: false
+          type: paragraph
+          variable: hypothesis_evidence_package
+        - label: planning_constraints
+          max_length: 16000
+          options: []
+          required: false
+          type: paragraph
+          variable: planning_constraints
+        - label: user_constraints
+          max_length: 12000
+          options: []
+          required: false
+          type: paragraph
+          variable: user_constraints
+      height: 325
+      id: start
+      position:
+        x: 80
+        y: 240
+      positionAbsolute:
+        x: 80
+        y: 240
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        code: |
+          import json
+
+          def _loads(value, default):
+              if isinstance(value, (dict, list)):
+                  return value
+              try:
+                  return json.loads(value or "")
+              except Exception:
+                  return default
+
+          def _list(value):
+              return value if isinstance(value, list) else []
+
+          def main(task_id: str, iteration: int, hypothesis_id: str, design_candidates: str,
+                   hypothesis_evidence_package: str = "", planning_constraints: str = "",
+                   user_constraints: str = "") -> dict:
+              candidates = _loads(design_candidates, [])
+              if isinstance(candidates, dict):
+                  candidates = candidates.get("candidates", [])
+              if not isinstance(candidates, list):
+                  candidates = []
+              package = _loads(hypothesis_evidence_package, {})
+              constraints = _loads(planning_constraints, {})
+              user = _loads(user_constraints, {})
+              if not isinstance(package, dict):
+                  package = {}
+              if not isinstance(constraints, dict):
+                  constraints = {}
+              if not isinstance(user, dict):
+                  user = {}
+              allowed_evidence = []
+              allowed_sources = []
+              subset = package.get("evidence_subset", {})
+              if isinstance(subset, dict):
+                  for key in ("supporting_evidence", "opposing_evidence", "uncertain_evidence"):
+                      for item in _list(subset.get(key)):
+                          if isinstance(item, dict) and item.get("evidence_id"):
+                              allowed_evidence.append(item.get("evidence_id"))
+              for item in _list(package.get("source_literature")):
+                  if isinstance(item, dict) and item.get("literature_id"):
+                      allowed_sources.append(item.get("literature_id"))
+              rubric = {
+                  "hard_gates": [
+                      "hypothesis_id must match the input",
+                      "all evidence_id/source_id values must be from the allowlists",
+                      "method_steps, metrics, and falsification_matrix must be non-empty",
+                      "no fabricated execution, reference, dataset URL, or forbidden action"
+                  ],
+                  "soft_dimensions": [
+                      "hypothesis_alignment",
+                      "evidence_traceability",
+                      "method_and_statistics",
+                      "data_feasibility",
+                      "falsifiability",
+                      "resource_and_risk",
+                      "iteration_readiness"
+                  ],
+                  "decision_policy": {
+                      "max_revisions": 1,
+                      "tie_or_disagreement": "human_review",
+                      "missing_evidence": "feedback_required"
+                  }
+              }
+              context = {
+                  "task_id": task_id,
+                  "iteration": iteration,
+                  "hypothesis_id": hypothesis_id,
+                  "hypothesis": package.get("hypothesis", ""),
+                  "rationale": package.get("rationale", ""),
+                  "needs_more_evidence": bool(package.get("needs_more_evidence", False)),
+                  "allowed_evidence_ids": sorted(set(allowed_evidence)),
+                  "allowed_source_ids": sorted(set(allowed_sources)),
+                  "planning_constraints": constraints,
+                  "user_constraints": user,
+                  "rubric": rubric,
+                  "candidates": candidates
+              }
+              return {"selection_context": json.dumps(context, ensure_ascii=False)}
+        code_language: python3
+        desc: Builds a compact selection context and explicit rubric for the judge.
+        outputs:
+          selection_context:
+            children: null
+            type: string
+        selected: false
+        title: Prepare Selection Context
+        type: code
+        variables:
+        - value_selector:
+          - start
+          - task_id
+          variable: task_id
+        - value_selector:
+          - start
+          - iteration
+          variable: iteration
+        - value_selector:
+          - start
+          - hypothesis_id
+          variable: hypothesis_id
+        - value_selector:
+          - start
+          - design_candidates
+          variable: design_candidates
+        - value_selector:
+          - start
+          - hypothesis_evidence_package
+          variable: hypothesis_evidence_package
+        - value_selector:
+          - start
+          - planning_constraints
+          variable: planning_constraints
+        - value_selector:
+          - start
+          - user_constraints
+          variable: user_constraints
+      height: 112
+      id: prepare_selection
+      position:
+        x: 380
+        y: 240
+      positionAbsolute:
+        x: 380
+        y: 240
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        context:
+          enabled: false
+          variable_selector: []
+        desc: Scores candidates, explains trade-offs, and proposes a bounded decision.
+        model:
+          completion_params:
+            enable_thinking: true
+            max_tokens: 8192
+            response_format: json_object
+            temperature: 0.1
+          mode: chat
+          name: qwen3.6-plus
+          provider: langgenius/tongyi/tongyi
+        prompt_template:
+        - id: system_prompt
+          role: system
+          text: |
+            你是 Research Planning Agent 的候选设计评审与选择子模块。
+
+            你只能评估输入 candidates，不能生成新 hypothesis、检索文献、增加 evidence/source ID 或修改候选的科学目标。
+            必须按照 rubric 逐候选评分，并区分 hard_gates 与 soft_dimensions。
+            评分不能替代事实校验；所有 evidence_id/source_id 必须来自 allowlist。
+            如果候选接近、评估意见分歧大或风险不可接受，decision 使用 human_review。
+            如果关键证据缺失，decision 使用 feedback_required。
+            只有存在清晰优胜者且 hard gates 通过时，decision 才能使用 accept。
+            只输出严格 JSON，不要 Markdown、代码块、解释文字或隐藏思考内容。
+        - id: user_prompt
+          role: user
+          text: |
+            selection_context:
+            {{#prepare_selection.selection_context#}}
+
+            请输出 `design_selection_v1` JSON，必须包含：
+            schema_version、task_id、iteration、hypothesis_id、decision、selected_candidate_id、candidate_reviews、selected_design、revision_instruction、feedback_tasks、meta_review、limitations。
+
+            task_id、iteration、hypothesis_id 必须原样复制 selection_context 中的同名字段。
+            顶层必须是完整 design_selection_v1 对象，禁止把单个 scores 对象作为顶层输出。
+            candidate_reviews 数量必须等于 candidates 数量，并按 candidates 原顺序逐个评审。
+            candidate_reviews[] 必须逐个包含 candidate_id、hard_gate_passed、scores、strengths、issues、decision_reason。
+            scores 必须且只能包含 hypothesis_alignment、evidence_traceability、method_and_statistics、data_feasibility、falsifiability、resource_and_risk、iteration_readiness，全部取值 0 到 1。
+            selected_design 必须原样复制被选候选的 JSON，不得补写候选中不存在的字段。
+            如果 decision 不是 accept，selected_candidate_id 可以为空，selected_design 使用空对象。
+            revision_instruction 只能描述对已有候选的修改，不得要求重新生成 hypothesis 或检索新文献。
+        selected: false
+        structured_output:
+          schema:
+            additionalProperties: false
+            properties:
+              schema_version:
+                enum:
+                - design_selection_v1
+                type: string
+              task_id:
+                type: string
+              iteration:
+                type: number
+              hypothesis_id:
+                type: string
+              decision:
+                enum:
+                - accept
+                - revise_once
+                - feedback_required
+                - human_review
+                - failed
+                type: string
+              selected_candidate_id:
+                type: string
+              candidate_reviews:
+                type: array
+                items:
+                  additionalProperties: false
+                  properties:
+                    candidate_id:
+                      type: string
+                    hard_gate_passed:
+                      type: boolean
+                    scores:
+                      additionalProperties: false
+                      properties:
+                        hypothesis_alignment:
+                          type: number
+                          minimum: 0
+                          maximum: 1
+                        evidence_traceability:
+                          type: number
+                          minimum: 0
+                          maximum: 1
+                        method_and_statistics:
+                          type: number
+                          minimum: 0
+                          maximum: 1
+                        data_feasibility:
+                          type: number
+                          minimum: 0
+                          maximum: 1
+                        falsifiability:
+                          type: number
+                          minimum: 0
+                          maximum: 1
+                        resource_and_risk:
+                          type: number
+                          minimum: 0
+                          maximum: 1
+                        iteration_readiness:
+                          type: number
+                          minimum: 0
+                          maximum: 1
+                      required:
+                      - hypothesis_alignment
+                      - evidence_traceability
+                      - method_and_statistics
+                      - data_feasibility
+                      - falsifiability
+                      - resource_and_risk
+                      - iteration_readiness
+                      type: object
+                    strengths:
+                      items:
+                        type: string
+                      type: array
+                    issues:
+                      items:
+                        type: string
+                      type: array
+                    decision_reason:
+                      type: string
+                  required:
+                  - candidate_id
+                  - hard_gate_passed
+                  - scores
+                  - strengths
+                  - issues
+                  - decision_reason
+                  type: object
+              selected_design:
+                type: object
+                additionalProperties: true
+              revision_instruction:
+                type: string
+              feedback_tasks:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+              meta_review:
+                type: object
+                additionalProperties: true
+              limitations:
+                type: array
+                items:
+                  type: string
+            required:
+            - schema_version
+            - task_id
+            - iteration
+            - hypothesis_id
+            - decision
+            - selected_candidate_id
+            - candidate_reviews
+            - selected_design
+            - revision_instruction
+            - feedback_tasks
+            - meta_review
+            - limitations
+            type: object
+        structured_output_enabled: true
+        title: Judge and Select Design
+        type: llm
+        variables: []
+        vision:
+          enabled: false
+      height: 148
+      id: judge_selector
+      position:
+        x: 700
+        y: 240
+      positionAbsolute:
+        x: 700
+        y: 240
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        code: |
+          import json
+
+          def _loads(value, default):
+              if isinstance(value, (dict, list)):
+                  return value
+              try:
+                  return json.loads(value or "")
+              except Exception:
+                  return default
+
+          def main(selection_payload: dict, selection_context: str, task_id: str,
+                   iteration: int, hypothesis_id: str) -> dict:
+              selection = _loads(selection_payload, {})
+              context = _loads(selection_context, {})
+              if not isinstance(selection, dict):
+                  selection = {}
+              if not isinstance(context, dict):
+                  context = {}
+              candidates = context.get("candidates", [])
+              if not isinstance(candidates, list):
+                  candidates = []
+              by_id = {
+                  item.get("candidate_id"): item
+                  for item in candidates
+                  if isinstance(item, dict) and item.get("candidate_id")
+              }
+              issues = []
+              normalized_identity_fields = []
+              expected_identity = {
+                  "task_id": task_id,
+                  "iteration": iteration,
+                  "hypothesis_id": hypothesis_id
+              }
+              for field, expected in expected_identity.items():
+                  if selection.get(field) != expected:
+                      normalized_identity_fields.append(field)
+                  selection[field] = expected
+              if selection.get("schema_version") != "design_selection_v1":
+                  issues.append("schema_version is invalid")
+              reviews = selection.get("candidate_reviews", [])
+              if not isinstance(reviews, list):
+                  reviews = []
+                  issues.append("candidate_reviews must be a list")
+              required_scores = {
+                  "hypothesis_alignment", "evidence_traceability",
+                  "method_and_statistics", "data_feasibility", "falsifiability",
+                  "resource_and_risk", "iteration_readiness"
+              }
+              review_ids = []
+              for index, item in enumerate(reviews):
+                  if not isinstance(item, dict):
+                      issues.append(f"candidate_reviews[{index}] must be an object")
+                      continue
+                  candidate_id = item.get("candidate_id")
+                  if candidate_id:
+                      review_ids.append(candidate_id)
+                  if not isinstance(item.get("hard_gate_passed"), bool):
+                      issues.append(f"candidate_reviews[{index}].hard_gate_passed must be boolean")
+                  scores = item.get("scores")
+                  if not isinstance(scores, dict):
+                      issues.append(f"candidate_reviews[{index}].scores must be an object")
+                  else:
+                      missing_scores = sorted(required_scores - set(scores))
+                      extra_scores = sorted(set(scores) - required_scores)
+                      if missing_scores:
+                          issues.append(f"candidate_reviews[{index}].scores missing: " + ", ".join(missing_scores))
+                      if extra_scores:
+                          issues.append(f"candidate_reviews[{index}].scores contain unknown fields: " + ", ".join(extra_scores))
+                      for score_name in required_scores & set(scores):
+                          value = scores.get(score_name)
+                          if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+                              issues.append(f"candidate_reviews[{index}].scores.{score_name} must be between 0 and 1")
+                  for field in ("strengths", "issues"):
+                      if not isinstance(item.get(field), list):
+                          issues.append(f"candidate_reviews[{index}].{field} must be a list")
+                  if not isinstance(item.get("decision_reason"), str):
+                      issues.append(f"candidate_reviews[{index}].decision_reason must be a string")
+              unknown_review_ids = sorted(set(review_ids) - set(by_id))
+              missing_review_ids = sorted(set(by_id) - set(review_ids))
+              if unknown_review_ids:
+                  issues.append("candidate_reviews contain unknown candidate_id: " + ", ".join(unknown_review_ids))
+              if missing_review_ids:
+                  issues.append("candidate_reviews are missing candidate_id: " + ", ".join(missing_review_ids))
+              if len(review_ids) != len(set(review_ids)):
+                  issues.append("candidate_reviews contain duplicate candidate_id")
+              decision = selection.get("decision", "failed")
+              selected_id = selection.get("selected_candidate_id", "")
+              if decision == "accept":
+                  if selected_id not in by_id:
+                      issues.append("accepted selected_candidate_id is not present in candidates")
+                  elif by_id[selected_id].get("status") == "failed":
+                      issues.append("selected candidate is failed")
+              if decision not in {"accept", "revise_once", "feedback_required", "human_review", "failed"}:
+                  issues.append("decision is invalid")
+              selected = by_id.get(selected_id, {}) if decision == "accept" else {}
+              if issues:
+                  decision = "failed"
+                  selected = {}
+                  selection["limitations"] = list(selection.get("limitations") or []) + issues
+              selection["task_id"] = task_id
+              selection["iteration"] = iteration
+              selection["hypothesis_id"] = hypothesis_id
+              selection["decision"] = decision
+              selection["selected_candidate_id"] = selected_id if decision == "accept" else ""
+              selection["selected_design"] = selected
+              report = {
+                  "passed": not issues,
+                  "issues": issues,
+                  "candidate_count": len(by_id),
+                  "selected_candidate_id": selection.get("selected_candidate_id", ""),
+                  "normalized_identity_fields": normalized_identity_fields
+              }
+              return {
+                  "design_selection": json.dumps(selection, ensure_ascii=False),
+                  "selected_design": json.dumps(selected, ensure_ascii=False),
+                  "selection_guardrail_report": json.dumps(report, ensure_ascii=False)
+              }
+        code_language: python3
+        desc: Normalizes routing identity, validates candidate references, and preserves the stable selection contract.
+        outputs:
+          design_selection:
+            children: null
+            type: string
+          selected_design:
+            children: null
+            type: string
+          selection_guardrail_report:
+            children: null
+            type: string
+        selected: false
+        title: Validate Selection Output
+        type: code
+        variables:
+        - value_selector:
+          - judge_selector
+          - structured_output
+          variable: selection_payload
+        - value_selector:
+          - prepare_selection
+          - selection_context
+          variable: selection_context
+        - value_selector:
+          - start
+          - task_id
+          variable: task_id
+        - value_selector:
+          - start
+          - iteration
+          variable: iteration
+        - value_selector:
+          - start
+          - task_id
+          variable: task_id
+        - value_selector:
+          - start
+          - iteration
+          variable: iteration
+        - value_selector:
+          - start
+          - hypothesis_id
+          variable: hypothesis_id
+      height: 112
+      id: selection_guard
+      position:
+        x: 1020
+        y: 240
+      positionAbsolute:
+        x: 1020
+        y: 240
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        desc: Returns the selection board, selected design, and deterministic guardrail report.
+        outputs:
+        - value_selector:
+          - selection_guard
+          - design_selection
+          variable: design_selection
+        - value_selector:
+          - selection_guard
+          - selected_design
+          variable: selected_design
+        - value_selector:
+          - selection_guard
+          - selection_guardrail_report
+          variable: selection_guardrail_report
+        selected: false
+        title: End
+        type: end
+      height: 132
+      id: end
+      position:
+        x: 1320
+        y: 240
+      positionAbsolute:
+        x: 1320
+        y: 240
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    viewport:
+      x: -100
+      y: 150
+      zoom: 0.9
+  rag_pipeline_variables: []

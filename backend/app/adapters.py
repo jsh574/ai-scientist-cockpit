@@ -343,10 +343,16 @@ def evidence_mapping_request(task_context: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def planning_request(task_context: dict[str, Any]) -> dict[str, Any]:
+def planning_request(
+    task_context: dict[str, Any], feedback: str | None = None
+) -> dict[str, Any]:
     user_constraints = task_context.get("user_constraints")
     if not isinstance(user_constraints, dict):
         user_constraints = (task_context.get("user_input") or {}).get("user_constraints", {})
+    hypothesis_cards = task_context.get("hypothesis_cards") or []
+    request_mode = task_context.get("request_mode")
+    if request_mode not in {"single", "batch"}:
+        request_mode = "single" if len(hypothesis_cards) == 1 else "batch"
     planning_constraints = task_context.get("planning_constraints")
     if not isinstance(planning_constraints, dict):
         planning_constraints = {
@@ -368,16 +374,19 @@ def planning_request(task_context: dict[str, Any]) -> dict[str, Any]:
             ),
         }
     return {
+        "schema_version": "experiment_planner_input_v1",
         "task_id": str(task_context.get("task_id") or ""),
         "iteration": int(task_context.get("iteration") or 1),
+        "request_mode": request_mode,
         "question_card": task_context.get("question_card") or {},
-        "hypothesis_cards": task_context.get("hypothesis_cards") or [],
+        "hypothesis_cards": hypothesis_cards,
         "evidence_map": task_context.get("evidence_map") or [],
         "literature_cards": task_context.get("literature_cards") or [],
         "evidence_cards": task_context.get("evidence_cards") or [],
         "knowledge_gaps": task_context.get("knowledge_gaps") or [],
         "user_constraints": user_constraints,
         "planning_constraints": planning_constraints,
+        "_feedback": feedback or "",
     }
 
 
@@ -484,14 +493,7 @@ class AgentRegistry:
         try:
             if cancellation_checker:
                 cancellation_checker()
-            if stage == "knowledge_integration":
-                raw = runner(
-                    task_context,
-                    feedback,
-                    progress_handler,
-                    cancellation_checker,
-                )
-            elif stage == "research_planning":
+            if stage == "knowledge_integration" or stage == "research_planning":
                 raw = runner(
                     task_context,
                     feedback,
@@ -800,7 +802,7 @@ class AgentRegistry:
             cancellation_checker=cancellation_checker,
         )
         raw = service.run_planning_agent(
-            planning_request(task_context),
+            planning_request(task_context, feedback=_feedback),
             dify_client=client,
             max_packages=int(os.getenv("PLANNING_MAX_HYPOTHESES", "2")),
             max_parallel_calls=int(os.getenv("PLANNING_MAX_PARALLEL_CALLS", "1")),

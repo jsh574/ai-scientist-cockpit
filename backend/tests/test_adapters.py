@@ -374,6 +374,16 @@ class AdapterContractTests(unittest.TestCase):
             response["self_review"]["dimension_scores"]["scoring_backend_llm"], 1.0
         )
 
+    def test_planning_request_uses_v01_module_contract(self) -> None:
+        request = planning_request(self.downstream_context(), feedback="优先降低样本量")
+
+        self.assertEqual(request["schema_version"], "experiment_planner_input_v1")
+        self.assertEqual(request["request_mode"], "single")
+        self.assertIn("question_card", request)
+        self.assertIn("hypothesis_cards", request)
+        self.assertIn("evidence_map", request)
+        self.assertEqual(request["_feedback"], "优先降低样本量")
+
     def test_planning_dify_output_reports_unknown_traceability_ids(self) -> None:
         class FakeDifyClient:
             configured = True

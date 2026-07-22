@@ -51,6 +51,17 @@ def test_validate_planner_input_reports_missing_required_fields():
     assert "Missing required field: evidence_cards" in errors
 
 
+def test_validate_planner_input_enforces_protocol_version_and_request_mode():
+    data = sample_planner_input()
+    data["schema_version"] = "legacy_planner_input"
+    data["request_mode"] = "interactive"
+
+    errors = validate_planner_input(data)
+
+    assert "Field must equal experiment_planner_input_v1: schema_version" in errors
+    assert "Field must be single or batch: request_mode" in errors
+
+
 def test_build_dify_workflow_inputs_serializes_one_package_for_one_dify_run():
     data = sample_planner_input()
     package = build_hypothesis_evidence_packages(data)[0]

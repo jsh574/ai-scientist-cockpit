@@ -1,0 +1,601 @@
+app:
+  description: Generates one bounded, evidence-grounded research-design candidate for an existing hypothesis. It does not generate hypotheses or retrieve literature.
+  icon: 🧩
+  icon_background: '#E0F2FE'
+  icon_type: emoji
+  mode: workflow
+  name: Planning Design Candidate Generator
+  use_icon_as_answer_icon: false
+dependencies:
+- current_identifier: null
+  type: marketplace
+  value:
+    marketplace_plugin_unique_identifier: langgenius/tongyi:0.2.4@72bdf0d70a10b1b9f64746ccd1bd792397598f4536872b310e77532af02ad6a6
+    version: null
+kind: app
+version: 0.6.0
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      enabled: false
+    retriever_resource:
+      enabled: false
+    opening_statement: ''
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+  graph:
+    edges:
+    - data:
+        isInIteration: false
+        sourceType: start
+        targetType: code
+      id: start-source-context-target
+      source: start
+      sourceHandle: source
+      target: compact_context
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: code
+        targetType: llm
+      id: context-source-candidate-target
+      source: compact_context
+      sourceHandle: source
+      target: design_candidate_llm
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: llm
+        targetType: code
+      id: candidate-source-guard-target
+      source: design_candidate_llm
+      sourceHandle: source
+      target: candidate_guard
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        sourceType: code
+        targetType: end
+      id: guard-source-end-target
+      source: candidate_guard
+      sourceHandle: source
+      target: end
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    nodes:
+    - data:
+        desc: Receives one existing hypothesis and one requested design variant.
+        selected: false
+        title: Start
+        type: start
+        variables:
+        - label: task_id
+          max_length: 128
+          options: []
+          required: true
+          type: text-input
+          variable: task_id
+        - label: iteration
+          max_length: 32
+          options: []
+          required: true
+          type: number
+          variable: iteration
+        - label: hypothesis_id
+          max_length: 128
+          options: []
+          required: true
+          type: text-input
+          variable: hypothesis_id
+        - label: variant_mode
+          max_length: 64
+          options: []
+          required: true
+          type: text-input
+          variable: variant_mode
+        - label: question_card
+          max_length: 20000
+          options: []
+          required: true
+          type: paragraph
+          variable: question_card
+        - label: hypothesis_evidence_package
+          max_length: 50000
+          options: []
+          required: true
+          type: paragraph
+          variable: hypothesis_evidence_package
+        - label: planning_constraints
+          max_length: 16000
+          options: []
+          required: false
+          type: paragraph
+          variable: planning_constraints
+        - label: user_constraints
+          max_length: 12000
+          options: []
+          required: false
+          type: paragraph
+          variable: user_constraints
+        - label: _feedback
+          max_length: 12000
+          options: []
+          required: false
+          type: paragraph
+          variable: _feedback
+      height: 400
+      id: start
+      position:
+        x: 80
+        y: 240
+      positionAbsolute:
+        x: 80
+        y: 240
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        code: |
+          import json
+
+          def _loads(value, default):
+              if value is None or value == "":
+                  return default
+              if isinstance(value, (dict, list)):
+                  return value
+              try:
+                  return json.loads(value)
+              except Exception:
+                  return default
+
+          def _list(value):
+              return value if isinstance(value, list) else []
+
+          def _compact_evidence(item, direction):
+              if not isinstance(item, dict):
+                  return None
+              return {
+                  "direction": direction,
+                  "evidence_id": item.get("evidence_id", ""),
+                  "claim": item.get("claim", ""),
+                  "summary": item.get("summary", ""),
+                  "source_literature_id": item.get("source_literature_id", ""),
+                  "strength_score": item.get("strength_score", 0)
+              }
+
+          def main(question_card: str, hypothesis_id: str, variant_mode: str,
+                   hypothesis_evidence_package: str, planning_constraints: str = "",
+                   user_constraints: str = "", _feedback: str = "") -> dict:
+              question = _loads(question_card, {})
+              package = _loads(hypothesis_evidence_package, {})
+              constraints = _loads(planning_constraints, {})
+              user = _loads(user_constraints, {})
+              feedback = _feedback.strip() if isinstance(_feedback, str) else ""
+              if not isinstance(question, dict):
+                  question = {}
+              if not isinstance(package, dict):
+                  package = {}
+              evidence_subset = package.get("evidence_subset", {})
+              if not isinstance(evidence_subset, dict):
+                  evidence_subset = {}
+              evidence_rows = []
+              for key, direction in (("supporting_evidence", "supporting"),
+                                     ("opposing_evidence", "opposing"),
+                                     ("uncertain_evidence", "uncertain")):
+                  for item in _list(evidence_subset.get(key)):
+                      row = _compact_evidence(item, direction)
+                      if row:
+                          evidence_rows.append(row)
+              literature = []
+              for item in _list(package.get("source_literature")):
+                  if isinstance(item, dict):
+                      literature.append({
+                          "literature_id": item.get("literature_id", ""),
+                          "title": item.get("title", ""),
+                          "year": item.get("year", ""),
+                          "doi": item.get("doi", ""),
+                          "url": item.get("url", "")
+                      })
+              gaps = []
+              for item in _list(package.get("knowledge_gaps")):
+                  if isinstance(item, dict):
+                      gaps.append({"gap_id": item.get("gap_id", ""),
+                                   "description": item.get("description", "")})
+                  else:
+                      gaps.append({"gap_id": "", "description": str(item)})
+              allowed_evidence_ids = [x.get("evidence_id") for x in evidence_rows if x.get("evidence_id")]
+              allowed_source_ids = [x.get("literature_id") for x in literature if x.get("literature_id")]
+              context = {
+                  "input_valid": bool(hypothesis_id and package.get("hypothesis")),
+                  "task_scope": {
+                      "hypothesis_id": hypothesis_id,
+                      "variant_mode": variant_mode,
+                      "core_question": question.get("core_question", ""),
+                      "domain": question.get("domain", []),
+                      "research_object": question.get("research_object", {}),
+                      "hypothesis": package.get("hypothesis", ""),
+                      "rationale": package.get("rationale", ""),
+                      "target_variables": package.get("target_variables", []),
+                      "expected_observation": package.get("expected_observation", ""),
+                      "validation_idea": package.get("validation_idea", "")
+                  },
+                  "scores": package.get("scores", {}),
+                  "evidence_rows": evidence_rows,
+                  "source_literature": literature,
+                  "knowledge_gaps": gaps,
+                  "limitations": package.get("limitations", []),
+                  "needs_more_evidence": bool(package.get("needs_more_evidence", False)),
+                  "planning_constraints": constraints,
+                  "user_constraints": user,
+                  "iteration_feedback": feedback,
+                  "guardrails": {
+                      "allowed_evidence_ids": allowed_evidence_ids,
+                      "allowed_source_ids": allowed_source_ids,
+                      "allowed_validation_types": constraints.get("allowed_validation_types", []),
+                      "forbidden_actions": constraints.get("forbidden_actions", [])
+                  }
+              }
+              return {"planning_context": json.dumps(context, ensure_ascii=False)}
+        code_language: python3
+        desc: Creates a compact, citation-grounded context view for one design candidate.
+        outputs:
+          planning_context:
+            children: null
+            type: string
+        selected: false
+        title: Build Compact Planning Context
+        type: code
+        variables:
+        - value_selector:
+          - start
+          - question_card
+          variable: question_card
+        - value_selector:
+          - start
+          - hypothesis_id
+          variable: hypothesis_id
+        - value_selector:
+          - start
+          - variant_mode
+          variable: variant_mode
+        - value_selector:
+          - start
+          - hypothesis_evidence_package
+          variable: hypothesis_evidence_package
+        - value_selector:
+          - start
+          - planning_constraints
+          variable: planning_constraints
+        - value_selector:
+          - start
+          - user_constraints
+          variable: user_constraints
+        - value_selector:
+          - start
+          - _feedback
+          variable: _feedback
+      height: 112
+      id: compact_context
+      position:
+        x: 380
+        y: 240
+      positionAbsolute:
+        x: 380
+        y: 240
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        context:
+          enabled: false
+          variable_selector: []
+        desc: Generates one executable design candidate without creating new hypotheses or retrieving new literature.
+        model:
+          completion_params:
+            enable_thinking: true
+            max_tokens: 8192
+            response_format: json_object
+            temperature: 0.25
+          mode: chat
+          name: qwen3.6-plus
+          provider: langgenius/tongyi/tongyi
+        prompt_template:
+        - id: system_prompt
+          role: system
+          text: |
+            你是 Research Planning Agent 的实验设计候选生成子模块。
+
+            你只负责把上游已经给出的一个 hypothesis 转换成一个可执行的 research design candidate。
+            不得生成新 hypothesis，不得检索或新增文献，不得新增 evidence_id、source_id、数据集 URL，也不得声称实验已经完成。
+            只能使用 planning_context 中的证据、文献和约束。
+            variant_mode 只决定设计取向，不改变 hypothesis 的含义。
+            iteration_feedback 非空时必须优先响应其中的修订要求，但不得改变 hypothesis 身份、绕过证据 allowlist 或违反 planning/user constraints。
+            输出必须是严格 JSON，不要 Markdown、代码块、解释文字或隐藏思考内容。
+            若输入不完整，status 使用 partial_success 或 failed，并把问题写入 limitations 或 feedback_tasks。
+        - id: user_prompt
+          role: user
+          text: |
+            planning_context:
+            {{#compact_context.planning_context#}}
+
+            请生成一个 `design_candidate_v1` JSON。候选设计必须包含：
+            schema_version、candidate_id、hypothesis_id、variant_mode、status、planning_objective、design_type、rationale、variables、operationalization、data_contract、method_steps、baselines、metrics、statistical_analysis、falsification_matrix、contingencies、resource_profile、feedback_tasks、limitations。
+
+            candidate_id 使用 `{{#start.hypothesis_id#}}::{{#start.variant_mode#}}`。
+            rationale 中的 evidence_ids/source_ids 只能来自 guardrails allowlist。
+            如果 needs_more_evidence=true，必须把缺口转为 feedback_tasks，但仍可给出条件式设计。
+            falsification_matrix 必须说明什么观测结果会支持、削弱或推翻假设。
+            method_steps 每一步都要有 input、action、output。
+        selected: false
+        structured_output:
+          schema:
+            additionalProperties: false
+            properties:
+              candidate_id:
+                type: string
+              hypothesis_id:
+                type: string
+              variant_mode:
+                type: string
+              schema_version:
+                enum:
+                - design_candidate_v1
+                type: string
+              status:
+                enum:
+                - success
+                - partial_success
+                - failed
+                type: string
+              planning_objective:
+                type: string
+              design_type:
+                type: string
+              rationale:
+                type: object
+                additionalProperties: true
+              variables:
+                type: object
+                additionalProperties: true
+              operationalization:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+              data_contract:
+                type: object
+                additionalProperties: true
+              method_steps:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+              baselines:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+              metrics:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+              statistical_analysis:
+                type: array
+                items:
+                  type: string
+              falsification_matrix:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+              contingencies:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+              resource_profile:
+                type: object
+                additionalProperties: true
+              feedback_tasks:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: true
+              limitations:
+                type: array
+                items:
+                  type: string
+            required:
+            - schema_version
+            - candidate_id
+            - hypothesis_id
+            - variant_mode
+            - status
+            - planning_objective
+            - design_type
+            - rationale
+            - variables
+            - operationalization
+            - data_contract
+            - method_steps
+            - baselines
+            - metrics
+            - statistical_analysis
+            - falsification_matrix
+            - contingencies
+            - resource_profile
+            - feedback_tasks
+            - limitations
+            type: object
+        structured_output_enabled: true
+        title: Generate Design Candidate JSON
+        type: llm
+        variables: []
+        vision:
+          enabled: false
+      height: 148
+      id: design_candidate_llm
+      position:
+        x: 700
+        y: 240
+      positionAbsolute:
+        x: 700
+        y: 240
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        code: |
+          import json
+
+          def _loads(value, default):
+              if isinstance(value, (dict, list)):
+                  return value
+              try:
+                  return json.loads(value or "")
+              except Exception:
+                  return default
+
+          def main(candidate_payload: dict, planning_context: str, hypothesis_id: str,
+                   variant_mode: str) -> dict:
+              candidate = _loads(candidate_payload, {})
+              context = _loads(planning_context, {})
+              if not isinstance(candidate, dict):
+                  candidate = {}
+              if not isinstance(context, dict):
+                  context = {}
+              guardrails = context.get("guardrails", {})
+              allowed_evidence = set(guardrails.get("allowed_evidence_ids", []))
+              allowed_sources = set(guardrails.get("allowed_source_ids", []))
+              issues = []
+              normalized_identity_fields = []
+              expected_identity = {
+                  "hypothesis_id": hypothesis_id,
+                  "variant_mode": variant_mode,
+                  "candidate_id": f"{hypothesis_id}::{variant_mode}"
+              }
+              for field, expected in expected_identity.items():
+                  if candidate.get(field) != expected:
+                      normalized_identity_fields.append(field)
+                  candidate[field] = expected
+              if candidate.get("schema_version") != "design_candidate_v1":
+                  issues.append("schema_version is invalid")
+              if not isinstance(candidate.get("method_steps"), list) or not candidate.get("method_steps"):
+                  issues.append("method_steps must be non-empty")
+              if not isinstance(candidate.get("falsification_matrix"), list) or not candidate.get("falsification_matrix"):
+                  issues.append("falsification_matrix must be non-empty")
+              serialized = json.dumps(candidate, ensure_ascii=False)
+              unknown_evidence = [x for x in allowed_evidence if False]
+              for evidence_id in candidate.get("rationale", {}).get("evidence_ids", []):
+                  if evidence_id not in allowed_evidence:
+                      unknown_evidence.append(evidence_id)
+              for source_id in candidate.get("rationale", {}).get("source_ids", []):
+                  if source_id not in allowed_sources:
+                      issues.append(f"unknown source_id: {source_id}")
+              if unknown_evidence:
+                  issues.append("unknown evidence_id: " + ", ".join(unknown_evidence))
+              if issues:
+                  candidate["status"] = "partial_success"
+                  candidate["limitations"] = list(candidate.get("limitations") or []) + issues
+              report = {
+                  "passed": not issues,
+                  "issues": issues,
+                  "allowed_evidence_count": len(allowed_evidence),
+                  "allowed_source_count": len(allowed_sources),
+                  "normalized_identity_fields": normalized_identity_fields
+              }
+              return {
+                  "design_candidate": json.dumps(candidate, ensure_ascii=False),
+                  "guardrail_report": json.dumps(report, ensure_ascii=False)
+              }
+        code_language: python3
+        desc: Normalizes routing identity and checks required planning fields plus evidence/source traceability.
+        outputs:
+          design_candidate:
+            children: null
+            type: string
+          guardrail_report:
+            children: null
+            type: string
+        selected: false
+        title: Guardrail Candidate Output
+        type: code
+        variables:
+        - value_selector:
+          - design_candidate_llm
+          - structured_output
+          variable: candidate_payload
+        - value_selector:
+          - compact_context
+          - planning_context
+          variable: planning_context
+        - value_selector:
+          - start
+          - hypothesis_id
+          variable: hypothesis_id
+        - value_selector:
+          - start
+          - variant_mode
+          variable: variant_mode
+      height: 112
+      id: candidate_guard
+      position:
+        x: 1020
+        y: 240
+      positionAbsolute:
+        x: 1020
+        y: 240
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    - data:
+        desc: Returns one design_candidate JSON and its deterministic guardrail report.
+        outputs:
+        - value_selector:
+          - candidate_guard
+          - design_candidate
+          variable: design_candidate
+        - value_selector:
+          - candidate_guard
+          - guardrail_report
+          variable: guardrail_report
+        selected: false
+        title: End
+        type: end
+      height: 132
+      id: end
+      position:
+        x: 1320
+        y: 240
+      positionAbsolute:
+        x: 1320
+        y: 240
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+    viewport:
+      x: -100
+      y: 150
+      zoom: 0.9
+  rag_pipeline_variables: []
