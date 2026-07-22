@@ -445,6 +445,40 @@ class OrchestratorTests(unittest.TestCase):
         ]
         self.assertEqual(len(overrides), 1)
 
+    def test_stage_input_receives_retrieved_attachment_chunks(self) -> None:
+        context = self.create()
+        self.artifacts.add_attachment(
+            context["task_id"],
+            "background.md",
+            (
+                "Inflammation markers and cytokines should be measured before tau PET follow-up. "
+                "This protocol note is relevant to the question."
+            ).encode("utf-8"),
+            "text/markdown",
+            context_char_limit=10_000,
+            message_id="msg_background",
+        )
+
+        result = self.orchestrator.run_stage(context["task_id"], "question_understanding")
+        detail = self.artifacts.get_node_run(
+            context["task_id"],
+            "question_understanding",
+            result["node_run_id"],
+        )
+        attachment_context = detail["input"]["attachment_context"]
+
+        self.assertEqual(
+            attachment_context["schema_version"],
+            "attachment_retrieval_v1",
+        )
+        self.assertEqual(attachment_context["retrieval_mode"], "stage_scoped_chunks")
+        self.assertGreaterEqual(len(attachment_context["chunks"]), 1)
+        self.assertIn("citation_id", attachment_context["chunks"][0])
+        self.assertIn(
+            "cytokines",
+            detail["input"]["user_input"]["retrieved_attachment_chunks"][0]["text"],
+        )
+
     def test_node_run_diff_compares_persisted_outputs(self) -> None:
         context = self.create()
         first = self.artifacts.begin_node_run(

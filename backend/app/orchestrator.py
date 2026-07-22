@@ -323,6 +323,122 @@ class Orchestrator:
         return "\n\n".join(parts)[:12000] or None
 
     @staticmethod
+    def _text_values(value: Any, *, max_items: int = 40) -> list[str]:
+        result: list[str] = []
+
+        def visit(child: Any) -> None:
+            if len(result) >= max_items:
+                return
+            if isinstance(child, str):
+                clean = child.strip()
+                if clean:
+                    result.append(clean)
+                return
+            if isinstance(child, dict):
+                for key in (
+                    "core_question",
+                    "research_object",
+                    "description",
+                    "claim",
+                    "hypothesis",
+                    "statement",
+                    "gap",
+                    "title",
+                    "summary",
+                    "rationale",
+                    "expected_result",
+                ):
+                    if key in child:
+                        visit(child.get(key))
+                return
+            if isinstance(child, list):
+                for item in child:
+                    visit(item)
+
+        visit(value)
+        return result
+
+    def _attachment_retrieval_query(
+        self,
+        context: dict[str, Any],
+        stage: str,
+        feedback: str | None,
+    ) -> str:
+        user_input = context.get("user_input") or {}
+        parts: list[str] = [
+            str(user_input.get("original_question") or ""),
+            str(user_input.get("base_question_description") or ""),
+            str(feedback or ""),
+            stage,
+        ]
+        if stage in {"question_understanding", "knowledge_integration"}:
+            parts.extend(self._text_values(context.get("question_card")))
+        elif stage == "hypothesis_generation":
+            parts.extend(self._text_values(context.get("question_card")))
+            parts.extend(self._text_values(context.get("evidence_cards")))
+            parts.extend(self._text_values(context.get("knowledge_gaps")))
+        elif stage == "evidence_mapping":
+            parts.extend(self._text_values(context.get("hypothesis_cards")))
+            parts.extend(self._text_values(context.get("evidence_cards")))
+        elif stage == "research_planning":
+            parts.extend(self._text_values(context.get("question_card")))
+            parts.extend(self._text_values(context.get("hypothesis_cards")))
+            parts.extend(self._text_values(context.get("evidence_map")))
+            parts.extend(self._text_values(context.get("knowledge_gaps")))
+        else:
+            parts.extend(self._text_values(context))
+        return "\n".join(part for part in parts if part).strip()[:12000]
+
+    @staticmethod
+    def _format_attachment_chunks(chunks: list[dict[str, Any]]) -> str:
+        lines = []
+        for chunk in chunks:
+            lines.append(
+                "\n".join(
+                    [
+                        f"[{chunk.get('citation_id')}] {chunk.get('name')} / {chunk.get('chunk_id')}",
+                        str(chunk.get("text") or ""),
+                    ]
+                )
+            )
+        return "\n\n".join(lines)
+
+    def _inject_attachment_context(
+        self,
+        context: dict[str, Any],
+        stage: str,
+        chunks: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        execution_context = dict(context)
+        user_input = dict((execution_context.get("user_input") or {}))
+        base_description = str(user_input.get("question_description") or "").strip()
+        retrieved_text = self._format_attachment_chunks(chunks)
+        if retrieved_text:
+            user_input["retrieved_attachment_chunks"] = chunks
+            user_input["question_description"] = "\n\n".join(
+                part
+                for part in (
+                    base_description,
+                    "[Retrieved attachment chunks for this Agent]\n" + retrieved_text,
+                )
+                if part
+            )[:20000]
+        execution_context["user_input"] = user_input
+        extensions = dict(execution_context.get("extensions") or {})
+        retrieval_payload = {
+            "schema_version": "attachment_retrieval_v1",
+            "stage": stage,
+            "chunks": chunks,
+        }
+        extensions["retrieved_attachment_chunks"] = retrieval_payload
+        spec = get_agent_spec(stage)
+        agent_extensions = dict(extensions.get(spec.agent_id) or {})
+        agent_extensions["attachment_context"] = retrieval_payload
+        extensions[spec.agent_id] = agent_extensions
+        execution_context["extensions"] = extensions
+        return execution_context
+
+    @staticmethod
     def _invalidate_from_stage(
         context: dict[str, Any], target_stage: str
     ) -> tuple[tuple[str, ...], list[str]]:
@@ -367,8 +483,25 @@ class Orchestrator:
             context = self.artifacts.load_context(task_id)
             iteration = int(context.get("iteration") or 1)
             effective_feedback = self._feedback_with_memory(context, stage, feedback)
-            stage_input = slice_context(context, spec)
-            execution_context = dict(context)
+            attachment_query = self._attachment_retrieval_query(
+                context, stage, effective_feedback
+            )
+            attachment_chunks = self.artifacts.search_attachment_chunks(
+                task_id, attachment_query, stage=stage, limit=6
+            )
+            execution_context = (
+                self._inject_attachment_context(context, stage, attachment_chunks)
+                if attachment_chunks
+                else dict(context)
+            )
+            stage_input = slice_context(execution_context, spec)
+            if attachment_chunks:
+                stage_input["attachment_context"] = {
+                    "schema_version": "attachment_retrieval_v1",
+                    "retrieval_mode": "stage_scoped_chunks",
+                    "query": attachment_query[:2000],
+                    "chunks": attachment_chunks,
+                }
             if input_override:
                 unknown = sorted(set(input_override) - set(spec.reads) - {"extensions"})
                 if unknown:
@@ -397,6 +530,14 @@ class Orchestrator:
             node_run_id = self.artifacts.begin_node_run(
                 task_id, stage, iteration, stage_input
             )
+            if attachment_chunks:
+                self._event(
+                    task_id,
+                    "attachment_chunks_retrieved",
+                    f"{stage} retrieved {len(attachment_chunks)} attachment chunks.",
+                    stage,
+                    citations=[chunk.get("citation_id") for chunk in attachment_chunks],
+                )
             self._event(task_id, "stage_started", f"{stage} started.", stage)
 
             try:

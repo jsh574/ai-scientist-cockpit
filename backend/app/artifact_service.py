@@ -29,6 +29,7 @@ _ALLOWED_ATTACHMENT_EXTENSIONS = {
 }
 _TEXT_ATTACHMENT_EXTENSIONS = {".txt", ".md", ".csv", ".json"}
 _LEGACY_OFFICE_EXTENSIONS = {".doc", ".ppt", ".xls"}
+_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]{2,}|[\u4e00-\u9fff]{2,}")
 
 
 def allowed_attachment_extensions() -> list[str]:
@@ -141,6 +142,28 @@ class ArtifactService:
             {"chunk_id": f"chunk_{index + 1:03d}", "text": compact[start:start + chunk_size]}
             for index, start in enumerate(range(0, len(compact), chunk_size))
         ]
+
+    @staticmethod
+    def _search_terms(text: str) -> set[str]:
+        return {
+            token.lower()
+            for token in _TOKEN_PATTERN.findall(text)
+            if len(token.strip()) >= 2
+        }
+
+    @staticmethod
+    def _chunk_score(query_terms: set[str], chunk_text: str) -> float:
+        chunk_terms = ArtifactService._search_terms(chunk_text)
+        if not chunk_terms:
+            return 0.0
+        if not query_terms:
+            return 0.01
+        overlap = query_terms & chunk_terms
+        if not overlap:
+            return 0.0
+        density = len(overlap) / max(1, len(query_terms))
+        coverage = len(overlap) / max(1, len(chunk_terms))
+        return round(density + coverage, 6)
 
     @staticmethod
     def _parse_text_attachment(content: bytes, extension: str) -> tuple[str, dict[str, Any]]:
@@ -388,6 +411,65 @@ class ArtifactService:
         except ArtifactError:
             return []
         return [dict(item) for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+    def search_attachment_chunks(
+        self,
+        task_id: str,
+        query: str,
+        *,
+        stage: str | None = None,
+        limit: int = 6,
+        max_chunk_chars: int = 1400,
+    ) -> list[dict[str, Any]]:
+        query_terms = self._search_terms(query)
+        candidates: list[dict[str, Any]] = []
+        for attachment in self.list_attachments(task_id):
+            if attachment.get("parse_status") != "completed":
+                continue
+            parsed_path = str(attachment.get("parsed_path") or "")
+            if not parsed_path:
+                continue
+            try:
+                parsed = self.read_json(task_id, parsed_path)
+            except ArtifactError:
+                continue
+            chunks = parsed.get("chunks") if isinstance(parsed, dict) else []
+            if not isinstance(chunks, list):
+                continue
+            for index, chunk in enumerate(chunks):
+                if not isinstance(chunk, dict):
+                    continue
+                text = str(chunk.get("text") or "").strip()
+                if not text:
+                    continue
+                score = self._chunk_score(query_terms, text)
+                attachment_id = str(attachment.get("attachment_id") or attachment.get("file_id") or "")
+                candidates.append(
+                    {
+                        "citation_id": f"{attachment_id}:{chunk.get('chunk_id') or index + 1}",
+                        "attachment_id": attachment_id,
+                        "file_id": attachment.get("file_id") or attachment_id,
+                        "name": attachment.get("name"),
+                        "file_type": attachment.get("file_type"),
+                        "parsed_path": parsed_path,
+                        "chunk_id": chunk.get("chunk_id") or f"chunk_{index + 1:03d}",
+                        "chunk_index": index,
+                        "stage": stage,
+                        "score": score,
+                        "text": text[:max_chunk_chars],
+                    }
+                )
+        candidates.sort(
+            key=lambda item: (
+                -float(item.get("score") or 0),
+                int(item.get("chunk_index") or 0),
+                str(item.get("name") or ""),
+            )
+        )
+        selected = [item for item in candidates if float(item.get("score") or 0) > 0][:limit]
+        if not selected:
+            selected = candidates[:limit]
+        return selected
 
     def add_attachment(
         self,

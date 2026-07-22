@@ -599,6 +599,221 @@
 
 - TypeScript 类型检查通过。
 
+### 2026-07-22：NodeDebugger 附件 citation 可视化
+
+本次推进 Batch 10 的第一阶段，重点解决“后端已经把附件 chunks 注入 node input，但前端仍需要在原始 JSON 里翻找引用片段”的问题。
+
+改动内容：
+
+- NodeDebugger 的节点运行详情新增“附件引用片段”面板。
+- 自动从 `input.attachment_context.chunks` 中提取 citation 列表。
+- 兼容从 `input.user_input.retrieved_attachment_chunks` 读取旧/备选位置。
+- 每条 citation 展示 `citation_id`、文件名、文件类型、score 和 chunk 文本预览。
+- 每条 citation 增加 `JSON` 按钮，可直接打开该 chunk 的结构化详情。
+
+实现方式：
+
+- 新增 `AttachmentChunkCitation` 类型和 `attachmentChunksFromInput()` 提取函数。
+- 新增 `AttachmentCitationList` 组件，放在 NodeDebugger 原始 Input JSON 之前。
+- `NodeDebugger` 接收 `onOpenJson`，复用全局 `JsonModal` 展示单条 chunk。
+- 样式采用紧凑审计列表，不做重型卡片，避免挤压节点输入/输出详情。
+
+改后效果：
+
+- 用户可以直接看到某个 Agent 节点实际读取了哪些附件片段。
+- citation 不再埋在长 JSON 中，调试“Agent 为什么这么回答”更直接。
+- 后续可以继续把 citation 与 parsed JSON、原始附件、chunk 定位联动。
+
+已执行验证：
+
+- `npm run typecheck`
+
+验证结果：
+
+- TypeScript 类型检查通过。
+
+### 2026-07-22：附件解析结果 JSON 查看入口
+
+本次推进 Batch 9 的第二阶段，继续补齐“附件解析结果 UI”和后续 citation 审计的前置能力。
+
+改动内容：
+
+- 新增 `fetchArtifactJson()` 前端 API 封装，可以读取任务 artifact 下的 JSON 文件。
+- System 页“已上传附件”列表增加解析结果查看按钮。
+- 只有存在 `parsed_path` 且解析未失败的附件可以点击查看。
+- 附件列表增加 chunk 数展示，用户可以直接看到该文件是否进入 chunk 化链路。
+- 点击查看后复用现有结构化 `JsonModal`，展示 parsed JSON 的 `metadata/sections/pages/tables/chunks` 等内容。
+
+实现方式：
+
+- 复用后端已有 `/api/tasks/{task_id}/artifacts/{artifact_path}` 下载接口，不新增后端路由。
+- artifact path 按路径片段分别 encode，避免 parsed path 中的目录分隔符被整体编码。
+- `SystemPage` 新增 `onOpenJson` 和 `onRuntimeError` props，由顶层 App 统一控制 JSON modal 和错误显示。
+- 附件行新增 `.attachment-runtime-table` 四列布局和 `.icon-row-button` 样式。
+
+改后效果：
+
+- 用户可以从 System 页直接追踪某个附件被解析成了什么结构。
+- 后续 citation 点击跳转或 chunk 详情弹窗可以复用同一套 artifact JSON 读取能力。
+- 解析失败附件不会给出不可用的查看入口，减少误操作。
+
+已执行验证：
+
+- `npm run typecheck`
+
+验证结果：
+
+- TypeScript 类型检查通过。
+
+### 2026-07-22：Composer 目标区视觉收敛
+
+本次推进 Batch 9 的第一阶段，回应“有内容输出时，输入框上的反馈目标和模块显示多余，设计不够美观简洁”的问题。
+
+改动内容：
+
+- 移除输入框顶部的“反馈目标”下拉行，避免和 `@Agent` chip 形成两套目标选择。
+- 空闲且任务已创建时，仅展示 `@Controller + 五个 Agent` chip，目标由 active chip 表达。
+- 去掉 chip 行尾部的 `重跑 -> 某模块` 路由 pill，避免重复说明。
+- workflow 运行中隐藏整排目标 chip，只保留一条轻量状态提示。
+- 运行中用户如果手动输入 `@Agent/@Controller`，状态提示右侧只显示一个小目标标记。
+- 清理不再使用的 `.feedback-target` 和 `.composer-route-pill` 样式。
+
+实现方式：
+
+- 新增 `mentionsStage()` 判断输入中是否存在显式 Agent mention。
+- 新增 `showComposerTargetControls` 和 `showComposerRunHint` 两个状态条件，控制 composer 顶部区域的显示模式。
+- 保留原有 `@Agent` parser 和提交流程，不改变后端调度语义。
+- CSS 新增 `.composer-run-hint`，用低对比、低高度状态条替代完整工具栏。
+
+改后效果：
+
+- Agent 输出中或 workflow running 时，输入框不会再显示多余的目标选择控件。
+- 用户空闲反馈时仍能通过 chip 明确选择总控或某个 Agent。
+- 输入框视觉层级更轻，主要注意力回到正在输出的 Agent 内容。
+
+已执行验证：
+
+- `npm run typecheck`
+
+验证结果：
+
+- TypeScript 类型检查通过。
+
+### 2026-07-22：附件 chunk 检索与 Agent 输入引用链路
+
+本次推进 Batch 8 的第一阶段，重点解决“上传文件虽然能解析，但 Agent 只能吃统一附件摘要，无法按自身职责检索相关片段，也无法在节点调试中追踪附件引用”的问题。
+
+改动内容：
+
+- 新增 `ArtifactService.search_attachment_chunks()`，可以从已解析附件的 `chunks` 中按 query 检索相关片段。
+- 每条检索结果包含 `citation_id`、`attachment_id/file_id`、文件名、文件类型、`parsed_path`、`chunk_id`、`chunk_index`、`score` 和截断后的 chunk 文本。
+- `Orchestrator.run_stage()` 在每个 Agent 启动前生成 stage scoped query，并检索最多 6 条附件片段。
+- 检索结果写入 node input 的 `attachment_context`，NodeDebugger 可以看到该节点当时引用了哪些附件 chunk。
+- 检索结果也注入本次执行上下文的 `user_input.retrieved_attachment_chunks` 和 agent namespace extension。
+- 对现有真实 Agent 保持兼容：通过本次执行上下文的 `question_description` 附加 retrieved chunks，让现有 `ProjectLLMClient` 可以直接消费，不要求各 Agent 立即改协议。
+- 新增 `attachment_chunks_retrieved` 事件，记录本次节点检索到的 citation 列表。
+
+实现方式：
+
+- 检索层先采用无依赖的词项 overlap 评分，避免引入向量库和 embedding 服务。
+- Query 由原始问题、基础描述、反馈，以及不同 stage 已有的上游产物共同构成。
+- `question_understanding/knowledge_integration` 更关注原始问题和 question card。
+- `hypothesis_generation` 额外关注 evidence cards 和 knowledge gaps。
+- `evidence_mapping` 额外关注 hypotheses 和 evidence cards。
+- `research_planning` 额外关注 question、hypotheses、evidence map 和 knowledge gaps。
+- 如果没有正分命中，检索层会回退返回前几个可用 chunk，保证 Agent 至少能看到可引用的附件片段。
+
+改后效果：
+
+- 附件不再只是被拼成一段泛化背景，而是能以 chunk + citation 的形式进入具体 Agent 节点输入。
+- System 页的 NodeDebugger 可以审计每个 Agent 运行时读到了哪些附件片段。
+- 后续可以把当前词项检索替换为 embedding/vector search，而不需要重写 orchestrator 和 node input 协议。
+- 为后续“引用链路 UI”“按 Agent 职责检索文件片段”“减少给所有 Agent 传全文”打下后端基础。
+
+已执行验证：
+
+- `python -m unittest discover -s backend/tests -v`
+- `python -m py_compile backend/app/artifact_service.py backend/app/orchestrator.py backend/app/adapters.py`
+- `npm run typecheck`
+
+验证结果：
+
+- 后端 unittest 50 个全部通过。
+- Python 编译检查通过。
+- TypeScript 类型检查通过。
+
+### 2026-07-22：输入框 @Agent 与总控定向入口
+
+本次推进 Batch 7，重点解决“输入框到底接什么、总控如何控制各 Agent、用户是否可以 @ 某个 Agent”的交互歧义。
+
+改动内容：
+
+- 扩展输入框 mention parser，支持 `@controller/@总控` 和五个 Agent 的英文、下划线、中文别名。
+- 新增 `@controller` 非重跑路径：任务已创建后，用户在输入框里 @ 总控会进入总控问答，不会默认触发 Agent 重跑。
+- 保留 `@knowledge/@hypothesis/@evidence/@plan/@question` 等 Agent 定向反馈路径：用户 @ 某个 Agent 后，反馈会发送到对应阶段并从该阶段重跑。
+- 新增输入框目标 chip：总控 + 五个 Agent 都可点击插入 mention。
+- 新增路由状态 pill，显示当前输入会被解释为“询问总控 / 重跑某 Agent / 运行中排队指令”。
+- 提交给后端前会剥离 mention token，避免 `@knowledge`、`@controller` 被 Agent 当成科研正文处理。
+- 点击新的目标 chip 会替换旧 mention，避免多个目标 token 同时存在造成路由歧义。
+
+实现方式：
+
+- 用 `controllerMentionAliases` 和 `stageMentionAliases` 统一维护别名表。
+- 用 `mentionsController()` 判定是否走总控问答路径。
+- 用新版 `mentionedStage()` 支持所有 Agent 阶段，而不是只识别少数旧别名。
+- 用 `stripComposerMentions()` 清洗提交正文，保留用户真实反馈内容。
+- 在 `submitComposer()` 中加入优先级：运行中排队指令 > @controller 问总控 > 迭代结束问总控 > Agent 反馈重跑 > 新任务启动。
+- UI 层新增 `.mention-strip` 与 `.composer-route-pill`，保持横向滚动和固定尺寸，避免窄屏挤压。
+
+改后效果：
+
+- 用户不需要猜输入框当前模式，界面会直接展示消息将发给总控还是某个 Agent。
+- 总控拥有明确的聊天入口，不再只有最终 review 或 System 页控制台才能体现存在。
+- 五个 Agent 都有可点击定向入口，多智能体从前端更容易被感知。
+- @Agent 反馈仍复用现有 `recordFeedback + startWorkflowRun(stage)` 链路，不引入新的后端协议风险。
+
+已执行验证：
+
+- `npm run typecheck`
+
+验证结果：
+
+- TypeScript 类型检查通过。
+
+### 2026-07-22：总控控制台与节点调试器接入
+
+本次推进 Batch 6 的第二阶段，重点解决“总控存在性弱、系统页只有观测没有操作、已有调试能力没有暴露给用户”的问题。
+
+改动内容：
+
+- 将已有 `ControllerConsole` 接入 System 页面，作为总控路由与计划评估入口。
+- 将已有 `NodeDebugger` 接入 System 页面，作为单个 Agent 节点的历史、输入校验、重跑和输出对比入口。
+- 新增 `handleExternalWorkflowRun()`，让 System 页面触发的工作流复用主应用已有的 workflow 监控、事件订阅、阶段状态刷新和错误处理。
+- 移除 `void ControllerConsole` / `void NodeDebugger` 占位语句，避免关键能力被定义后长期不可见。
+- 修正 `ControllerConsole` 的“识别意图”行为：只调用总控路由判断，不默认执行工作流；真正会触发执行的入口保留在“评估并开始新一轮”和节点调试执行按钮。
+
+实现方式：
+
+- 在 `App` 中新增统一外部 run 接入口，先 `trackWorkflowRun()`，再对 active run 调用 `monitorWorkflowRun()`。
+- 在 `SystemPage` props 中新增 `onWorkflowRun`，由顶层 App 注入，避免 System 页面自己复制工作流监控逻辑。
+- 在 System 页面顶部接入 `ControllerConsole` 和 `NodeDebugger`，用户进入系统页后即可从“状态观测”切换到“总控操作 / 节点操作”。
+- 保持现有后端 API、Agent schema、workflow run 协议不变，本轮只做前端挂载与执行语义修正。
+
+改后效果：
+
+- 总控不再只是隐含在聊天输入框背后的逻辑，而是在 System 页面拥有明确操作面板。
+- 用户可以让总控解释某条输入会路由到哪里、为什么路由，而不会因为“识别意图”误触发重跑。
+- 用户可以按 Agent 节点查看历史输入/输出/review，也可以进行单节点校验、单点重跑、从某节点继续运行。
+- System 页面从“只读运行状态页”升级为“运行状态 + 总控介入 + 节点调试”的工作台。
+
+已执行验证：
+
+- `npm run typecheck`
+
+验证结果：
+
+- TypeScript 类型检查通过。
+
 ### 2026-07-22：文件上传格式扩展和基础解析架构
 
 本次推进 Batch 5 的第一阶段，先把“更多文件格式可上传、可解析、可进入 Task Context”的基础链路打通。复杂 OCR、图片抽取、表格结构化检索后续再做。

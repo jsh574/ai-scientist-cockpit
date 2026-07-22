@@ -1728,6 +1728,15 @@ function App() {
     [hydrateProject, language, trackWorkflowRun, updateStage],
   );
 
+  const handleExternalWorkflowRun = useCallback((run: WorkflowRun) => {
+    trackWorkflowRun(run.task_id, run);
+    if (!activeWorkflowStatuses.has(run.status)) return;
+    void monitorWorkflowRun(run).catch((error) => {
+      trackWorkflowRun(run.task_id, null);
+      setRuntimeError(error instanceof Error ? error.message : String(error));
+    });
+  }, [monitorWorkflowRun, trackWorkflowRun]);
+
   useEffect(() => {
     if (!hasSubmittedQuestion || !restoredTaskIdsRef.current.has(context.task_id)) return;
     restoredTaskIdsRef.current.delete(context.task_id);
@@ -2929,6 +2938,7 @@ function App() {
             maxIterations={maxIterations}
             onExport={() => void exportTaskBundle(context.task_id).catch((error) => setRuntimeError(String(error)))}
             onRefresh={() => void refreshRuntimeData()}
+            onWorkflowRun={handleExternalWorkflowRun}
             runtimeError={runtimeError}
             stages={stages}
             versions={versions}
@@ -3116,6 +3126,7 @@ function SystemPage({
   maxIterations,
   onExport,
   onRefresh,
+  onWorkflowRun,
   runtimeError,
   stages,
   versions,
@@ -3130,6 +3141,7 @@ function SystemPage({
   maxIterations: number;
   onExport: () => void;
   onRefresh: () => void;
+  onWorkflowRun: (run: WorkflowRun) => void;
   runtimeError: string;
   stages: StageRun[];
   versions: VersionRecord[];
@@ -3159,6 +3171,10 @@ function SystemPage({
       </header>
 
       {runtimeError ? <p className="runtime-error">{runtimeError}</p> : null}
+
+      <ControllerConsole context={context} language={language} onWorkflowRun={onWorkflowRun} />
+
+      <NodeDebugger context={context} language={language} onOpenJson={onOpenJson} onWorkflowRun={onWorkflowRun} />
 
       <div className="runtime-metrics">
         <StatusMetric label={zh ? "当前阶段" : "Current stage"} value={context.current_stage} />
@@ -3322,7 +3338,7 @@ function ControllerConsole({
     setBusy(true);
     setError("");
     try {
-      const result = await routeControllerMessage(context.task_id, message.trim());
+      const result = await routeControllerMessage(context.task_id, message.trim(), false);
       setRoute(result.route);
       if (result.run && !["cancelled", "cancelling"].includes(result.run.status)) {
         onWorkflowRun(result.run);
@@ -3364,7 +3380,98 @@ function ControllerConsole({
   );
 }
 
-function NodeDebugger({ context, language, onWorkflowRun }: { context: TaskContext; language: Language; onWorkflowRun: (run: WorkflowRun) => void }) {
+interface AttachmentChunkCitation {
+  attachment_id?: string;
+  chunk_id?: string;
+  citation_id?: string;
+  file_id?: string;
+  file_type?: string;
+  name?: string;
+  parsed_path?: string;
+  score?: number;
+  stage?: string;
+  text?: string;
+}
+
+function attachmentChunksFromInput(input: Record<string, unknown> | null | undefined): AttachmentChunkCitation[] {
+  const directContext = input?.attachment_context;
+  const directChunks = directContext && typeof directContext === "object"
+    ? (directContext as Record<string, unknown>).chunks
+    : null;
+  const userInput = input?.user_input;
+  const userChunks = userInput && typeof userInput === "object"
+    ? (userInput as Record<string, unknown>).retrieved_attachment_chunks
+    : null;
+  const chunks = Array.isArray(directChunks) ? directChunks : userChunks;
+  if (!Array.isArray(chunks)) return [];
+  return chunks
+    .filter((chunk): chunk is Record<string, unknown> => Boolean(chunk) && typeof chunk === "object")
+    .map((chunk) => ({
+      attachment_id: stringOrUndefined(chunk.attachment_id),
+      chunk_id: stringOrUndefined(chunk.chunk_id),
+      citation_id: stringOrUndefined(chunk.citation_id),
+      file_id: stringOrUndefined(chunk.file_id),
+      file_type: stringOrUndefined(chunk.file_type),
+      name: stringOrUndefined(chunk.name),
+      parsed_path: stringOrUndefined(chunk.parsed_path),
+      score: typeof chunk.score === "number" ? chunk.score : undefined,
+      stage: stringOrUndefined(chunk.stage),
+      text: stringOrUndefined(chunk.text),
+    }));
+}
+
+function stringOrUndefined(value: unknown) {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function AttachmentCitationList({
+  chunks,
+  language,
+  onOpenJson,
+}: {
+  chunks: AttachmentChunkCitation[];
+  language: Language;
+  onOpenJson: (title: string, data: unknown) => void;
+}) {
+  if (!chunks.length) return null;
+  const zh = language === "zh";
+  return (
+    <section className="attachment-citation-panel">
+      <div>
+        <strong>{zh ? "附件引用片段" : "Retrieved attachment chunks"}</strong>
+        <span>{chunks.length}</span>
+      </div>
+      {chunks.map((chunk, index) => {
+        const citationId = chunk.citation_id || `${chunk.attachment_id ?? "attachment"}:${chunk.chunk_id ?? index + 1}`;
+        return (
+          <article key={`${citationId}-${index}`}>
+            <header>
+              <code>{citationId}</code>
+              <span>{chunk.name ?? "--"}{chunk.file_type ? ` · ${chunk.file_type}` : ""}</span>
+              {typeof chunk.score === "number" ? <b>{chunk.score.toFixed(3)}</b> : null}
+              <button type="button" onClick={() => onOpenJson(`${citationId} chunk`, chunk)}>
+                JSON
+              </button>
+            </header>
+            <p>{trimPreview(chunk.text, 260)}</p>
+          </article>
+        );
+      })}
+    </section>
+  );
+}
+
+function NodeDebugger({
+  context,
+  language,
+  onOpenJson,
+  onWorkflowRun,
+}: {
+  context: TaskContext;
+  language: Language;
+  onOpenJson: (title: string, data: unknown) => void;
+  onWorkflowRun: (run: WorkflowRun) => void;
+}) {
   const zh = language === "zh";
   const [nodeId, setNodeId] = useState<StageId>("question_understanding");
   const [runs, setRuns] = useState<NodeRunSummary[]>([]);
@@ -3457,6 +3564,7 @@ function NodeDebugger({ context, language, onWorkflowRun }: { context: TaskConte
       setLoading(false);
     }
   };
+  const attachmentChunks = attachmentChunksFromInput(detail?.input);
 
   return (
     <section className="runtime-section node-debugger">
@@ -3519,6 +3627,7 @@ function NodeDebugger({ context, language, onWorkflowRun }: { context: TaskConte
           {detail ? (
             <>
               <div><strong>{detail.metadata.status}</strong><span>{detail.metadata.workflow_run_id || "standalone"}</span></div>
+              <AttachmentCitationList chunks={attachmentChunks} language={language} onOpenJson={onOpenJson} />
               <details open><summary>Input</summary><pre>{JSON.stringify(detail.input, null, 2)}</pre></details>
               <details><summary>Output</summary><pre>{JSON.stringify(detail.output, null, 2)}</pre></details>
               <details><summary>Review</summary><pre>{JSON.stringify(detail.review, null, 2)}</pre></details>
@@ -3529,9 +3638,6 @@ function NodeDebugger({ context, language, onWorkflowRun }: { context: TaskConte
     </section>
   );
 }
-
-void ControllerConsole;
-void NodeDebugger;
 
 function formatBytes(size: number) {
   if (size < 1024) return `${size} B`;

@@ -146,6 +146,34 @@ class PersistenceTests(unittest.TestCase):
             item["parsed_path"],
         )
 
+    def test_attachment_chunks_are_searchable_with_citations(self) -> None:
+        self.create("task_chunk_search")
+        item, _context = self.artifacts.add_attachment(
+            "task_chunk_search",
+            "background.md",
+            (
+                "# Background\n"
+                "Cytokine trajectories should be aligned before tau PET follow-up.\n"
+                "Unrelated notes discuss telescope calibration."
+            ).encode("utf-8"),
+            "text/markdown",
+            context_char_limit=10_000,
+            message_id="msg_chunks",
+        )
+
+        chunks = self.artifacts.search_attachment_chunks(
+            "task_chunk_search",
+            "cytokine tau follow-up",
+            stage="hypothesis_generation",
+            limit=3,
+        )
+
+        self.assertGreaterEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["attachment_id"], item["attachment_id"])
+        self.assertEqual(chunks[0]["stage"], "hypothesis_generation")
+        self.assertIn("citation_id", chunks[0])
+        self.assertIn("Cytokine", chunks[0]["text"])
+
     def test_feedback_updates_runtime_controls_without_creating_a_new_task(self) -> None:
         context = self.create("task_controls")
         updated = self.orchestrator.record_feedback(
