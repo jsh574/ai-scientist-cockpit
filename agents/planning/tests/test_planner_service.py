@@ -190,3 +190,91 @@ def test_run_planning_agent_can_call_selected_hypotheses_in_parallel_and_keep_or
         "hyp_002",
     ]
     assert len(client.calls) == 2
+
+
+class FakeWorkflowChainRunner:
+    def __init__(self, decision: str = "accept") -> None:
+        self.decision = decision
+        self.calls = []
+
+    def run_batch(self, data, **kwargs):
+        self.calls.append((data, kwargs))
+        hypothesis_id = data["hypothesis_cards"][0]["hypothesis_id"]
+        if self.decision != "accept":
+            return {
+                "status": "requires_action",
+                "errors": [],
+                "hypothesis_runs": [
+                    {
+                        "hypothesis_id": hypothesis_id,
+                        "status": "requires_action",
+                        "decision": self.decision,
+                        "next_action": "request_upstream_feedback",
+                        "final_result": None,
+                        "errors": [],
+                    }
+                ],
+            }
+        return {
+            "status": "success",
+            "errors": [],
+            "hypothesis_runs": [
+                {
+                    "hypothesis_id": hypothesis_id,
+                    "status": "success",
+                    "decision": "accept",
+                    "next_action": "continue_to_product",
+                    "final_result": {
+                        "schema_version": "experiment_planner_plan_result_v1",
+                        "agent_name": "ExperimentPlannerAgent",
+                        "task_id": data["task_id"],
+                        "iteration": data["iteration"],
+                        "hypothesis_id": hypothesis_id,
+                        "status": "success",
+                        "error_message": "",
+                        "plan": {
+                            "problem_statement": "Chain-generated plan",
+                            "rationale": {"logic_chain": []},
+                            "references": [],
+                        },
+                    },
+                    "errors": [],
+                }
+            ],
+        }
+
+
+def test_run_planning_agent_normalizes_chain_report_to_formal_response():
+    data = sample_planner_input()
+    data["_feedback"] = "Reduce the sample size for this revision."
+    runner = FakeWorkflowChainRunner()
+
+    response = run_planning_agent(
+        data, workflow_runner=runner, max_packages=1, max_parallel_calls=2
+    )
+
+    assert response["metadata"]["status"] == "success"
+    assert response["payload"]["schema_version"] == "experiment_planner_output_v1"
+    assert len(response["payload"]["plans"]) == 1
+    assert response["payload"]["plans"][0]["plan"]["problem_statement"] == (
+        "Chain-generated plan"
+    )
+    assert "intermediate_results" not in response["payload"]
+    chain_input, options = runner.calls[0]
+    assert chain_input["_feedback"] == "Reduce the sample size for this revision."
+    assert len(chain_input["hypothesis_cards"]) == 1
+    assert options["max_parallel_hypotheses"] == 2
+
+
+def test_run_planning_agent_maps_feedback_required_to_failed_plan_item():
+    runner = FakeWorkflowChainRunner(decision="feedback_required")
+
+    response = run_planning_agent(
+        sample_planner_input(), workflow_runner=runner, max_packages=1
+    )
+
+    assert response["metadata"]["status"] == "failed"
+    plan = response["payload"]["plans"][0]
+    assert plan["status"] == "failed"
+    assert "decision=feedback_required" in plan["error_message"]
+    assert response["self_review"]["passed"] is False

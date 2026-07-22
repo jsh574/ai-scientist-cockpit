@@ -462,6 +462,69 @@ class AdapterContractTests(unittest.TestCase):
             response["payload"]["research_plan"]["plans"][0]["plan"]["problem_statement"],
             "测试研究问题",
         )
+    def test_registry_auto_selects_configured_planning_workflow_chain(self) -> None:
+        class FakeWorkflowChainRunner:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def configuration_summary(self):
+                return [
+                    {"name": "workflow_a", "configured": True},
+                    {"name": "workflow_b", "configured": True},
+                    {"name": "workflow_c", "configured": True},
+                ]
+
+            def run_batch(self, data, **options):
+                self.calls.append((data, options))
+                hypothesis_id = data["hypothesis_cards"][0]["hypothesis_id"]
+                return {
+                    "status": "success",
+                    "errors": [],
+                    "hypothesis_runs": [
+                        {
+                            "hypothesis_id": hypothesis_id,
+                            "status": "success",
+                            "decision": "accept",
+                            "next_action": "continue_to_product",
+                            "final_result": {
+                                "hypothesis_id": hypothesis_id,
+                                "status": "success",
+                                "error_message": "",
+                                "plan": {"problem_statement": "ABC 链路研究计划"},
+                            },
+                            "errors": [],
+                        }
+                    ],
+                }
+
+        context = self.downstream_context()
+        with patch.dict(os.environ, {"EVIDENCE_MAPPING_MODE": "rules"}):
+            evidence_response = AgentRegistry(Settings.from_env()).run(
+                "evidence_mapping", context
+            )
+        context["evidence_map"] = evidence_response["payload"]["evidence_map"]
+        service = _load_package(
+            Settings.from_env().planning_agent_root, "planning_agent.service"
+        )
+        runner = FakeWorkflowChainRunner()
+
+        with patch.object(
+            service.PlanningWorkflowChainRunner, "from_env", return_value=runner
+        ):
+            response = AgentRegistry(Settings.from_env()).run(
+                "research_planning", context, feedback="减少样本量并保留证据约束"
+            )
+
+        self.assertEqual(response["metadata"]["status"], "success")
+        self.assertEqual(
+            response["payload"]["research_plan"]["plans"][0]["plan"][
+                "problem_statement"
+            ],
+            "ABC 链路研究计划",
+        )
+        self.assertEqual(
+            runner.calls[0][0]["_feedback"], "减少样本量并保留证据约束"
+        )
 
 
 if __name__ == "__main__":

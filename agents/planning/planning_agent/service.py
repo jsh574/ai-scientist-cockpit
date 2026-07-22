@@ -12,19 +12,24 @@ from planning_agent.adapter import (
     validate_planner_input,
 )
 from planning_agent.dify_client import DifyWorkflowClient, DifyWorkflowError
-
+from planning_agent.workflow_chain import PlanningWorkflowChainRunner
 
 AGENT_ID = "research_planning_agent"
 STAGE = "research_planning"
 ProgressHandler = Callable[[str], None]
+WorkflowEventHandler = Callable[[str, dict[str, Any]], None]
+CancellationChecker = Callable[[], None]
 
 
 def run_planning_agent(
     data: dict[str, Any],
     dify_client: DifyWorkflowClient | None = None,
+    workflow_runner: PlanningWorkflowChainRunner | None = None,
     max_packages: int | None = None,
     progress_handler: ProgressHandler | None = None,
     max_parallel_calls: int | None = None,
+    workflow_event_handler: WorkflowEventHandler | None = None,
+    cancellation_checker: CancellationChecker | None = None,
 ) -> dict[str, Any]:
     errors = validate_planner_input(data)
     if errors:
@@ -35,8 +40,32 @@ def run_planning_agent(
         packages,
         max_packages=max_packages or _max_hypotheses(data),
     )
+    runner = workflow_runner
+    if runner is None and dify_client is None:
+        auto_runner = PlanningWorkflowChainRunner.from_env(
+            progress_handler=progress_handler,
+            event_handler=workflow_event_handler,
+            cancellation_checker=cancellation_checker,
+        )
+        if _runner_is_configured(auto_runner):
+            runner = auto_runner
+    parallel_calls = _max_parallel_calls(max_parallel_calls)
+    if runner is not None:
+        return _run_planning_chain(
+            data, selected, runner, parallel_calls
+        )
 
-    client = dify_client or DifyWorkflowClient()
+    legacy_event_handler = None
+
+    if workflow_event_handler:
+        def forward_legacy_event(event: dict[str, Any]) -> None:
+            workflow_event_handler("workflow_c", event)
+
+        legacy_event_handler = forward_legacy_event
+    client = dify_client or DifyWorkflowClient(
+        event_handler=legacy_event_handler,
+        cancellation_checker=cancellation_checker,
+    )
     if not client.configured:
         return _failed_response(
             data,
@@ -44,7 +73,6 @@ def run_planning_agent(
             score=0.0,
         )
 
-    parallel_calls = _max_parallel_calls(max_parallel_calls)
     plan_results, dify_errors = _run_selected_packages(
         data=data,
         selected=selected,
@@ -53,14 +81,87 @@ def run_planning_agent(
         max_parallel_calls=parallel_calls,
     )
 
+    return _response_from_plan_results(data, plan_results, dify_errors)
+
+
+def _runner_is_configured(runner: PlanningWorkflowChainRunner) -> bool:
+    return all(
+        bool(item.get("configured")) for item in runner.configuration_summary()
+    )
+
+
+def _run_planning_chain(
+    data: dict[str, Any],
+    selected: list[dict[str, Any]],
+    runner: PlanningWorkflowChainRunner,
+    max_parallel_calls: int,
+) -> dict[str, Any]:
+    selected_ids = [str(package.get("hypothesis_id") or "") for package in selected]
+    cards_by_id = {
+        str(card.get("hypothesis_id") or ""): card
+        for card in data.get("hypothesis_cards", [])
+        if isinstance(card, dict)
+    }
+    chain_data = {
+        **data,
+        "hypothesis_cards": [
+            cards_by_id[hypothesis_id]
+            for hypothesis_id in selected_ids
+            if hypothesis_id in cards_by_id
+        ],
+    }
+    report = runner.run_batch(
+        chain_data,
+        max_revisions=max(0, _env_int("PLANNING_MAX_REVISIONS", 1)),
+        max_parallel_hypotheses=max_parallel_calls,
+    )
+    packages_by_id = {
+        str(package.get("hypothesis_id") or ""): package for package in selected
+    }
+    plan_results: list[dict[str, Any]] = []
+    issues = [str(item) for item in report.get("errors", []) if str(item).strip()]
+    for hypothesis_run in report.get("hypothesis_runs", []):
+        if not isinstance(hypothesis_run, dict):
+            continue
+        hypothesis_id = str(hypothesis_run.get("hypothesis_id") or "")
+        package = packages_by_id.get(hypothesis_id, {"hypothesis_id": hypothesis_id})
+        final_result = hypothesis_run.get("final_result")
+        if isinstance(final_result, dict) and final_result:
+            plan_results.append(
+                _normalize_plan_result(chain_data, package, final_result)
+            )
+            if hypothesis_run.get("status") != "success":
+                issues.append(
+                    f"Hypothesis {hypothesis_id} requires action: "
+                    f"{hypothesis_run.get('next_action') or hypothesis_run.get('status')}"
+                )
+            continue
+        child_errors = [
+            str(item)
+            for item in hypothesis_run.get("errors", [])
+            if str(item).strip()
+        ]
+        reason = "; ".join(child_errors) or (
+            f"Workflow B stopped with decision="
+            f"{hypothesis_run.get('decision') or 'unknown'}; "
+            f"next_action={hypothesis_run.get('next_action') or 'inspect_failure'}"
+        )
+        plan_results.append(_failed_plan_result(chain_data, package, reason))
+        issues.append(f"Hypothesis {hypothesis_id}: {reason}")
+    return _response_from_plan_results(data, plan_results, issues)
+
+
+def _response_from_plan_results(
+    data: dict[str, Any],
+    plan_results: list[dict[str, Any]],
+    execution_issues: list[str],
+) -> dict[str, Any]:
     payload = _aggregate_payload(data, plan_results)
-    guardrail_issues = _guardrail_issues(data, payload)
-    issues = dify_errors + guardrail_issues
+    issues = execution_issues + _guardrail_issues(data, payload)
     payload["status"] = _payload_status(payload, issues)
     if not payload.get("plans"):
         payload["status"] = "failed"
         issues.append("Dify workflow returned no plans.")
-
     return _response(
         data=data,
         status=payload["status"],
@@ -277,9 +378,11 @@ def _payload_status(payload: dict[str, Any], issues: list[str]) -> str:
     plans = payload.get("plans", [])
     if not plans:
         return "failed"
-    if any(plan.get("status") == "success" for plan in plans) and not issues:
+    successful = [plan for plan in plans if plan.get("status") == "success"]
+    usable = [plan for plan in plans if plan.get("status") in {"success", "partial_success"}]
+    if len(successful) == len(plans) and not issues:
         return "success"
-    if any(plan.get("status") == "success" for plan in plans):
+    if usable:
         return "partial_success"
     return "failed"
 

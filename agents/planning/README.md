@@ -109,7 +109,7 @@ POST /planning-agent/run
 
 ## Dify Workflow 资产
 
-Canonical Dify 资产位于 dify/：A 负责候选生成，B 负责评审路由，C（Research Planning Agent.yml）负责最终计划。当前生产服务仍只调用 C，A/B/C 产品编排待 trace 和人工选择协议完成后接入。
+Canonical Dify 资产位于 dify/：A 负责候选生成，B 负责评审路由，C（Research Planning Agent.yml）负责最终计划。A/B/C 三组 App 配置完整时生产服务自动运行完整链路；A/B 未配置时保持 C-only 兼容。当前版本只接入阻塞式正式结果，trace 流式展示和人工选择后恢复协议仍待后续实现。
 
 重要边界：Dify Workflow 一次只处理一个 `hypothesis_evidence_package`，输出一个 `plan_result`；本地封装层负责多 hypothesis 循环调用和 `plans[]` 聚合。更多说明见 `dify/README.md`。
 

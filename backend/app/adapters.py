@@ -777,7 +777,7 @@ class AgentRegistry:
                 "payload": {"hypothesis_id": finished_match.group(1) if finished_match else None},
             })
 
-        def dify_event(event: dict[str, Any]) -> None:
+        def dify_event(_workflow: str, event: dict[str, Any]) -> None:
             data = event.get("data") if isinstance(event.get("data"), dict) else {}
             emit({
                 "node_id": current_node["id"],
@@ -797,16 +797,13 @@ class AgentRegistry:
             "message": "Selecting hypothesis evidence packages.",
             "progress": 0.05,
         })
-        client = service.DifyWorkflowClient(
-            event_handler=dify_event,
-            cancellation_checker=cancellation_checker,
-        )
         raw = service.run_planning_agent(
             planning_request(task_context, feedback=_feedback),
-            dify_client=client,
             max_packages=int(os.getenv("PLANNING_MAX_HYPOTHESES", "2")),
             max_parallel_calls=int(os.getenv("PLANNING_MAX_PARALLEL_CALLS", "1")),
             progress_handler=service_progress,
+            workflow_event_handler=dify_event,
+            cancellation_checker=cancellation_checker,
         )
         emit({
             "node_id": "aggregate",
