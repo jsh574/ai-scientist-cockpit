@@ -35,6 +35,10 @@ class HypothesisAgentConfig:
     min_variable_coverage: float = 0.6
     min_evidence_keyword_overlap: float = 0.08
     min_gap_ratio: float = 0.8
+    min_gap_evidence_link_ratio: float = 0.5
+    enable_independent_eval: bool = True
+    eval_weight: float = 0.2
+    min_binding_bridge_chars: int = 18
 
 
 class HypothesisGenerationAgent:
@@ -63,6 +67,7 @@ class HypothesisGenerationAgent:
         "hypothesis_type",
         "rationale",
         "based_on_evidence_ids",
+        "evidence_bindings",
         "related_gap_ids",
         "target_variables",
         "expected_observation",
@@ -87,6 +92,19 @@ class HypothesisGenerationAgent:
         "may be related",
         "might be related",
     )
+    VAGUE_PATTERNS = (
+        "可能有关",
+        "可能相关",
+        "或许有关",
+        "或许相关",
+        "值得研究",
+        "存在一定关系",
+        "有一定影响",
+        "may be related",
+        "might be related",
+        "worth studying",
+        "has some effect",
+    )
 
     def __init__(self, config: HypothesisAgentConfig | None = None) -> None:
         self.config = config or HypothesisAgentConfig()
@@ -109,7 +127,14 @@ class HypothesisGenerationAgent:
                 payload = self.normalize_payload(payload)
                 audit = self.validate_payload(payload, normalized_input)
                 self.calibrate_scores(payload)
-                self_review = self.build_self_review(payload, normalized_input, audit, retry_notes)
+                eval_report = self.evaluate_payload(payload, normalized_input, audit)
+                self_review = self.build_self_review(
+                    payload,
+                    normalized_input,
+                    audit,
+                    retry_notes,
+                    eval_report,
+                )
                 return self._response(normalized_input, payload, self_review)
             except AgentOutputError as exc:
                 last_error = exc
@@ -206,21 +231,29 @@ class HypothesisGenerationAgent:
             "You are a scientific hypothesis generation Agent.\n"
             "Your output will be consumed by an evidence-mapping Agent, so every hypothesis must be traceable, testable, and specific.\n\n"
             f"Output language: {language}.\n"
-            f"Generate {self.config.min_hypotheses} to {max_hypotheses} candidate hypotheses.\n\n"
+            f"Internally draft more candidates, then return only the best {self.config.min_hypotheses} to {max_hypotheses} candidate hypotheses.\n\n"
             "Mandatory internal workflow before writing each hypothesis:\n"
             "1. Variable anchoring: identify the core variables from question_card.key_variables and choose target_variables.\n"
-            "2. Evidence matching: select concrete evidence_ids whose claim/summary supports the variable relation.\n"
-            "3. Gap coverage: select concrete gap_ids explaining why the hypothesis adds research value.\n"
+            "2. Evidence matching: select concrete evidence_ids whose claim/summary supports the variable relation; prefer support_direction='support' and higher strength_score.\n"
+            "3. Gap coverage: select concrete gap_ids explaining why the hypothesis adds research value; use gap_type, importance_score, related_evidence_ids, and why_it_matters_for_hypothesis_generation when provided.\n"
             "4. Hypothesis construction: state a mechanism/causal/mediation/moderation/comparison relation and write checkable predictions.\n\n"
             "Hard constraints:\n"
             "- Return JSON only. No Markdown, no comments, no text outside JSON.\n"
             "- Each hypothesis must reference at least one known based_on_evidence_ids and at least one known related_gap_ids.\n"
+            "- If a selected knowledge_gap has related_evidence_ids, prefer those evidence IDs in based_on_evidence_ids unless there is a clear reason not to.\n"
+            "- Mention the selected gap's description or why_it_matters_for_hypothesis_generation in rationale.\n"
+            "- Treat support_direction='uncertain' as exploratory background only, and do not use support_direction='oppose' as positive support.\n"
+            "- Do not invent numerical thresholds, AUC values, confidence intervals, or time windows unless they appear in evidence_cards or knowledge_gaps.\n"
+            "- Use evidence limitations to weaken causal language when evidence is correlational, narrow, or method-limited.\n"
+            "- Each referenced evidence_id must also appear in evidence_bindings with a concise inference_bridge.\n"
             "- Each statement must mention at least two target variables or their close synonyms.\n"
             "- Each evidence_id used must be reflected in statement or rationale through overlapping concepts.\n"
+            "- Each rationale must explicitly follow this structure: evidence says X; gap says Y is unresolved; therefore the hypothesis tests Z.\n"
             "- Do not merely repeat evidence claims. Convert evidence + gap into a new testable hypothesis.\n"
             "- Avoid vague empty wording such as 'possibly related', 'worth studying', or 'has some effect'.\n"
             "- Scientific uncertainty is allowed, but express it as a testable relation: 'A may affect C through B' plus predictions.\n"
             "- predictions must contain 1 to 3 concrete, evidence-checkable predictions.\n"
+            "- evidence_bindings are source explanations for the next evidence-mapping Agent; do not claim final support strength there.\n"
             "- initial_scores and hypothesis_scores must contain numbers between 0 and 1, and both score objects must be identical.\n"
             "- risk means higher is worse.\n\n"
             f"{revision_instruction}"
@@ -362,6 +395,23 @@ class HypothesisGenerationAgent:
                 if expected:
                     card["predictions"] = self._split_prediction_text(expected)
 
+            evidence_ids = card.get("based_on_evidence_ids")
+            bindings = card.get("evidence_bindings")
+            if isinstance(evidence_ids, list) and not isinstance(bindings, list):
+                target_variables = self._string_items(card.get("target_variables"))
+                linked_variable = target_variables[0] if target_variables else ""
+                rationale = str(card.get("rationale") or "").strip()
+                bridge = rationale[:240] if rationale else "Generated from the referenced evidence and knowledge gap."
+                card["evidence_bindings"] = [
+                    {
+                        "evidence_id": str(evidence_id),
+                        "used_as": "hypothesis_source",
+                        "linked_variable": linked_variable,
+                        "inference_bridge": bridge,
+                    }
+                    for evidence_id in evidence_ids
+                ]
+
         return payload
 
     def validate_payload(
@@ -425,6 +475,18 @@ class HypothesisGenerationAgent:
                     f"{hypothesis_id} references unknown gap ids: {sorted(unknown_gaps)}."
                 )
 
+            evidence_binding_audit = self._validate_evidence_bindings(
+                card,
+                evidence_by_id,
+                hypothesis_id,
+            )
+            gap_alignment_audit = self._gap_alignment(
+                card,
+                gap_by_id,
+                evidence_by_id,
+                hypothesis_id,
+            )
+
             target_variables = card["target_variables"]
             if not isinstance(target_variables, list) or not target_variables:
                 raise AgentOutputError(f"{hypothesis_id}.target_variables must be a non-empty list.")
@@ -471,6 +533,14 @@ class HypothesisGenerationAgent:
                 raise AgentOutputError(
                     f"{hypothesis_id} evidence keyword overlap too low: {evidence_overlap:.2f}."
                 )
+            if gap_alignment_audit["related_evidence_available"] and (
+                gap_alignment_audit["gap_evidence_link_ratio"]
+                < self.config.min_gap_evidence_link_ratio
+            ):
+                raise AgentOutputError(
+                    f"{hypothesis_id} does not use enough evidence linked to selected knowledge gaps: "
+                    f"{gap_alignment_audit['gap_evidence_link_ratio']:.2f}."
+                )
             if vague_hits:
                 raise AgentOutputError(f"{hypothesis_id} contains vague phrases: {vague_hits}.")
 
@@ -480,6 +550,23 @@ class HypothesisGenerationAgent:
                     "variable_coverage": round(variable_coverage, 3),
                     "evidence_keyword_overlap": round(evidence_overlap, 3),
                     "gap_count": len(related_gap_ids),
+                    "evidence_binding_coverage": round(
+                        evidence_binding_audit["coverage"],
+                        3,
+                    ),
+                    "binding_bridge_quality": round(
+                        evidence_binding_audit["bridge_quality"],
+                        3,
+                    ),
+                    "gap_evidence_link_ratio": round(
+                        gap_alignment_audit["gap_evidence_link_ratio"],
+                        3,
+                    ),
+                    "gap_importance": round(
+                        gap_alignment_audit["gap_importance"],
+                        3,
+                    ),
+                    "gap_type_coverage": sorted(gap_alignment_audit["gap_types"]),
                 }
             )
 
@@ -521,12 +608,124 @@ class HypothesisGenerationAgent:
                     scores[key] = round(max(0.0, float(scores.get(key, 0.0)) - 0.15), 3)
                 card["hypothesis_scores"] = dict(scores)
 
+    def evaluate_payload(
+        self,
+        payload: dict[str, Any],
+        input_data: dict[str, Any],
+        audit: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Run an optional independent reviewer pass over generated hypotheses."""
+        if not self.config.enable_independent_eval:
+            return None
+
+        prompt = self.build_eval_prompt(payload, input_data, audit)
+        try:
+            eval_text = self.call_llm_for_eval(prompt)
+            eval_payload = self.parse_llm_output(eval_text)
+            return self.normalize_eval_report(eval_payload)
+        except Exception as exc:
+            return {
+                "available": False,
+                "overall_score": None,
+                "issues": [f"Independent evaluation unavailable: {type(exc).__name__}: {exc}"],
+                "suggestions": ["Keep hard checks enabled and rerun evaluation when the model API is stable."],
+            }
+
+    def call_llm_for_eval(self, prompt: str) -> str:
+        """Separate hook for evaluator-model calls."""
+        return self.call_llm(prompt)
+
+    def build_eval_prompt(
+        self,
+        payload: dict[str, Any],
+        input_data: dict[str, Any],
+        audit: dict[str, Any],
+    ) -> str:
+        eval_schema = {
+            "available": True,
+            "overall_score": 0.0,
+            "reasoning": "Brief review based only on the provided input materials.",
+            "dimension_scores": {
+                "evidence_binding": 0.0,
+                "testability": 0.0,
+                "specificity": 0.0,
+                "novelty_from_gap": 0.0,
+                "downstream_readiness": 0.0,
+            },
+            "hypothesis_reviews": [
+                {
+                    "hypothesis_id": "hyp_001",
+                    "score": 0.0,
+                    "major_flaws": ["string"],
+                    "revision_advice": "string",
+                }
+            ],
+            "issues": ["string"],
+            "suggestions": ["string"],
+        }
+        context = {
+            "question_card": input_data["question_card"],
+            "evidence_cards": input_data["evidence_cards"],
+            "knowledge_gaps": input_data["knowledge_gaps"],
+            "hard_check_audit": audit,
+            "candidate_hypotheses": payload,
+        }
+        return (
+            "You are an independent scientific quality reviewer for generated hypothesis cards.\n"
+            "Review only against the provided question_card, evidence_cards, knowledge_gaps, and hard_check_audit.\n"
+            "Do not introduce external mandatory definitions, organization goals, datasets, thresholds, or standards "
+            "unless they are explicitly present in the input materials.\n"
+            "Judge whether each hypothesis is specific, testable, traceable to evidence, and useful for the next "
+            "evidence-mapping Agent. Treat external improvements as suggestions, not fatal issues.\n"
+            "Penalize vague language, fake evidence citation, missing variable links, repeated evidence claims, "
+            "and predictions that cannot be checked by data or experiments.\n"
+            "Return JSON only. First write concise reasoning, then scores.\n\n"
+            "Required evaluation JSON schema:\n"
+            f"{json.dumps(eval_schema, ensure_ascii=False, indent=2)}\n\n"
+            "Review context:\n"
+            f"{json.dumps(context, ensure_ascii=False, indent=2)}"
+        )
+
+    def normalize_eval_report(self, eval_payload: dict[str, Any]) -> dict[str, Any]:
+        score = eval_payload.get("overall_score", 0.0)
+        try:
+            score = max(0.0, min(1.0, float(score)))
+        except (TypeError, ValueError):
+            score = 0.0
+
+        dimension_scores = eval_payload.get("dimension_scores")
+        if not isinstance(dimension_scores, dict):
+            dimension_scores = {}
+
+        hypothesis_reviews = eval_payload.get("hypothesis_reviews")
+        if not isinstance(hypothesis_reviews, list):
+            hypothesis_reviews = []
+
+        issues = self._string_items(eval_payload.get("issues"))
+        suggestions = self._string_items(eval_payload.get("suggestions"))
+        reasoning = str(eval_payload.get("reasoning") or "").strip()
+        if score > 0.85 and len(reasoning) < 40:
+            score = 0.75
+            issues.append("Independent evaluator gave a high score with too little reasoning.")
+            suggestions.append("Ask evaluator to provide concrete flaw analysis before accepting high scores.")
+
+        return {
+            "available": True,
+            "overall_score": round(score, 3),
+            "reasoning": reasoning,
+            "dimension_scores": dimension_scores,
+            "hypothesis_reviews": hypothesis_reviews,
+            "issues": issues,
+            "suggestions": suggestions,
+        }
+
     def build_self_review(
         self,
         payload: dict[str, Any],
         input_data: dict[str, Any],
         audit: dict[str, Any] | None = None,
         retry_notes: list[str] | None = None,
+        eval_report: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Build module-level self review from generated cards."""
         cards = payload["hypothesis_cards"]
@@ -541,21 +740,38 @@ class HypothesisGenerationAgent:
         average_evidence_overlap = self._mean(
             item["evidence_keyword_overlap"] for item in (audit or {}).get("hard_checks", [])
         )
+        average_gap_evidence_link = self._mean(
+            item.get("gap_evidence_link_ratio", 0.0)
+            for item in (audit or {}).get("hard_checks", [])
+        )
+        average_gap_importance = self._mean(
+            item.get("gap_importance", 0.0)
+            for item in (audit or {}).get("hard_checks", [])
+        )
 
         hypothesis_count_score = min(1.0, len(cards) / input_data["user_constraints"]["max_hypotheses"])
         diversity_score = self._estimate_diversity(cards)
 
-        overall_score = round(
+        code_review_score = round(
             0.15 * hypothesis_count_score
             + 0.15 * diversity_score
             + 0.20 * average_testability
             + 0.20 * average_alignment
             + 0.10 * average_relevance
             + 0.10 * average_variable_coverage
-            + 0.10 * min(1.0, average_evidence_overlap * 3)
+            + 0.08 * min(1.0, average_evidence_overlap * 3)
+            + 0.02 * average_gap_evidence_link
             - 0.10 * average_risk,
             3,
         )
+        overall_score = code_review_score
+        if eval_report and eval_report.get("available") and eval_report.get("overall_score") is not None:
+            eval_score = float(eval_report["overall_score"])
+            eval_weight = max(0.0, min(0.8, self.config.eval_weight))
+            overall_score = round(
+                (1 - eval_weight) * code_review_score + eval_weight * eval_score,
+                3,
+            )
         overall_score = max(0.0, min(1.0, overall_score))
 
         issues: list[str] = []
@@ -569,25 +785,42 @@ class HypothesisGenerationAgent:
         if diversity_score < 0.6:
             issues.append("Hypothesis types or variable combinations are not diverse enough.")
             suggestions.append("Generate mechanism, mediation, moderation, and comparison hypotheses.")
+        if average_gap_evidence_link < 0.7:
+            issues.append("Some hypotheses are weakly aligned with evidence IDs linked by their selected knowledge gaps.")
+            suggestions.append("Prefer evidence IDs listed in knowledge_gaps.related_evidence_ids when selecting based_on_evidence_ids.")
+        if eval_report:
+            issues.extend(self._string_items(eval_report.get("issues")))
+            suggestions.extend(self._string_items(eval_report.get("suggestions")))
         if retry_notes:
             suggestions.append("The model needed repair attempts; keep JSON mode enabled when connecting Qwen.")
+
+        dimension_scores = {
+            "code_review_score": round(code_review_score, 3),
+            "hypothesis_count": round(hypothesis_count_score, 3),
+            "diversity": round(diversity_score, 3),
+            "average_testability": round(average_testability, 3),
+            "evidence_alignment": round(average_alignment, 3),
+            "average_relevance": round(average_relevance, 3),
+            "average_risk": round(average_risk, 3),
+            "variable_coverage": round(average_variable_coverage, 3),
+            "evidence_keyword_overlap": round(average_evidence_overlap, 3),
+            "gap_evidence_link": round(average_gap_evidence_link, 3),
+            "gap_importance": round(average_gap_importance, 3),
+            "gap_ratio": float((audit or {}).get("gap_ratio", 0.0)),
+        }
+        if eval_report and eval_report.get("available") and eval_report.get("overall_score") is not None:
+            dimension_scores["independent_eval_score"] = round(
+                float(eval_report["overall_score"]),
+                3,
+            )
 
         return {
             "passed": overall_score >= self.config.threshold,
             "overall_score": overall_score,
             "threshold": self.config.threshold,
-            "dimension_scores": {
-                "hypothesis_count": round(hypothesis_count_score, 3),
-                "diversity": round(diversity_score, 3),
-                "average_testability": round(average_testability, 3),
-                "evidence_alignment": round(average_alignment, 3),
-                "average_relevance": round(average_relevance, 3),
-                "average_risk": round(average_risk, 3),
-                "variable_coverage": round(average_variable_coverage, 3),
-                "evidence_keyword_overlap": round(average_evidence_overlap, 3),
-                "gap_ratio": (audit or {}).get("gap_ratio", 0.0),
-            },
+            "dimension_scores": dimension_scores,
             "hard_check_audit": (audit or {}).get("hard_checks", []),
+            "independent_eval": eval_report,
             "issues": issues,
             "suggestions": suggestions,
         }
@@ -676,6 +909,120 @@ class HypothesisGenerationAgent:
             raise AgentOutputError(f"{label} must be a number.")
         if value < 0 or value > 1:
             raise AgentOutputError(f"{label} must be between 0 and 1.")
+
+    def _validate_evidence_bindings(
+        self,
+        card: dict[str, Any],
+        evidence_by_id: dict[str, dict[str, Any]],
+        hypothesis_id: str,
+    ) -> dict[str, float]:
+        bindings = card.get("evidence_bindings")
+        if not isinstance(bindings, list) or not bindings:
+            raise AgentOutputError(f"{hypothesis_id}.evidence_bindings must be a non-empty list.")
+
+        referenced_ids = {str(item) for item in card.get("based_on_evidence_ids", [])}
+        binding_ids: set[str] = set()
+        bridge_scores: list[float] = []
+        for index, binding in enumerate(bindings):
+            if not isinstance(binding, dict):
+                raise AgentOutputError(f"{hypothesis_id}.evidence_bindings[{index}] must be a dict.")
+            evidence_id = str(binding.get("evidence_id") or "").strip()
+            if not evidence_id:
+                raise AgentOutputError(f"{hypothesis_id}.evidence_bindings[{index}] missing evidence_id.")
+            if evidence_id not in evidence_by_id:
+                raise AgentOutputError(
+                    f"{hypothesis_id}.evidence_bindings[{index}] references unknown evidence id: {evidence_id}."
+                )
+            binding_ids.add(evidence_id)
+
+            bridge = str(binding.get("inference_bridge") or "").strip()
+            linked_variable = str(binding.get("linked_variable") or "").strip()
+            if len(bridge) < self.config.min_binding_bridge_chars:
+                raise AgentOutputError(
+                    f"{hypothesis_id}.evidence_bindings[{index}].inference_bridge is too short."
+                )
+            bridge_scores.append(1.0 if linked_variable else 0.75)
+
+        missing_bindings = referenced_ids - binding_ids
+        if missing_bindings:
+            raise AgentOutputError(
+                f"{hypothesis_id} has evidence IDs without evidence_bindings: {sorted(missing_bindings)}."
+            )
+
+        extra_bindings = binding_ids - referenced_ids
+        if extra_bindings:
+            raise AgentOutputError(
+                f"{hypothesis_id} has evidence_bindings not listed in based_on_evidence_ids: {sorted(extra_bindings)}."
+            )
+
+        return {
+            "coverage": len(binding_ids & referenced_ids) / max(1, len(referenced_ids)),
+            "bridge_quality": self._mean(bridge_scores),
+        }
+
+    def _gap_alignment(
+        self,
+        card: dict[str, Any],
+        gap_by_id: dict[str, dict[str, Any]],
+        evidence_by_id: dict[str, dict[str, Any]],
+        hypothesis_id: str,
+    ) -> dict[str, Any]:
+        selected_gap_ids = [str(item) for item in card.get("related_gap_ids", [])]
+        selected_evidence_ids = {str(item) for item in card.get("based_on_evidence_ids", [])}
+        related_evidence_ids: set[str] = set()
+        gap_importance_scores: list[float] = []
+        gap_types: set[str] = set()
+        gap_text_parts: list[str] = []
+
+        for gap_id in selected_gap_ids:
+            gap = gap_by_id.get(gap_id)
+            if not isinstance(gap, dict):
+                continue
+            gap_types.add(str(gap.get("gap_type") or "unknown"))
+            gap_importance_scores.append(self._score_or_default(gap.get("importance_score"), 0.5))
+            gap_text_parts.extend(
+                [
+                    str(gap.get("description") or ""),
+                    str(gap.get("why_it_matters_for_hypothesis_generation") or ""),
+                    " ".join(self._string_items(gap.get("related_concepts"))),
+                ]
+            )
+            for evidence_id in self._string_items(gap.get("related_evidence_ids")):
+                if evidence_id in evidence_by_id:
+                    related_evidence_ids.add(evidence_id)
+
+        if related_evidence_ids:
+            gap_evidence_link_ratio = len(selected_evidence_ids & related_evidence_ids) / len(
+                related_evidence_ids
+            )
+        else:
+            gap_evidence_link_ratio = 1.0
+
+        hypothesis_text = self._normalized_text(
+            " ".join(
+                [
+                    str(card.get("statement") or ""),
+                    str(card.get("rationale") or ""),
+                    str(card.get("expected_observation") or ""),
+                    " ".join(str(item) for item in card.get("predictions", [])),
+                ]
+            )
+        )
+        gap_tokens = self._token_set(" ".join(gap_text_parts))
+        text_tokens = self._token_set(hypothesis_text)
+        gap_text_overlap = (
+            len(gap_tokens & text_tokens) / len(gap_tokens)
+            if gap_tokens
+            else 0.0
+        )
+
+        return {
+            "related_evidence_available": bool(related_evidence_ids),
+            "gap_evidence_link_ratio": max(0.0, min(1.0, gap_evidence_link_ratio)),
+            "gap_importance": self._mean(gap_importance_scores) if gap_importance_scores else 0.0,
+            "gap_types": gap_types,
+            "gap_text_overlap": max(0.0, min(1.0, gap_text_overlap)),
+        }
 
     def _variable_coverage(self, card: dict[str, Any], input_data: dict[str, Any]) -> float:
         required_variables = [
@@ -801,6 +1148,13 @@ class HypothesisGenerationAgent:
             return 0.0
         return sum(float(value) for value in value_list) / len(value_list)
 
+    def _score_or_default(self, value: Any, default: float) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            numeric = default
+        return max(0.0, min(1.0, numeric))
+
     def _schema_hint(self) -> dict[str, Any]:
         return {
             "hypothesis_cards": [
@@ -810,6 +1164,14 @@ class HypothesisGenerationAgent:
                     "hypothesis_type": "mechanism | causal | mediation | moderation | comparison",
                     "rationale": "string",
                     "based_on_evidence_ids": ["ev_001"],
+                    "evidence_bindings": [
+                        {
+                            "evidence_id": "ev_001",
+                            "used_as": "hypothesis_source",
+                            "linked_variable": "string",
+                            "inference_bridge": "string explaining how this evidence inspires the hypothesis",
+                        }
+                    ],
                     "related_gap_ids": ["gap_001"],
                     "target_variables": ["string"],
                     "expected_observation": "string",
@@ -843,6 +1205,20 @@ class HypothesisGenerationAgent:
                     "hypothesis_type": "mechanism",
                     "rationale": "ev_001 links tau pathology to cognitive decline, ev_002 links neuroinflammation to tau pathology, and gap_001 states that the causal role of neuroinflammation in tau spread remains unclear.",
                     "based_on_evidence_ids": ["ev_001", "ev_002"],
+                    "evidence_bindings": [
+                        {
+                            "evidence_id": "ev_001",
+                            "used_as": "hypothesis_source",
+                            "linked_variable": "cognitive decline",
+                            "inference_bridge": "ev_001 anchors the outcome side of the hypothesis by linking tau pathology with cognitive decline.",
+                        },
+                        {
+                            "evidence_id": "ev_002",
+                            "used_as": "hypothesis_source",
+                            "linked_variable": "neuroinflammation",
+                            "inference_bridge": "ev_002 anchors the upstream mechanism by linking neuroinflammation with tau pathology.",
+                        },
+                    ],
                     "related_gap_ids": ["gap_001"],
                     "target_variables": ["neuroinflammation", "tau pathology", "cognitive decline"],
                     "expected_observation": "Inflammatory biomarkers should precede or accompany tau spreading and predict faster cognitive decline.",

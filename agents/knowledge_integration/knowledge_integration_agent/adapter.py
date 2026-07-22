@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Any
+from typing import Any, Callable
 
-from .agent import KnowledgeIntegrationAgent
+from .agent import KnowledgeIntegrationAgent, ProgressCallback
 
 
 class KnowledgeIntegrationAdapter:
@@ -24,7 +23,7 @@ class KnowledgeIntegrationAdapter:
         }
 
     def build_request(self, task_context: dict[str, Any]) -> dict[str, Any]:
-        return {
+        request = {
             "task_id": task_context.get("task_id", ""),
             "stage": self.stage,
             "iteration": int(task_context.get("iteration", 1)),
@@ -33,18 +32,22 @@ class KnowledgeIntegrationAdapter:
                 "search_policy": dict(self.default_search_policy),
             },
             "output_schema": self.output_schema,
-            "extensions": task_context.get("extensions") or {},
         }
+        extensions = task_context.get("extensions")
+        if isinstance(extensions, dict) and extensions:
+            request["extensions"] = dict(extensions)
+        return request
 
     def call(
         self,
         task_context: dict[str, Any],
-        *,
+        progress_callback: ProgressCallback | None = None,
         progress_handler: Callable[[dict[str, Any]], None] | None = None,
         cancellation_checker: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         return self.agent.run(
             self.build_request(task_context),
+            progress_callback=progress_callback,
             progress_handler=progress_handler,
             cancellation_checker=cancellation_checker,
         )

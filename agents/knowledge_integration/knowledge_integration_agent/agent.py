@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from collections.abc import Callable
-from typing import Any
+from typing import Any, Callable
 
 from .llm import LLMClient, QwenDashScopeClient
 from .retrieval import LiteratureClient, default_literature_clients
@@ -24,6 +23,8 @@ ALLOWED_GAP_TYPES = {
     "method_limitation",
     "contradiction",
 }
+
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 @dataclass(frozen=True)
@@ -154,16 +155,59 @@ class RetrievalService:
         self.clients = clients or default_literature_clients()
 
     def retrieve(
-        self, question: ParsedQuestion, queries: list[dict[str, Any]]
+        self,
+        question: ParsedQuestion,
+        queries: list[dict[str, Any]],
+        progress_callback: ProgressCallback | None = None,
     ) -> list[dict[str, Any]]:
         max_papers = int(question.search_policy.get("max_papers") or 20)
         per_client_limit = max(1, int(question.search_policy.get("per_client_limit") or 3))
         sources: list[dict[str, Any]] = []
-        for query in queries:
+        query_count = len(queries)
+        for query_index, query in enumerate(queries, start=1):
             for client in self.clients:
+                event_payload = {
+                    "database": client.name,
+                    "query": query["query"],
+                    "query_index": query_index,
+                    "query_count": query_count,
+                }
+                _notify_progress(
+                    progress_callback,
+                    {
+                        "event": "retrieval_database_started",
+                        "component": "RetrievalService",
+                        "payload": event_payload,
+                    },
+                )
                 try:
-                    sources.extend(client.search(query["query"], limit=per_client_limit))
-                except Exception:
+                    found_sources = client.search(
+                        query["query"], limit=per_client_limit
+                    )
+                    sources.extend(found_sources)
+                    _notify_progress(
+                        progress_callback,
+                        {
+                            "event": "retrieval_database_completed",
+                            "component": "RetrievalService",
+                            "payload": {
+                                **event_payload,
+                                "result_count": len(found_sources),
+                            },
+                        },
+                    )
+                except Exception as exc:
+                    _notify_progress(
+                        progress_callback,
+                        {
+                            "event": "retrieval_database_failed",
+                            "component": "RetrievalService",
+                            "payload": {
+                                **event_payload,
+                                "error": str(exc),
+                            },
+                        },
+                    )
                     continue
             if len(sources) >= max_papers * 3:
                 break
@@ -287,43 +331,60 @@ class LiteratureExtractor:
 
 
 class EvidenceExtractor:
-    def __init__(self, llm_client: LLMClient) -> None:
+    def __init__(
+        self, llm_client: LLMClient, *, max_cards_per_literature: int = 6
+    ) -> None:
         self.llm_client = llm_client
+        self.max_cards_per_literature = max(1, max_cards_per_literature)
+        self.extraction_errors: list[str] = []
 
     def extract(
         self, sources: list[dict[str, Any]], literature_cards: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
+        self.extraction_errors = []
         evidence_cards: list[dict[str, Any]] = []
         evidence_index = 1
         for source, literature in zip(sources, literature_cards):
-            result = self.llm_client.generate_json(
-                system_prompt=(
-                    "Extract evidence cards from source text. Return "
-                    "{'evidence_cards': [{'claim': string, 'evidence_type': string, "
-                    "'support_direction': 'support|oppose|uncertain', "
-                    "'related_concepts': string[], 'strength_score': number, "
-                    "'summary': string, 'limitations': string[]}]} only."
-                ),
-                user_payload={
-                    "source_literature_id": literature["literature_id"],
-                    "title": literature["title"],
-                    "abstract": source.get("abstract", ""),
-                    "main_findings": literature.get("main_findings", []),
-                    "related_concepts": literature.get("related_concepts", []),
-                },
-                expected_schema="evidence_cards",
-            )
+            literature_id = literature["literature_id"]
+            try:
+                result = self.llm_client.generate_json(
+                    system_prompt=(
+                        "Extract evidence cards from source text. Return at most "
+                        f"{self.max_cards_per_literature} evidence cards for this "
+                        "single source. Return {'evidence_cards': [{'claim': string, "
+                        "'evidence_type': string, "
+                        "'support_direction': 'support|oppose|uncertain', "
+                        "'related_concepts': string[], 'strength_score': number, "
+                        "'summary': string, 'limitations': string[]}]} only."
+                    ),
+                    user_payload={
+                        "source_literature_id": literature_id,
+                        "title": literature["title"],
+                        "abstract": source.get("abstract", ""),
+                        "main_findings": literature.get("main_findings", []),
+                        "related_concepts": literature.get("related_concepts", []),
+                    },
+                    expected_schema="evidence_cards",
+                )
+            except Exception as exc:
+                self.extraction_errors.append(
+                    f"evidence extraction failed for {literature_id}: {exc}"
+                )
+                continue
+            source_evidence_count = 0
             for item in result.get("evidence_cards") or []:
                 if not isinstance(item, dict):
                     continue
                 claim = str(item.get("claim", "")).strip()
                 if not claim:
                     continue
+                if source_evidence_count >= self.max_cards_per_literature:
+                    break
                 evidence_cards.append(
                     {
                         "evidence_id": f"ev_{evidence_index:03d}",
                         "claim": claim,
-                        "source_literature_id": literature["literature_id"],
+                        "source_literature_id": literature_id,
                         "evidence_type": str(item.get("evidence_type") or "literature_finding"),
                         "support_direction": _support_direction(item.get("support_direction")),
                         "related_concepts": _string_list(item.get("related_concepts")),
@@ -333,6 +394,7 @@ class EvidenceExtractor:
                     }
                 )
                 evidence_index += 1
+                source_evidence_count += 1
         literature_ids = {card["literature_id"] for card in literature_cards}
         return [
             card
@@ -352,7 +414,13 @@ class GapSynthesizer:
     ) -> list[dict[str, Any]]:
         result = self.llm_client.generate_json(
             system_prompt=(
-                "Identify knowledge gaps that can drive hypothesis generation. Return "
+                "Identify knowledge gaps that can guide a downstream candidate-hypothesis "
+                "generation agent. Provide research directions and recommendations only. "
+                "Do not propose or state any concrete hypothesis, predicted relationship, "
+                "causal claim framed as a hypothesis, or if-then hypothesis. In "
+                "why_it_matters_for_hypothesis_generation, describe only the broad research "
+                "direction, variables or relationships worth exploring, evidence still "
+                "needed, and methodological suggestions. Return "
                 "{'knowledge_gaps': [{'description': string, 'gap_type': string, "
                 "'related_concepts': string[], 'related_evidence_ids': string[], "
                 "'importance_score': number, "
@@ -497,32 +565,42 @@ class KnowledgeIntegrationAgent:
     def run(
         self,
         request: dict[str, Any],
+        progress_callback: ProgressCallback | None = None,
         *,
         progress_handler: Callable[[dict[str, Any]], None] | None = None,
         cancellation_checker: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
+        def check_cancelled() -> None:
+            if cancellation_checker is not None:
+                cancellation_checker()
+
         def checkpoint(
             node_id: str,
             message: str,
-            progress: float,
+            progress: float | None = None,
             *,
             kind: str = "progress",
             payload: dict[str, Any] | None = None,
             operation: str = "append",
         ) -> None:
-            if cancellation_checker:
-                cancellation_checker()
-            if progress_handler:
-                progress_handler({
-                    "node_id": node_id,
-                    "kind": kind,
-                    "message": message,
-                    "progress": progress,
-                    "payload": payload or {},
-                    "operation": operation,
-                })
+            check_cancelled()
+            if progress_handler is not None:
+                progress_handler(
+                    {
+                        "node_id": node_id,
+                        "kind": kind,
+                        "message": message,
+                        "progress": progress,
+                        "payload": payload or {},
+                        "operation": operation,
+                    }
+                )
 
-        checkpoint("query_planning", "Parsing the research question.", 0.02, kind="started")
+        def emit(event: dict[str, Any]) -> None:
+            check_cancelled()
+            self._emit_progress(request, progress_callback, event)
+            self._emit_workflow_progress(progress_handler, event)
+
         question, missing_fields = self.question_parser.parse(request)
         if missing_fields:
             return self._failure_response(
@@ -532,69 +610,167 @@ class KnowledgeIntegrationAgent:
             )
 
         assert question is not None
+        literature_cards: list[dict[str, Any]] = []
+        evidence_cards: list[dict[str, Any]] = []
+        knowledge_gaps: list[dict[str, Any]] = []
         resume = (request.get("extensions") or {}).get("workflow_resume") or {}
         checkpoint_payloads = {
             item.get("node_id"): item.get("payload") or {}
             for item in resume.get("checkpoints") or []
             if isinstance(item, dict)
         }
-        resumed_literature = checkpoint_payloads.get("literature_extract", {}).get("literature_cards")
-        resumed_evidence = checkpoint_payloads.get("evidence_extract", {}).get("evidence_cards")
+        resumed_literature = checkpoint_payloads.get("literature_extract", {}).get(
+            "literature_cards"
+        )
+        resumed_evidence = checkpoint_payloads.get("evidence_extract", {}).get(
+            "evidence_cards"
+        )
         resumed_gaps = checkpoint_payloads.get("gap_synthesis", {}).get("knowledge_gaps")
         try:
-            if resumed_evidence:
-                literature_cards = resumed_literature or []
+            checkpoint("query_planning", "Parsing the research question.", 0.02, kind="started")
+            restored_evidence_from_checkpoint = False
+            if isinstance(resumed_evidence, list) and resumed_evidence:
+                literature_cards = resumed_literature if isinstance(resumed_literature, list) else []
                 evidence_cards = resumed_evidence
-                checkpoint("evidence_extract", "Restored evidence checkpoint.", 0.82)
+                restored_evidence_from_checkpoint = True
+                checkpoint(
+                    "literature_extract",
+                    "Restored literature checkpoint.",
+                    0.7,
+                    kind="partial_output",
+                    payload={"literature_cards": literature_cards},
+                    operation="replace",
+                )
+                checkpoint(
+                    "evidence_extract",
+                    "Restored evidence checkpoint.",
+                    0.82,
+                    kind="partial_output",
+                    payload={"evidence_cards": evidence_cards},
+                    operation="replace",
+                )
+                evidence_extraction_errors: list[str] = []
             else:
                 checkpoint("query_planning", "Planning literature search queries.", 0.08)
                 queries = self.search_query_planner.build_queries(question)
-                checkpoint("source_search", "Searching configured literature sources.", 0.16, kind="started", payload={"queries": queries})
-                retrieved_sources = self.retrieval_service.retrieve(question, queries)
-                checkpoint("source_verify", "Verifying retrieved source identifiers.", 0.38, payload={"candidate_sources": len(retrieved_sources)})
-                verified_sources = self.source_verifier.verify(retrieved_sources, bool(question.search_policy.get("must_verify_sources", True)))
-                checkpoint("relevance_filter", "Filtering sources for question relevance.", 0.48, payload={"verified_sources": len(verified_sources)})
-                relevant_sources = self.source_relevance_filter.filter(question, verified_sources)
-                checkpoint("literature_extract", "Extracting structured literature cards.", 0.6, payload={"relevant_sources": len(relevant_sources)})
+                checkpoint(
+                    "source_search",
+                    "Searching configured literature sources.",
+                    0.16,
+                    kind="started",
+                    payload={"queries": queries},
+                )
+                retrieved_sources = self.retrieval_service.retrieve(
+                    question,
+                    queries,
+                    progress_callback=emit,
+                )
+                emit(
+                    {
+                        "event": "retrieval_completed",
+                        "component": "RetrievalService",
+                        "payload": {"retrieved_sources": retrieved_sources},
+                    }
+                )
+                checkpoint(
+                    "source_verify",
+                    "Verifying retrieved source identifiers.",
+                    0.38,
+                    payload={"candidate_sources": len(retrieved_sources)},
+                )
+                verified_sources = self.source_verifier.verify(
+                    retrieved_sources,
+                    bool(question.search_policy.get("must_verify_sources", True)),
+                )
+                checkpoint(
+                    "relevance_filter",
+                    "Filtering sources for question relevance.",
+                    0.48,
+                    payload={"verified_sources": len(verified_sources)},
+                )
+                relevant_sources = self.source_relevance_filter.filter(
+                    question, verified_sources
+                )
+                checkpoint(
+                    "literature_extract",
+                    "Extracting structured literature cards.",
+                    0.6,
+                    payload={"relevant_sources": len(relevant_sources)},
+                )
                 literature_cards = self.literature_extractor.extract(relevant_sources)
-            checkpoint(
-                "literature_extract",
-                "Literature cards are available.",
-                0.7,
-                kind="partial_output",
-                payload={"literature_cards": literature_cards},
-                operation="replace",
-            )
-            if not resumed_evidence:
+                emit(
+                    {
+                        "event": "literature_extraction_completed",
+                        "component": "LiteratureExtractor",
+                        "payload": {"literature_cards": literature_cards},
+                    }
+                )
                 checkpoint("evidence_extract", "Extracting traceable evidence cards.", 0.74)
-                evidence_cards = self.evidence_extractor.extract(relevant_sources, literature_cards)
-            checkpoint(
-                "evidence_extract",
-                "Evidence cards are available.",
-                0.82,
-                kind="partial_output",
-                payload={"evidence_cards": evidence_cards},
-                operation="replace",
-            )
-            checkpoint("gap_synthesis", "Synthesizing knowledge gaps.", 0.86)
-            knowledge_gaps = resumed_gaps or self.gap_synthesizer.synthesize(question, evidence_cards)
-            checkpoint(
-                "gap_synthesis",
-                "Knowledge gaps are available.",
-                0.92,
-                kind="partial_output",
-                payload={"knowledge_gaps": knowledge_gaps},
-                operation="replace",
-            )
+                evidence_cards = self.evidence_extractor.extract(
+                    relevant_sources, literature_cards
+                )
+                evidence_extraction_errors = list(self.evidence_extractor.extraction_errors)
+            if not evidence_cards:
+                return self._failure_response(
+                    request,
+                    requested_resources=[],
+                    issues=[
+                        "no evidence cards were extracted",
+                        *evidence_extraction_errors,
+                    ],
+                    payload={
+                        "literature_cards": literature_cards,
+                        "evidence_cards": [],
+                        "knowledge_gaps": [],
+                    },
+                )
+            if not restored_evidence_from_checkpoint:
+                emit(
+                    {
+                        "event": "evidence_extraction_completed",
+                        "component": "EvidenceExtractor",
+                        "payload": {"evidence_cards": evidence_cards},
+                    }
+                )
+            if isinstance(resumed_gaps, list) and resumed_gaps:
+                knowledge_gaps = resumed_gaps
+                checkpoint(
+                    "gap_synthesis",
+                    "Restored knowledge gap checkpoint.",
+                    0.92,
+                    kind="partial_output",
+                    payload={"knowledge_gaps": knowledge_gaps},
+                    operation="replace",
+                )
+            else:
+                checkpoint("gap_synthesis", "Synthesizing knowledge gaps.", 0.86)
+                knowledge_gaps = self.gap_synthesizer.synthesize(question, evidence_cards)
+                emit(
+                    {
+                        "event": "gap_synthesis_completed",
+                        "component": "GapSynthesizer",
+                        "payload": {"knowledge_gaps": knowledge_gaps},
+                    }
+                )
             checkpoint("quality_review", "Reviewing knowledge integration quality.", 0.96)
             self_review = self.quality_reviewer.review(
                 literature_cards, evidence_cards, knowledge_gaps, question
             )
+            if evidence_extraction_errors:
+                self_review["issues"] = [
+                    *_string_list(self_review.get("issues")),
+                    *evidence_extraction_errors,
+                ]
         except Exception as exc:
             return self._failure_response(
                 request,
                 requested_resources=[],
                 issues=[f"knowledge integration failed: {exc}"],
+                payload={
+                    "literature_cards": literature_cards,
+                    "evidence_cards": evidence_cards,
+                    "knowledge_gaps": knowledge_gaps,
+                },
             )
 
         status = "success" if self_review["passed"] else "failed"
@@ -613,10 +789,12 @@ class KnowledgeIntegrationAgent:
         request: dict[str, Any],
         requested_resources: list[str],
         issues: list[str],
+        payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return {
             "metadata": self._metadata(request, status="failed"),
-            "payload": {
+            "payload": payload
+            or {
                 "literature_cards": [],
                 "evidence_cards": [],
                 "knowledge_gaps": [],
@@ -646,6 +824,100 @@ class KnowledgeIntegrationAgent:
             "status": status,
         }
 
+    def _emit_progress(
+        self,
+        request: dict[str, Any],
+        progress_callback: ProgressCallback | None,
+        event: dict[str, Any],
+    ) -> None:
+        if progress_callback is None:
+            return
+        progress_callback(
+            {
+                "metadata": self._metadata(request, status="in_progress"),
+                **event,
+            }
+        )
+
+    def _emit_workflow_progress(
+        self,
+        progress_handler: Callable[[dict[str, Any]], None] | None,
+        event: dict[str, Any],
+    ) -> None:
+        if progress_handler is None:
+            return
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        event_name = str(event.get("event") or "")
+        database = str(payload.get("database") or "literature source")
+        query = str(payload.get("query") or "").strip()
+
+        update: dict[str, Any] | None = None
+        if event_name == "retrieval_database_started":
+            suffix = f": {query}" if query else ""
+            update = {
+                "node_id": "source_search",
+                "kind": "progress",
+                "message": f"Searching {database}{suffix}",
+                "progress": 0.2,
+                "payload": payload,
+            }
+        elif event_name == "retrieval_database_completed":
+            update = {
+                "node_id": "source_search",
+                "kind": "progress",
+                "message": f"Retrieved {payload.get('result_count', 0)} results from {database}.",
+                "progress": 0.3,
+                "payload": payload,
+            }
+        elif event_name == "retrieval_database_failed":
+            update = {
+                "node_id": "source_search",
+                "kind": "progress",
+                "message": f"Search failed for {database}.",
+                "progress": 0.3,
+                "payload": payload,
+            }
+        elif event_name == "retrieval_completed":
+            update = {
+                "node_id": "source_search",
+                "kind": "partial_output",
+                "message": "Retrieved literature candidates.",
+                "progress": 0.36,
+                "payload": payload,
+                "operation": "replace",
+            }
+        elif event_name == "literature_extraction_completed":
+            update = {
+                "node_id": "literature_extract",
+                "kind": "partial_output",
+                "message": "Literature cards are available.",
+                "progress": 0.7,
+                "payload": payload,
+                "operation": "replace",
+            }
+        elif event_name == "evidence_extraction_completed":
+            update = {
+                "node_id": "evidence_extract",
+                "kind": "partial_output",
+                "message": "Evidence cards are available.",
+                "progress": 0.82,
+                "payload": payload,
+                "operation": "replace",
+            }
+        elif event_name == "gap_synthesis_completed":
+            update = {
+                "node_id": "gap_synthesis",
+                "kind": "partial_output",
+                "message": "Knowledge gaps are available.",
+                "progress": 0.92,
+                "payload": payload,
+                "operation": "replace",
+            }
+
+        if update is not None:
+            update.setdefault("operation", "append")
+            progress_handler(update)
+
 
 def _dedupe_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     deduped: list[dict[str, Any]] = []
@@ -659,6 +931,13 @@ def _dedupe_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen.add(key)
         deduped.append(source)
     return deduped
+
+
+def _notify_progress(
+    progress_callback: ProgressCallback | None, event: dict[str, Any]
+) -> None:
+    if progress_callback is not None:
+        progress_callback(event)
 
 
 def _string_list(value: Any) -> list[str]:
@@ -691,4 +970,3 @@ def _gap_type(value: Any) -> str:
     if gap_type in ALLOWED_GAP_TYPES:
         return gap_type
     return "mechanism_unknown"
-
