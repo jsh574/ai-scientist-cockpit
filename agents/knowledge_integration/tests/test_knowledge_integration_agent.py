@@ -4,6 +4,7 @@ from pathlib import Path
 from knowledge_integration_agent import KnowledgeIntegrationAdapter, KnowledgeIntegrationAgent
 from knowledge_integration_agent.agent import (
     EvidenceExtractor,
+    FeedbackRouter,
     GapSynthesizer,
     LiteratureExtractor,
     RetrievalService,
@@ -192,6 +193,44 @@ class AlwaysFailEvidenceLLM(FakeLLM):
             raise RuntimeError(
                 f"evidence timeout for {user_payload['source_literature_id']}"
             )
+        return super().generate_json(
+            system_prompt=system_prompt,
+            user_payload=user_payload,
+            expected_schema=expected_schema,
+        )
+
+
+class FeedbackRoutingLLM(FakeLLM):
+    def __init__(self):
+        self.payloads_by_schema = {}
+
+    def generate_json(self, *, system_prompt, user_payload, expected_schema):
+        self.payloads_by_schema.setdefault(expected_schema, []).append(user_payload)
+        if expected_schema == "feedback_directives":
+            return {
+                "question_updates": {
+                    "new_sub_questions": ["How do foregrounds affect B-mode claims?"],
+                    "new_key_concepts": ["foreground removal"],
+                },
+                "retrieval_directives": {
+                    "required_keywords": ["foreground removal B-mode"],
+                    "requested_sources": ["Planck 2018 cosmological parameters"],
+                },
+                "literature_directives": {
+                    "focus_points": ["extract methods and datasets"],
+                },
+                "evidence_directives": {
+                    "user_provided_evidence": [
+                        "Foreground models can shift inferred tensor constraints."
+                    ],
+                },
+                "gap_directives": {
+                    "style": "research directions only",
+                    "avoid": ["concrete if-then hypotheses"],
+                },
+                "global_notes": ["Prioritize user feedback in this iteration."],
+                "unassigned_feedback": [],
+            }
         return super().generate_json(
             system_prompt=system_prompt,
             user_payload=user_payload,
@@ -389,6 +428,103 @@ def test_search_query_planner_uses_llm_expansion_then_code_dedupes_and_limits():
             "rationale": "connects observable proxies to model constraints",
             "priority": 0.9,
         },
+    ]
+
+
+def test_feedback_router_skips_blank_feedback_without_llm_call():
+    llm = FeedbackRoutingLLM()
+
+    directives = FeedbackRouter(llm).route("")
+
+    assert directives == {
+        "question_updates": {},
+        "retrieval_directives": {},
+        "literature_directives": {},
+        "evidence_directives": {},
+        "gap_directives": {},
+        "global_notes": [],
+        "unassigned_feedback": [],
+    }
+    assert "feedback_directives" not in llm.payloads_by_schema
+
+
+def test_feedback_router_splits_mixed_feedback_into_subagent_directives():
+    llm = FeedbackRoutingLLM()
+    feedback = (
+        "Please search Planck 2018, add a foreground sub-question, use my evidence "
+        "about foreground models, and keep gaps directional."
+    )
+
+    directives = FeedbackRouter(llm).route(feedback)
+
+    assert llm.payloads_by_schema["feedback_directives"][0]["feedback"] == feedback
+    assert directives["question_updates"]["new_sub_questions"] == [
+        "How do foregrounds affect B-mode claims?"
+    ]
+    assert directives["retrieval_directives"]["requested_sources"] == [
+        "Planck 2018 cosmological parameters"
+    ]
+    assert directives["literature_directives"]["focus_points"] == [
+        "extract methods and datasets"
+    ]
+    assert directives["evidence_directives"]["user_provided_evidence"] == [
+        "Foreground models can shift inferred tensor constraints."
+    ]
+    assert directives["gap_directives"]["style"] == "research directions only"
+
+
+def test_agent_routes_feedback_to_each_subagent_without_changing_final_schema():
+    llm = FeedbackRoutingLLM()
+    request = {
+        **make_request(),
+        "_feedback": (
+            "Search Planck 2018; add foreground-removal sub-question; use my "
+            "foreground-model evidence; keep gaps directional."
+        ),
+    }
+    events = []
+
+    response = KnowledgeIntegrationAgent(
+        llm_client=llm, literature_clients=[FakeLiteratureClient()]
+    ).run(request, progress_callback=events.append)
+
+    assert response.keys() == {"metadata", "payload", "self_review"}
+    assert response["payload"].keys() == {
+        "literature_cards",
+        "evidence_cards",
+        "knowledge_gaps",
+    }
+    assert response["metadata"]["status"] == "success"
+    assert events[0]["event"] == "feedback_routing_completed"
+    assert events[0]["payload"]["feedback_directives"]["retrieval_directives"] == {
+        "required_keywords": ["foreground removal B-mode"],
+        "requested_sources": ["Planck 2018 cosmological parameters"],
+    }
+
+    search_payload = llm.payloads_by_schema["search_strategy"][0]
+    literature_payload = llm.payloads_by_schema["literature_cards"][0]
+    evidence_payload = llm.payloads_by_schema["evidence_cards"][0]
+    gap_payload = llm.payloads_by_schema["knowledge_gaps"][0]
+    review_payload = llm.payloads_by_schema["self_review"][0]
+
+    assert search_payload["question_updates"]["new_key_concepts"] == [
+        "foreground removal"
+    ]
+    assert search_payload["retrieval_directives"]["required_keywords"] == [
+        "foreground removal B-mode"
+    ]
+    assert literature_payload["question_updates"]["new_sub_questions"] == [
+        "How do foregrounds affect B-mode claims?"
+    ]
+    assert literature_payload["literature_directives"]["focus_points"] == [
+        "extract methods and datasets"
+    ]
+    assert evidence_payload["evidence_directives"]["user_provided_evidence"] == [
+        "Foreground models can shift inferred tensor constraints."
+    ]
+    assert gap_payload["gap_directives"]["avoid"] == ["concrete if-then hypotheses"]
+    assert review_payload["feedback_directives"]["global_notes"] == [
+        "Prioritize user feedback in this iteration."
     ]
 
 
@@ -710,6 +846,7 @@ def test_adapter_slices_task_context_for_total_control_layer():
     task_context = {
         "task_id": "task_001",
         "iteration": 1,
+        "_feedback": "补充 Planck 2018 文献。",
         "question_card": make_request()["input"]["question_card"],
         "literature_cards": [{"should_not": "be passed back in"}],
         "hypothesis_cards": [{"should_not": "be visible to module 2"}],
@@ -719,6 +856,7 @@ def test_adapter_slices_task_context_for_total_control_layer():
 
     assert request["task_id"] == "task_001"
     assert request["stage"] == "knowledge_integration"
+    assert request["_feedback"] == "补充 Planck 2018 文献。"
     assert request["input"].keys() == {"question_card", "search_policy"}
     assert request["input"]["question_card"] == task_context["question_card"]
     assert "literature_cards" not in request["input"]

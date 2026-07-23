@@ -27,6 +27,17 @@ ALLOWED_GAP_TYPES = {
 ProgressCallback = Callable[[dict[str, Any]], None]
 
 
+EMPTY_FEEDBACK_DIRECTIVES: dict[str, Any] = {
+    "question_updates": {},
+    "retrieval_directives": {},
+    "literature_directives": {},
+    "evidence_directives": {},
+    "gap_directives": {},
+    "global_notes": [],
+    "unassigned_feedback": [],
+}
+
+
 @dataclass(frozen=True)
 class ParsedQuestion:
     task_id: str
@@ -39,6 +50,7 @@ class ParsedQuestion:
     sub_questions: list[str]
     search_keywords: list[str]
     search_policy: dict[str, Any]
+    feedback: str
 
 
 class QuestionParser:
@@ -64,16 +76,63 @@ class QuestionParser:
                 sub_questions=list(question_card["sub_questions"]),
                 search_keywords=list(question_card["search_keywords"]),
                 search_policy=dict(request.get("input", {}).get("search_policy") or {}),
+                feedback=str(request.get("_feedback") or ""),
             ),
             [],
         )
+
+
+class FeedbackRouter:
+    def __init__(self, llm_client: LLMClient) -> None:
+        self.llm_client = llm_client
+
+    def route(self, feedback: str) -> dict[str, Any]:
+        feedback = str(feedback or "").strip()
+        if not feedback:
+            return _empty_feedback_directives()
+        try:
+            result = self.llm_client.generate_json(
+                system_prompt=(
+                    "You route one user's feedback for a knowledge integration agent "
+                    "into directives for internal sub-agents. Split mixed feedback by "
+                    "target responsibility. Do not invent user intent. Return "
+                    "{'question_updates': object, 'retrieval_directives': object, "
+                    "'literature_directives': object, 'evidence_directives': object, "
+                    "'gap_directives': object, 'global_notes': string[], "
+                    "'unassigned_feedback': string[]}."
+                ),
+                user_payload={
+                    "feedback": feedback,
+                    "routing_targets": {
+                        "question_updates": "new sub-questions, concepts, variables, scope changes, or focus changes that affect the whole knowledge integration flow",
+                        "retrieval_directives": "requested papers, authors, DOI, URL, databases, keywords, search directions, or missing literature areas",
+                        "literature_directives": "requested emphasis when extracting literature cards, such as methods, datasets, findings, or concepts to capture",
+                        "evidence_directives": "user-provided evidence, evidence to verify, claims to check, or evidence extraction preferences",
+                        "gap_directives": "knowledge-gap style, missing gap directions, topics to avoid, or downstream hypothesis-generation guidance",
+                    },
+                },
+                expected_schema="feedback_directives",
+            )
+        except Exception as exc:
+            directives = _empty_feedback_directives()
+            directives["global_notes"] = [feedback]
+            directives["unassigned_feedback"] = [
+                f"feedback routing failed: {exc}"
+            ]
+            return directives
+        return _normalize_feedback_directives(result)
 
 
 class SearchQueryPlanner:
     def __init__(self, llm_client: LLMClient) -> None:
         self.llm_client = llm_client
 
-    def build_queries(self, question: ParsedQuestion) -> list[dict[str, Any]]:
+    def build_queries(
+        self,
+        question: ParsedQuestion,
+        feedback_directives: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        feedback_directives = feedback_directives or _empty_feedback_directives()
         payload = {
             "core_question": question.core_question,
             "research_object": question.research_object,
@@ -82,10 +141,14 @@ class SearchQueryPlanner:
             "key_variables": question.key_variables,
             "sub_questions": question.sub_questions,
             "search_keywords": question.search_keywords,
+            "question_updates": feedback_directives["question_updates"],
+            "retrieval_directives": feedback_directives["retrieval_directives"],
             "instruction": (
                 "Generate topic-specific scholarly search queries. Avoid fixed templates. "
                 "Use professional English terms, important synonyms, observable proxies, "
-                "method terms, and domain databases when useful."
+                "method terms, and domain databases when useful. When feedback directives "
+                "request specific literature, sources, keywords, or missing areas, make "
+                "sure the generated queries explicitly cover them."
             ),
         }
         result = self.llm_client.generate_json(
@@ -290,10 +353,15 @@ class LiteratureExtractor:
     def __init__(self, llm_client: LLMClient) -> None:
         self.llm_client = llm_client
 
-    def extract(self, sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def extract(
+        self,
+        sources: list[dict[str, Any]],
+        feedback_directives: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        feedback_directives = feedback_directives or _empty_feedback_directives()
         cards: list[dict[str, Any]] = []
         for index, source in enumerate(sources, start=1):
-            llm_card = self._extract_llm_fields(source)
+            llm_card = self._extract_llm_fields(source, feedback_directives)
             cards.append(
                 {
                     "literature_id": f"lit_{index:03d}",
@@ -311,10 +379,16 @@ class LiteratureExtractor:
             )
         return cards
 
-    def _extract_llm_fields(self, source: dict[str, Any]) -> dict[str, Any]:
+    def _extract_llm_fields(
+        self,
+        source: dict[str, Any],
+        feedback_directives: dict[str, Any],
+    ) -> dict[str, Any]:
         result = self.llm_client.generate_json(
             system_prompt=(
                 "Extract literature card semantic fields from a verified scholarly source. "
+                "Apply user feedback directives when they request focus on methods, "
+                "datasets, findings, concepts, or newly added question focus. "
                 "Return {'literature_cards': [{'main_findings': string[], "
                 "'related_concepts': string[]}]} only."
             ),
@@ -323,6 +397,8 @@ class LiteratureExtractor:
                 "abstract": source.get("abstract"),
                 "source": source.get("source"),
                 "database": source.get("database"),
+                "question_updates": feedback_directives["question_updates"],
+                "literature_directives": feedback_directives["literature_directives"],
             },
             expected_schema="literature_cards",
         )
@@ -339,8 +415,12 @@ class EvidenceExtractor:
         self.extraction_errors: list[str] = []
 
     def extract(
-        self, sources: list[dict[str, Any]], literature_cards: list[dict[str, Any]]
+        self,
+        sources: list[dict[str, Any]],
+        literature_cards: list[dict[str, Any]],
+        feedback_directives: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
+        feedback_directives = feedback_directives or _empty_feedback_directives()
         self.extraction_errors = []
         evidence_cards: list[dict[str, Any]] = []
         evidence_index = 1
@@ -351,7 +431,11 @@ class EvidenceExtractor:
                     system_prompt=(
                         "Extract evidence cards from source text. Return at most "
                         f"{self.max_cards_per_literature} evidence cards for this "
-                        "single source. Return {'evidence_cards': [{'claim': string, "
+                        "single source. Apply user evidence directives when they provide "
+                        "claims, evidence, or extraction preferences. User-provided "
+                        "evidence without a verifiable source must be treated as a clue "
+                        "to check, not as verified literature evidence. Return "
+                        "{'evidence_cards': [{'claim': string, "
                         "'evidence_type': string, "
                         "'support_direction': 'support|oppose|uncertain', "
                         "'related_concepts': string[], 'strength_score': number, "
@@ -363,6 +447,8 @@ class EvidenceExtractor:
                         "abstract": source.get("abstract", ""),
                         "main_findings": literature.get("main_findings", []),
                         "related_concepts": literature.get("related_concepts", []),
+                        "question_updates": feedback_directives["question_updates"],
+                        "evidence_directives": feedback_directives["evidence_directives"],
                     },
                     expected_schema="evidence_cards",
                 )
@@ -411,7 +497,9 @@ class GapSynthesizer:
         self,
         question: ParsedQuestion,
         evidence_cards: list[dict[str, Any]],
+        feedback_directives: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
+        feedback_directives = feedback_directives or _empty_feedback_directives()
         result = self.llm_client.generate_json(
             system_prompt=(
                 "Identify knowledge gaps that can guide a downstream candidate-hypothesis "
@@ -420,7 +508,8 @@ class GapSynthesizer:
                 "causal claim framed as a hypothesis, or if-then hypothesis. In "
                 "why_it_matters_for_hypothesis_generation, describe only the broad research "
                 "direction, variables or relationships worth exploring, evidence still "
-                "needed, and methodological suggestions. Return "
+                "needed, and methodological suggestions. Apply user gap directives about "
+                "missing directions, topics to avoid, and style constraints. Return "
                 "{'knowledge_gaps': [{'description': string, 'gap_type': string, "
                 "'related_concepts': string[], 'related_evidence_ids': string[], "
                 "'importance_score': number, "
@@ -435,6 +524,8 @@ class GapSynthesizer:
                     "sub_questions": question.sub_questions,
                 },
                 "evidence_cards": evidence_cards,
+                "question_updates": feedback_directives["question_updates"],
+                "gap_directives": feedback_directives["gap_directives"],
             },
             expected_schema="knowledge_gaps",
         )
@@ -481,7 +572,9 @@ class QualityReviewer:
         evidence_cards: list[dict[str, Any]],
         knowledge_gaps: list[dict[str, Any]],
         question: ParsedQuestion,
+        feedback_directives: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        feedback_directives = feedback_directives or _empty_feedback_directives()
         literature_ids = {card["literature_id"] for card in literature_cards}
         traceable_evidence = [
             card
@@ -502,6 +595,7 @@ class QualityReviewer:
                 "literature_cards": literature_cards,
                 "evidence_cards": evidence_cards,
                 "knowledge_gaps": knowledge_gaps,
+                "feedback_directives": feedback_directives,
             },
             expected_schema="self_review",
         )
@@ -553,6 +647,7 @@ class KnowledgeIntegrationAgent:
     ) -> None:
         self.llm_client = RetryingLLMClient(llm_client or QwenDashScopeClient())
         self.question_parser = QuestionParser()
+        self.feedback_router = FeedbackRouter(self.llm_client)
         self.search_query_planner = SearchQueryPlanner(self.llm_client)
         self.retrieval_service = RetrievalService(literature_clients)
         self.source_relevance_filter = SourceRelevanceFilter(self.llm_client)
@@ -566,41 +661,7 @@ class KnowledgeIntegrationAgent:
         self,
         request: dict[str, Any],
         progress_callback: ProgressCallback | None = None,
-        *,
-        progress_handler: Callable[[dict[str, Any]], None] | None = None,
-        cancellation_checker: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
-        def check_cancelled() -> None:
-            if cancellation_checker is not None:
-                cancellation_checker()
-
-        def checkpoint(
-            node_id: str,
-            message: str,
-            progress: float | None = None,
-            *,
-            kind: str = "progress",
-            payload: dict[str, Any] | None = None,
-            operation: str = "append",
-        ) -> None:
-            check_cancelled()
-            if progress_handler is not None:
-                progress_handler(
-                    {
-                        "node_id": node_id,
-                        "kind": kind,
-                        "message": message,
-                        "progress": progress,
-                        "payload": payload or {},
-                        "operation": operation,
-                    }
-                )
-
-        def emit(event: dict[str, Any]) -> None:
-            check_cancelled()
-            self._emit_progress(request, progress_callback, event)
-            self._emit_workflow_progress(progress_handler, event)
-
         question, missing_fields = self.question_parser.parse(request)
         if missing_fields:
             return self._failure_response(
@@ -613,103 +674,60 @@ class KnowledgeIntegrationAgent:
         literature_cards: list[dict[str, Any]] = []
         evidence_cards: list[dict[str, Any]] = []
         knowledge_gaps: list[dict[str, Any]] = []
-        resume = (request.get("extensions") or {}).get("workflow_resume") or {}
-        checkpoint_payloads = {
-            item.get("node_id"): item.get("payload") or {}
-            for item in resume.get("checkpoints") or []
-            if isinstance(item, dict)
-        }
-        resumed_literature = checkpoint_payloads.get("literature_extract", {}).get(
-            "literature_cards"
-        )
-        resumed_evidence = checkpoint_payloads.get("evidence_extract", {}).get(
-            "evidence_cards"
-        )
-        resumed_gaps = checkpoint_payloads.get("gap_synthesis", {}).get("knowledge_gaps")
         try:
-            checkpoint("query_planning", "Parsing the research question.", 0.02, kind="started")
-            restored_evidence_from_checkpoint = False
-            if isinstance(resumed_evidence, list) and resumed_evidence:
-                literature_cards = resumed_literature if isinstance(resumed_literature, list) else []
-                evidence_cards = resumed_evidence
-                restored_evidence_from_checkpoint = True
-                checkpoint(
-                    "literature_extract",
-                    "Restored literature checkpoint.",
-                    0.7,
-                    kind="partial_output",
-                    payload={"literature_cards": literature_cards},
-                    operation="replace",
-                )
-                checkpoint(
-                    "evidence_extract",
-                    "Restored evidence checkpoint.",
-                    0.82,
-                    kind="partial_output",
-                    payload={"evidence_cards": evidence_cards},
-                    operation="replace",
-                )
-                evidence_extraction_errors: list[str] = []
-            else:
-                checkpoint("query_planning", "Planning literature search queries.", 0.08)
-                queries = self.search_query_planner.build_queries(question)
-                checkpoint(
-                    "source_search",
-                    "Searching configured literature sources.",
-                    0.16,
-                    kind="started",
-                    payload={"queries": queries},
-                )
-                retrieved_sources = self.retrieval_service.retrieve(
-                    question,
-                    queries,
-                    progress_callback=emit,
-                )
-                emit(
+            feedback_directives = self.feedback_router.route(question.feedback)
+            if question.feedback:
+                self._emit_progress(
+                    request,
+                    progress_callback,
                     {
-                        "event": "retrieval_completed",
-                        "component": "RetrievalService",
-                        "payload": {"retrieved_sources": retrieved_sources},
-                    }
+                        "event": "feedback_routing_completed",
+                        "component": "FeedbackRouter",
+                        "payload": {"feedback_directives": feedback_directives},
+                    },
                 )
-                checkpoint(
-                    "source_verify",
-                    "Verifying retrieved source identifiers.",
-                    0.38,
-                    payload={"candidate_sources": len(retrieved_sources)},
-                )
-                verified_sources = self.source_verifier.verify(
-                    retrieved_sources,
-                    bool(question.search_policy.get("must_verify_sources", True)),
-                )
-                checkpoint(
-                    "relevance_filter",
-                    "Filtering sources for question relevance.",
-                    0.48,
-                    payload={"verified_sources": len(verified_sources)},
-                )
-                relevant_sources = self.source_relevance_filter.filter(
-                    question, verified_sources
-                )
-                checkpoint(
-                    "literature_extract",
-                    "Extracting structured literature cards.",
-                    0.6,
-                    payload={"relevant_sources": len(relevant_sources)},
-                )
-                literature_cards = self.literature_extractor.extract(relevant_sources)
-                emit(
-                    {
-                        "event": "literature_extraction_completed",
-                        "component": "LiteratureExtractor",
-                        "payload": {"literature_cards": literature_cards},
-                    }
-                )
-                checkpoint("evidence_extract", "Extracting traceable evidence cards.", 0.74)
-                evidence_cards = self.evidence_extractor.extract(
-                    relevant_sources, literature_cards
-                )
-                evidence_extraction_errors = list(self.evidence_extractor.extraction_errors)
+            queries = self.search_query_planner.build_queries(
+                question, feedback_directives
+            )
+            retrieved_sources = self.retrieval_service.retrieve(
+                question,
+                queries,
+                progress_callback=lambda event: self._emit_progress(
+                    request, progress_callback, event
+                ),
+            )
+            self._emit_progress(
+                request,
+                progress_callback,
+                {
+                    "event": "retrieval_completed",
+                    "component": "RetrievalService",
+                    "payload": {"retrieved_sources": retrieved_sources},
+                },
+            )
+            verified_sources = self.source_verifier.verify(
+                retrieved_sources,
+                bool(question.search_policy.get("must_verify_sources", True)),
+            )
+            relevant_sources = self.source_relevance_filter.filter(
+                question, verified_sources
+            )
+            literature_cards = self.literature_extractor.extract(
+                relevant_sources, feedback_directives
+            )
+            self._emit_progress(
+                request,
+                progress_callback,
+                {
+                    "event": "literature_extraction_completed",
+                    "component": "LiteratureExtractor",
+                    "payload": {"literature_cards": literature_cards},
+                },
+            )
+            evidence_cards = self.evidence_extractor.extract(
+                relevant_sources, literature_cards, feedback_directives
+            )
+            evidence_extraction_errors = list(self.evidence_extractor.extraction_errors)
             if not evidence_cards:
                 return self._failure_response(
                     request,
@@ -724,37 +742,33 @@ class KnowledgeIntegrationAgent:
                         "knowledge_gaps": [],
                     },
                 )
-            if not restored_evidence_from_checkpoint:
-                emit(
-                    {
-                        "event": "evidence_extraction_completed",
-                        "component": "EvidenceExtractor",
-                        "payload": {"evidence_cards": evidence_cards},
-                    }
-                )
-            if isinstance(resumed_gaps, list) and resumed_gaps:
-                knowledge_gaps = resumed_gaps
-                checkpoint(
-                    "gap_synthesis",
-                    "Restored knowledge gap checkpoint.",
-                    0.92,
-                    kind="partial_output",
-                    payload={"knowledge_gaps": knowledge_gaps},
-                    operation="replace",
-                )
-            else:
-                checkpoint("gap_synthesis", "Synthesizing knowledge gaps.", 0.86)
-                knowledge_gaps = self.gap_synthesizer.synthesize(question, evidence_cards)
-                emit(
-                    {
-                        "event": "gap_synthesis_completed",
-                        "component": "GapSynthesizer",
-                        "payload": {"knowledge_gaps": knowledge_gaps},
-                    }
-                )
-            checkpoint("quality_review", "Reviewing knowledge integration quality.", 0.96)
+            self._emit_progress(
+                request,
+                progress_callback,
+                {
+                    "event": "evidence_extraction_completed",
+                    "component": "EvidenceExtractor",
+                    "payload": {"evidence_cards": evidence_cards},
+                },
+            )
+            knowledge_gaps = self.gap_synthesizer.synthesize(
+                question, evidence_cards, feedback_directives
+            )
+            self._emit_progress(
+                request,
+                progress_callback,
+                {
+                    "event": "gap_synthesis_completed",
+                    "component": "GapSynthesizer",
+                    "payload": {"knowledge_gaps": knowledge_gaps},
+                },
+            )
             self_review = self.quality_reviewer.review(
-                literature_cards, evidence_cards, knowledge_gaps, question
+                literature_cards,
+                evidence_cards,
+                knowledge_gaps,
+                question,
+                feedback_directives,
             )
             if evidence_extraction_errors:
                 self_review["issues"] = [
@@ -839,85 +853,6 @@ class KnowledgeIntegrationAgent:
             }
         )
 
-    def _emit_workflow_progress(
-        self,
-        progress_handler: Callable[[dict[str, Any]], None] | None,
-        event: dict[str, Any],
-    ) -> None:
-        if progress_handler is None:
-            return
-        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-        event_name = str(event.get("event") or "")
-        database = str(payload.get("database") or "literature source")
-        query = str(payload.get("query") or "").strip()
-
-        update: dict[str, Any] | None = None
-        if event_name == "retrieval_database_started":
-            suffix = f": {query}" if query else ""
-            update = {
-                "node_id": "source_search",
-                "kind": "progress",
-                "message": f"Searching {database}{suffix}",
-                "progress": 0.2,
-                "payload": payload,
-            }
-        elif event_name == "retrieval_database_completed":
-            update = {
-                "node_id": "source_search",
-                "kind": "progress",
-                "message": f"Retrieved {payload.get('result_count', 0)} results from {database}.",
-                "progress": 0.3,
-                "payload": payload,
-            }
-        elif event_name == "retrieval_database_failed":
-            update = {
-                "node_id": "source_search",
-                "kind": "progress",
-                "message": f"Search failed for {database}.",
-                "progress": 0.3,
-                "payload": payload,
-            }
-        elif event_name == "retrieval_completed":
-            update = {
-                "node_id": "source_search",
-                "kind": "partial_output",
-                "message": "Retrieved literature candidates.",
-                "progress": 0.36,
-                "payload": payload,
-                "operation": "replace",
-            }
-        elif event_name == "literature_extraction_completed":
-            update = {
-                "node_id": "literature_extract",
-                "kind": "partial_output",
-                "message": "Literature cards are available.",
-                "progress": 0.7,
-                "payload": payload,
-                "operation": "replace",
-            }
-        elif event_name == "evidence_extraction_completed":
-            update = {
-                "node_id": "evidence_extract",
-                "kind": "partial_output",
-                "message": "Evidence cards are available.",
-                "progress": 0.82,
-                "payload": payload,
-                "operation": "replace",
-            }
-        elif event_name == "gap_synthesis_completed":
-            update = {
-                "node_id": "gap_synthesis",
-                "kind": "partial_output",
-                "message": "Knowledge gaps are available.",
-                "progress": 0.92,
-                "payload": payload,
-                "operation": "replace",
-            }
-
-        if update is not None:
-            update.setdefault("operation", "append")
-            progress_handler(update)
-
 
 def _dedupe_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     deduped: list[dict[str, Any]] = []
@@ -938,6 +873,34 @@ def _notify_progress(
 ) -> None:
     if progress_callback is not None:
         progress_callback(event)
+
+
+def _empty_feedback_directives() -> dict[str, Any]:
+    return {
+        "question_updates": {},
+        "retrieval_directives": {},
+        "literature_directives": {},
+        "evidence_directives": {},
+        "gap_directives": {},
+        "global_notes": [],
+        "unassigned_feedback": [],
+    }
+
+
+def _normalize_feedback_directives(value: Any) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    directives = _empty_feedback_directives()
+    for key in (
+        "question_updates",
+        "retrieval_directives",
+        "literature_directives",
+        "evidence_directives",
+        "gap_directives",
+    ):
+        directives[key] = source.get(key) if isinstance(source.get(key), dict) else {}
+    directives["global_notes"] = _string_list(source.get("global_notes"))
+    directives["unassigned_feedback"] = _string_list(source.get("unassigned_feedback"))
+    return directives
 
 
 def _string_list(value: Any) -> list[str]:

@@ -8,9 +8,13 @@ import urllib.request
 from typing import Any, Protocol
 
 
-# Shared code must read credentials from environment variables only.
-# Configure DASHSCOPE_API_KEY or QWEN_API_KEY, and optionally QWEN_MODEL.
-QWEN_API_KEY = ""
+# Optional one-time local configuration.
+#
+# Preferred for shared code: set environment variables DASHSCOPE_API_KEY or
+# QWEN_API_KEY, and QWEN_MODEL.
+#
+# If this file is only used locally, you may fill QWEN_API_KEY once here.
+QWEN_API_KEY = "sk-fde4d29af91a4e71881e4b3fb217ad12"
 QWEN_MODEL = "qwen3.7-max"
 QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
