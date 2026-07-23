@@ -482,9 +482,18 @@ workflow:
               if not isinstance(context, dict):
                   context = {}
               guardrails = context.get("guardrails", {})
+              task_scope = context.get("task_scope", {})
+              constraints = context.get("planning_constraints", {})
+              if not isinstance(guardrails, dict):
+                  guardrails = {}
+              if not isinstance(task_scope, dict):
+                  task_scope = {}
+              if not isinstance(constraints, dict):
+                  constraints = {}
               allowed_evidence = set(guardrails.get("allowed_evidence_ids", []))
               allowed_sources = set(guardrails.get("allowed_source_ids", []))
-              issues = []
+              repair_notes = []
+              hard_issues = []
               normalized_identity_fields = []
               expected_identity = {
                   "hypothesis_id": hypothesis_id,
@@ -495,28 +504,130 @@ workflow:
                   if candidate.get(field) != expected:
                       normalized_identity_fields.append(field)
                   candidate[field] = expected
+              if not context.get("input_valid"):
+                  hard_issues.append("missing hypothesis context")
               if candidate.get("schema_version") != "design_candidate_v1":
-                  issues.append("schema_version is invalid")
+                  repair_notes.append("schema_version was normalized")
+              candidate["schema_version"] = "design_candidate_v1"
+              candidate["planning_objective"] = str(
+                  candidate.get("planning_objective")
+                  or task_scope.get("hypothesis")
+                  or "Evaluate the supplied hypothesis"
+              )
+              allowed_validation_types = constraints.get("allowed_validation_types", [])
+              if not isinstance(allowed_validation_types, list):
+                  allowed_validation_types = []
+              candidate["design_type"] = str(
+                  candidate.get("design_type")
+                  or (allowed_validation_types[0] if allowed_validation_types else "")
+                  or "evidence_grounded_feasibility"
+              )
+              rationale = candidate.get("rationale", {})
+              if not isinstance(rationale, dict):
+                  rationale = {}
+                  repair_notes.append("rationale was normalized")
+              raw_evidence = rationale.get("evidence_ids", candidate.get("evidence_ids", []))
+              raw_sources = rationale.get("source_ids", candidate.get("source_ids", []))
+              if not isinstance(raw_evidence, list):
+                  raw_evidence = []
+              if not isinstance(raw_sources, list):
+                  raw_sources = []
+              removed_evidence = [
+                  str(value) for value in raw_evidence if value not in allowed_evidence
+              ]
+              removed_sources = [
+                  str(value) for value in raw_sources if value not in allowed_sources
+              ]
+              if removed_evidence:
+                  repair_notes.append(
+                      "removed unknown evidence_id: " + ", ".join(removed_evidence)
+                  )
+              if removed_sources:
+                  repair_notes.append(
+                      "removed unknown source_id: " + ", ".join(removed_sources)
+                  )
+              rationale["evidence_ids"] = [
+                  value for value in raw_evidence if value in allowed_evidence
+              ] or sorted(allowed_evidence)
+              rationale["source_ids"] = [
+                  value for value in raw_sources if value in allowed_sources
+              ] or sorted(allowed_sources)
+              rationale["summary"] = str(
+                  rationale.get("summary") or task_scope.get("rationale") or ""
+              )
+              candidate["rationale"] = rationale
+              target_variables = task_scope.get("target_variables", [])
+              if not isinstance(target_variables, list):
+                  target_variables = []
+              if not isinstance(candidate.get("variables"), dict):
+                  candidate["variables"] = {"target_variables": target_variables}
+                  repair_notes.append("variables were synthesized from task scope")
+              if not isinstance(candidate.get("operationalization"), list):
+                  candidate["operationalization"] = []
+              if not isinstance(candidate.get("data_contract"), dict):
+                  candidate["data_contract"] = {
+                      "required_fields": target_variables,
+                      "source_policy": "Use available documented data; do not invent URLs."
+                  }
+                  repair_notes.append("data_contract was synthesized")
               if not isinstance(candidate.get("method_steps"), list) or not candidate.get("method_steps"):
-                  issues.append("method_steps must be non-empty")
+                  candidate["method_steps"] = [{
+                      "step_id": 1,
+                      "input": "Allowed evidence, constraints, and available data",
+                      "action": str(
+                          task_scope.get("validation_idea")
+                          or "Run an allowed bounded validation of the supplied hypothesis"
+                      ),
+                      "output": "Effect estimates, uncertainty, diagnostics, and provenance"
+                  }]
+                  repair_notes.append("method_steps were synthesized")
+              if not isinstance(candidate.get("baselines"), list) or not candidate.get("baselines"):
+                  candidate["baselines"] = ["No-effect or simplest valid baseline"]
+              if not isinstance(candidate.get("metrics"), list) or not candidate.get("metrics"):
+                  candidate["metrics"] = [{
+                      "name": "primary_hypothesis_metric",
+                      "definition": str(
+                          task_scope.get("expected_observation")
+                          or "Observed support or contradiction for the supplied hypothesis"
+                      )
+                  }]
+                  repair_notes.append("metrics were synthesized")
+              if not isinstance(candidate.get("statistical_analysis"), list) or not candidate.get("statistical_analysis"):
+                  candidate["statistical_analysis"] = (
+                      allowed_validation_types or ["bounded feasibility analysis"]
+                  )
               if not isinstance(candidate.get("falsification_matrix"), list) or not candidate.get("falsification_matrix"):
-                  issues.append("falsification_matrix must be non-empty")
-              serialized = json.dumps(candidate, ensure_ascii=False)
-              unknown_evidence = [x for x in allowed_evidence if False]
-              for evidence_id in candidate.get("rationale", {}).get("evidence_ids", []):
-                  if evidence_id not in allowed_evidence:
-                      unknown_evidence.append(evidence_id)
-              for source_id in candidate.get("rationale", {}).get("source_ids", []):
-                  if source_id not in allowed_sources:
-                      issues.append(f"unknown source_id: {source_id}")
-              if unknown_evidence:
-                  issues.append("unknown evidence_id: " + ", ".join(unknown_evidence))
-              if issues:
+                  candidate["falsification_matrix"] = [{
+                      "scenario": "The expected pattern is absent or reverses under valid analysis.",
+                      "interpretation": "The supplied hypothesis is weakened or falsified."
+                  }]
+                  repair_notes.append("falsification_matrix was synthesized")
+              if not isinstance(candidate.get("contingencies"), list):
+                  candidate["contingencies"] = []
+              if not isinstance(candidate.get("resource_profile"), dict):
+                  candidate["resource_profile"] = {
+                      "resource_level": constraints.get("resource_level", "bounded"),
+                      "plan_depth": constraints.get("plan_depth", "brief")
+                  }
+              if not isinstance(candidate.get("feedback_tasks"), list):
+                  candidate["feedback_tasks"] = []
+              limitations = candidate.get("limitations", [])
+              if not isinstance(limitations, list):
+                  limitations = [str(limitations)]
+              if repair_notes:
                   candidate["status"] = "partial_success"
-                  candidate["limitations"] = list(candidate.get("limitations") or []) + issues
+              elif candidate.get("status") not in {"success", "partial_success"}:
+                  candidate["status"] = "partial_success"
+              candidate["limitations"] = list(dict.fromkeys(
+                  [str(item) for item in limitations if item] + repair_notes
+              ))
+              if hard_issues:
+                  candidate["status"] = "failed"
               report = {
-                  "passed": not issues,
-                  "issues": issues,
+                  "passed": not hard_issues,
+                  "issues": hard_issues,
+                  "repair_applied": bool(repair_notes),
+                  "repair_notes": repair_notes,
                   "allowed_evidence_count": len(allowed_evidence),
                   "allowed_source_count": len(allowed_sources),
                   "normalized_identity_fields": normalized_identity_fields

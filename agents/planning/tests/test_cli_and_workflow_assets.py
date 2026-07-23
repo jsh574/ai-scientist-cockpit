@@ -199,6 +199,7 @@ def test_short_sample_file_exists_and_is_smaller_than_full_sample():
     full_path = Path("samples/input/module5_input_sample.json")
 
     short_data = json.loads(short_path.read_text(encoding="utf-8"))
+    full_data = json.loads(full_path.read_text(encoding="utf-8"))
 
     assert short_data["task_id"] == "task_short_001"
     assert short_data["user_constraints"]["max_hypotheses"] == 2

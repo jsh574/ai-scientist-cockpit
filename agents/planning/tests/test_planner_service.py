@@ -278,3 +278,30 @@ def test_run_planning_agent_maps_feedback_required_to_failed_plan_item():
     assert plan["status"] == "failed"
     assert "decision=feedback_required" in plan["error_message"]
     assert response["self_review"]["passed"] is False
+
+
+class WrongIdentityDifyClient(FakeSingleHypothesisDifyClient):
+    def run_workflow(self, inputs):
+        result = super().run_workflow(inputs)
+        result.update(
+            {
+                "schema_version": "wrong",
+                "agent_name": "wrong",
+                "task_id": "wrong",
+                "iteration": 99,
+                "hypothesis_id": "wrong",
+            }
+        )
+        return result
+
+
+def test_service_normalizes_system_identity_from_local_context():
+    data = sample_planner_input()
+
+    response = run_planning_agent(data, dify_client=WrongIdentityDifyClient())
+
+    assert response["metadata"]["status"] == "success"
+    assert [plan["hypothesis_id"] for plan in response["payload"]["plans"]] == [
+        "hyp_001",
+        "hyp_002",
+    ]

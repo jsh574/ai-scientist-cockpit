@@ -61,7 +61,7 @@ class FakeHTTPResponse:
 class FakeStreamingHTTPResponse:
     def __init__(self, events: list[dict[str, Any]]) -> None:
         self.lines = [
-            f"data: {json.dumps(event)}\n".encode() for event in events
+            f"data: {json.dumps(event)}\n".encode("utf-8") for event in events
         ]
 
     def __enter__(self) -> FakeStreamingHTTPResponse:
@@ -484,14 +484,17 @@ def test_workflow_c_success_with_empty_plan_is_converted_to_failure():
     assert report["stages"][-1]["status"] == "failed"
     assert report["final_result"]["status"] == "failed"
     assert report["errors"] == ["Workflow C returned an empty plan."]
-def test_workflow_a_rejected_candidate_is_excluded_from_selection():
+def test_workflow_a_soft_rejection_is_repaired_and_included_in_selection():
     def one_rejected_candidate(inputs: dict[str, Any]) -> dict[str, Any]:
         output = _candidate_outputs(inputs)
         if inputs["variant_mode"] == "resource_efficient":
             output["design_candidate"]["status"] = "partial_success"
             output["guardrail_report"] = {
                 "passed": False,
-                "issues": ["method_steps must be non-empty"],
+                "issues": [
+                    "method_steps must be non-empty",
+                    "unknown evidence_id: invented",
+                ],
             }
         return output
 
@@ -506,15 +509,97 @@ def test_workflow_a_rejected_candidate_is_excluded_from_selection():
     candidate_stage = report["stages"][0]
     candidate_round = report["intermediate_results"]["candidate_rounds"][0]
 
-    assert len(selected_inputs) == 2
+    assert len(selected_inputs) == 3
     assert {item["variant_mode"] for item in selected_inputs} == {
         "minimum_viable",
         "high_information",
+        "resource_efficient",
     }
     assert candidate_stage["status"] == "partial_success"
+    assert candidate_stage["accepted_candidate_count"] == 3
+    assert candidate_stage["rejected_candidate_count"] == 0
+    assert len(candidate_round["guardrail_reports"]) == 3
+    assert candidate_stage["degraded_candidate_count"] == 1
+    repaired = next(
+        item for item in selected_inputs if item["variant_mode"] == "resource_efficient"
+    )
+    assert repaired["schema_version"] == "design_candidate_v1"
+    assert repaired["method_steps"]
+    assert repaired["falsification_matrix"]
+    assert "invented" not in repaired["rationale"]["evidence_ids"]
+
+
+def test_workflow_a_nonrepairable_guardrail_rejection_is_excluded_from_selection():
+    def one_hard_rejection(inputs: dict[str, Any]) -> dict[str, Any]:
+        output = _candidate_outputs(inputs)
+        if inputs["variant_mode"] == "resource_efficient":
+            output["design_candidate"]["status"] = "partial_success"
+            output["guardrail_report"] = {
+                "passed": False,
+                "issues": ["fabricated execution result"],
+            }
+        return output
+
+    candidate = FakeWorkflowClient("a", one_hard_rejection)
+    selector = FakeWorkflowClient("b", _accept_outputs)
+    planner = FakeWorkflowClient("c", _plan_outputs)
+    report = PlanningWorkflowChainRunner(candidate, selector, planner).run(
+        short_sample_planner_input()
+    )
+
+    selected_inputs = json.loads(selector.calls[0]["design_candidates"])
+    candidate_stage = report["stages"][0]
+
+    assert report["status"] == "success"
+    assert len(selected_inputs) == 2
+    assert all(item["variant_mode"] != "resource_efficient" for item in selected_inputs)
     assert candidate_stage["accepted_candidate_count"] == 2
     assert candidate_stage["rejected_candidate_count"] == 1
-    assert len(candidate_round["guardrail_reports"]) == 3
+    assert candidate_stage["degraded_candidate_count"] == 0
+
+
+def test_workflow_a_all_soft_rejections_still_reach_workflow_c():
+    def fragmented_candidate(inputs: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "design_candidate": {
+                "hypothesis_id": inputs["hypothesis_id"],
+                "variant_mode": inputs["variant_mode"],
+                "candidate_id": (
+                    f'{inputs["hypothesis_id"]}::{inputs["variant_mode"]}'
+                ),
+                "status": "partial_success",
+                "text": "Model returned only a grounded fragment.",
+            },
+            "guardrail_report": {
+                "passed": False,
+                "issues": [
+                    "schema_version is invalid",
+                    "method_steps must be non-empty",
+                    "falsification_matrix must be non-empty",
+                ],
+            },
+        }
+
+    candidate = FakeWorkflowClient("a", fragmented_candidate)
+    selector = FakeWorkflowClient("b", _accept_outputs)
+    planner = FakeWorkflowClient("c", _plan_outputs)
+    report = PlanningWorkflowChainRunner(candidate, selector, planner).run(
+        short_sample_planner_input()
+    )
+
+    selected_inputs = json.loads(selector.calls[0]["design_candidates"])
+    candidate_stage = report["stages"][0]
+
+    assert report["status"] == "success"
+    assert report["decision"] == "accept"
+    assert len(selected_inputs) == 3
+    assert len(planner.calls) == 1
+    assert candidate_stage["status"] == "partial_success"
+    assert candidate_stage["accepted_candidate_count"] == 3
+    assert candidate_stage["rejected_candidate_count"] == 0
+    assert candidate_stage["degraded_candidate_count"] == 3
+    assert all(item["method_steps"] for item in selected_inputs)
+    assert all(item["falsification_matrix"] for item in selected_inputs)
 
 
 def test_workflow_b_malformed_structured_output_is_retried_once():

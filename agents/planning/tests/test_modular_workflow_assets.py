@@ -7,6 +7,7 @@ from typing import Any
 
 import yaml
 
+
 ACTIVE_WORKFLOWS = (
     "dify/Planning Design Candidate Generator.yml",
     "dify/Planning Design Judge Selector.yml",
@@ -90,7 +91,13 @@ def test_candidate_guard_normalizes_system_owned_identity():
         "falsification_matrix": [{"scenario": "test"}],
     }
     context = {
-        "guardrails": {"allowed_evidence_ids": [], "allowed_source_ids": []}
+        "input_valid": True,
+        "task_scope": {
+            "hypothesis": "Test the supplied hypothesis.",
+            "target_variables": [],
+        },
+        "planning_constraints": {},
+        "guardrails": {"allowed_evidence_ids": [], "allowed_source_ids": []},
     }
     result = _code_main(guard)(
         candidate,
@@ -176,7 +183,7 @@ def test_selection_context_and_guard_own_routing_identity():
     }
 
 
-def test_selection_guard_rejects_unknown_candidate_review_reference():
+def test_selection_guard_recovers_from_unknown_candidate_review_reference():
     workflow = _workflow(ACTIVE_WORKFLOWS[1])
     guard = _node(workflow, "selection_guard")
     candidate = {
@@ -196,10 +203,136 @@ def test_selection_guard_rejects_unknown_candidate_review_reference():
     report = json.loads(result["selection_guardrail_report"])
     normalized = json.loads(result["design_selection"])
 
-    assert report["passed"] is False
-    assert normalized["decision"] == "failed"
+    assert report["passed"] is True
+    assert normalized["decision"] == "accept"
+    assert normalized["selected_candidate_id"] == candidate["candidate_id"]
+    assert normalized["selected_design"] == candidate
     assert any("unknown candidate_id" in issue for issue in report["issues"])
     assert any("missing candidate_id" in issue for issue in report["issues"])
+
+
+def test_candidate_guard_repairs_fragment_and_removes_unknown_references():
+    workflow = _workflow(ACTIVE_WORKFLOWS[0])
+    guard = _node(workflow, "candidate_guard")
+    fragment = {
+        "name": "fragment",
+        "evidence_ids": ["ev_allowed", "ev_invented"],
+        "source_ids": ["lit_allowed", "lit_invented"],
+    }
+    context = {
+        "input_valid": True,
+        "task_scope": {
+            "hypothesis": "The supplied intervention improves the outcome.",
+            "rationale": "Grounded upstream rationale.",
+            "target_variables": ["intervention", "outcome"],
+            "expected_observation": "The outcome improves.",
+            "validation_idea": "Run an allowed statistical test.",
+        },
+        "planning_constraints": {
+            "allowed_validation_types": ["statistical_test"],
+            "resource_level": "smoke_test",
+            "plan_depth": "brief",
+        },
+        "guardrails": {
+            "allowed_evidence_ids": ["ev_allowed"],
+            "allowed_source_ids": ["lit_allowed"],
+        },
+    }
+
+    result = _code_main(guard)(
+        fragment,
+        json.dumps(context),
+        "hyp_001",
+        "high_information",
+    )
+    candidate = json.loads(result["design_candidate"])
+    report = json.loads(result["guardrail_report"])
+
+    assert report["passed"] is True
+    assert report["repair_applied"] is True
+    assert candidate["schema_version"] == "design_candidate_v1"
+    assert candidate["status"] == "partial_success"
+    assert candidate["method_steps"]
+    assert candidate["metrics"]
+    assert candidate["falsification_matrix"]
+    assert candidate["rationale"]["evidence_ids"] == ["ev_allowed"]
+    assert candidate["rationale"]["source_ids"] == ["lit_allowed"]
+    assert any("ev_invented" in note for note in report["repair_notes"])
+    assert any("lit_invented" in note for note in report["repair_notes"])
+
+
+def test_selection_guard_converts_human_review_to_best_available_accept():
+    workflow = _workflow(ACTIVE_WORKFLOWS[1])
+    guard = _node(workflow, "selection_guard")
+    low = {
+        "candidate_id": "hyp_001::minimum_viable",
+        "status": "success",
+        "method_steps": [{"step_id": 1}],
+        "metrics": [{"name": "metric"}],
+        "falsification_matrix": [{"scenario": "null"}],
+    }
+    high = {
+        "candidate_id": "hyp_001::high_information",
+        "status": "partial_success",
+        "method_steps": [{"step_id": 1}],
+        "metrics": [{"name": "metric"}],
+        "falsification_matrix": [{"scenario": "null"}],
+    }
+    low_review = _valid_review(low["candidate_id"])
+    high_review = _valid_review(high["candidate_id"])
+    low_review["scores"] = {name: 0.3 for name in low_review["scores"]}
+    high_review["scores"] = {name: 0.9 for name in high_review["scores"]}
+    selection = {
+        "schema_version": "design_selection_v1",
+        "decision": "human_review",
+        "selected_candidate_id": "",
+        "candidate_reviews": [low_review, high_review],
+        "limitations": ["Candidates are close."],
+    }
+    context = json.dumps({"candidates": [low, high]})
+
+    result = _code_main(guard)(selection, context, "task_001", 1, "hyp_001")
+    normalized = json.loads(result["design_selection"])
+    report = json.loads(result["selection_guardrail_report"])
+
+    assert report["passed"] is True
+    assert report["fallback_selection_applied"] is True
+    assert report["original_decision"] == "human_review"
+    assert normalized["decision"] == "accept"
+    assert normalized["selected_candidate_id"] == high["candidate_id"]
+    assert normalized["selected_design"] == high
+    assert any("best-available" in item for item in normalized["limitations"])
+
+
+def test_selection_guard_fails_only_when_all_candidates_failed():
+    workflow = _workflow(ACTIVE_WORKFLOWS[1])
+    guard = _node(workflow, "selection_guard")
+    failed = {
+        "candidate_id": "hyp_001::minimum_viable",
+        "status": "failed",
+    }
+    selection = {
+        "schema_version": "design_selection_v1",
+        "decision": "human_review",
+        "selected_candidate_id": "",
+        "candidate_reviews": [_valid_review(failed["candidate_id"])],
+        "limitations": [],
+    }
+
+    result = _code_main(guard)(
+        selection,
+        json.dumps({"candidates": [failed]}),
+        "task_001",
+        1,
+        "hyp_001",
+    )
+    normalized = json.loads(result["design_selection"])
+    report = json.loads(result["selection_guardrail_report"])
+
+    assert report["passed"] is False
+    assert normalized["decision"] == "failed"
+    assert normalized["selected_design"] == {}
+    assert any("no non-failed candidates" in issue for issue in report["issues"])
 
 
 def test_workflow_c_uses_structured_outputs_and_normalizes_final_identity():

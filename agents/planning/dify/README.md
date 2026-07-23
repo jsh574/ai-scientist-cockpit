@@ -93,9 +93,6 @@ Start -> Exa Answer -> Intent analysis -> Answer stream
 - `planning_constraints`：研究计划生成约束 JSON 字符串
 - `user_constraints`：用户约束 JSON 字符串
 
-Workflow A 还必须接收 `variant_mode` 和可选的 `_feedback`。总控在首轮传空字符串，在后续轮次传本轮合并后的操作者/审核意见；三个 A 变体共享同一份 `_feedback`，并在不改变 hypothesis 身份和证据边界的前提下据此修订候选设计。
-
-
 注意：不再向 Dify 传 `hypothesis_evidence_packages` 复数数组。
 
 ## Dify 预期输出

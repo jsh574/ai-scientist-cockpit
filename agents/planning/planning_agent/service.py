@@ -347,11 +347,11 @@ def _normalize_plan_result(
     if "plans" in result and result.get("plans"):
         result = result["plans"][0]
     plan_result = dict(result)
-    plan_result.setdefault("schema_version", "experiment_planner_plan_result_v1")
-    plan_result.setdefault("agent_name", "ExperimentPlannerAgent")
-    plan_result.setdefault("task_id", data.get("task_id", ""))
-    plan_result.setdefault("iteration", data.get("iteration", 1))
-    plan_result.setdefault("hypothesis_id", package.get("hypothesis_id", ""))
+    plan_result["schema_version"] = "experiment_planner_plan_result_v1"
+    plan_result["agent_name"] = "ExperimentPlannerAgent"
+    plan_result["task_id"] = data.get("task_id", "")
+    plan_result["iteration"] = data.get("iteration", 1)
+    plan_result["hypothesis_id"] = package.get("hypothesis_id", "")
     plan_result.setdefault("status", "success" if plan_result.get("plan") else "failed")
     plan_result.setdefault("error_message", "")
     plan_result.setdefault("plan", {})
