@@ -20,6 +20,7 @@ def build_request():
         "task_id": "task_consciousness_001",
         "stage": "knowledge_integration",
         "iteration": 1,
+        "_feedback": "",
         "input": {
             "question_card": {
                 "question_id": "q_consciousness_001",

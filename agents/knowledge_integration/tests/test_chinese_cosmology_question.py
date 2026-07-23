@@ -70,6 +70,7 @@ def build_request() -> dict[str, Any]:
         "task_id": "task_universe_composition_001",
         "stage": "knowledge_integration",
         "iteration": 1,
+        "_feedback": "",
         "input": {
             "question_card": {
                 "question_id": "q_universe_composition_001",
@@ -174,7 +175,15 @@ def test_chinese_request_uses_science_125_universe_composition_question() -> Non
 def test_chinese_cosmology_request_keeps_required_protocol_field_names() -> None:
     request = build_request()
 
-    assert request.keys() == {"task_id", "stage", "iteration", "input", "output_schema"}
+    assert request.keys() == {
+        "task_id",
+        "stage",
+        "iteration",
+        "_feedback",
+        "input",
+        "output_schema",
+    }
+    assert request["_feedback"] == ""
     assert request["input"].keys() == {"question_card", "search_policy"}
     assert request["input"]["question_card"].keys() == {
         "question_id",
