@@ -61,7 +61,7 @@ class FakeHTTPResponse:
 class FakeStreamingHTTPResponse:
     def __init__(self, events: list[dict[str, Any]]) -> None:
         self.lines = [
-            f"data: {json.dumps(event)}\n".encode("utf-8") for event in events
+            f"data: {json.dumps(event)}\n".encode() for event in events
         ]
 
     def __enter__(self) -> FakeStreamingHTTPResponse:

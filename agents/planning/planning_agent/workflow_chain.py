@@ -232,16 +232,19 @@ class PlanningWorkflowChainRunner:
         max_revisions: int,
     ) -> dict[str, Any]:
         hypothesis_id = str(package.get("hypothesis_id") or "")
-        progress_handler = None
+        child_progress_handler = None
         if self.progress_handler:
-            progress_handler = lambda message: self.progress_handler(
-                f"[{hypothesis_id}] {message}"
-            )
+            parent_progress_handler = self.progress_handler
+
+            def emit_child_progress(message: str) -> None:
+                parent_progress_handler(f"[{hypothesis_id}] {message}")
+
+            child_progress_handler = emit_child_progress
         child = PlanningWorkflowChainRunner(
             candidate_client=self.candidate_client,
             selector_client=self.selector_client,
             planner_client=self.planner_client,
-            progress_handler=progress_handler,
+            progress_handler=child_progress_handler,
             max_c_context_chars=self.max_c_context_chars,
             max_selection_retries=self.max_selection_retries,
         )

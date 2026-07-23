@@ -13,14 +13,22 @@ def _load_env_file(path: Path) -> None:
         return
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
-_load_env_file(PROJECT_ROOT / ".env")
-_load_env_file(PROJECT_ROOT / "backend" / ".env")
+def _load_environment_files(project_root: Path = PROJECT_ROOT) -> None:
+    """Load controller and agent-local env files without overriding process env."""
+    _load_env_file(project_root / ".env")
+    _load_env_file(project_root / "agents" / "planning" / ".env")
+    _load_env_file(project_root / "backend" / ".env")
+
+
+_load_environment_files()
 
 
 def _resolve_project_path(value: str | None, default: Path) -> Path:

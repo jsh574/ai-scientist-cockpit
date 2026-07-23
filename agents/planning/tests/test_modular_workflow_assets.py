@@ -7,7 +7,6 @@ from typing import Any
 
 import yaml
 
-
 ACTIVE_WORKFLOWS = (
     "dify/Planning Design Candidate Generator.yml",
     "dify/Planning Design Judge Selector.yml",

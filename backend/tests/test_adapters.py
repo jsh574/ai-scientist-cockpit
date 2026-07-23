@@ -452,7 +452,14 @@ class AdapterContractTests(unittest.TestCase):
         context["evidence_map"] = evidence_response["payload"]["evidence_map"]
         service = _load_package(Settings.from_env().planning_agent_root, "planning_agent.service")
         client = FakeDifyClient()
-        with patch.object(service, "DifyWorkflowClient", return_value=client):
+        with patch.dict(
+            os.environ,
+            {
+                "DIFY_WORKFLOW_A_API_KEY": "",
+                "DIFY_WORKFLOW_B_API_KEY": "",
+                "PLANNING_AGENT_SKIP_DOTENV": "1",
+            },
+        ), patch.object(service, "DifyWorkflowClient", return_value=client):
             response = AgentRegistry(Settings.from_env()).run("research_planning", context)
 
         self.assertEqual(response["metadata"]["stage"], "research_planning")
