@@ -2,16 +2,13 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from planning_agent.adapter import (
-    build_dify_workflow_inputs,
     build_hypothesis_evidence_packages,
     select_top_packages,
     validate_planner_input,
 )
-from planning_agent.dify_client import DifyWorkflowClient, DifyWorkflowError
 from planning_agent.workflow_chain import PlanningWorkflowChainRunner
 
 AGENT_ID = "research_planning_agent"
@@ -23,7 +20,6 @@ CancellationChecker = Callable[[], None]
 
 def run_planning_agent(
     data: dict[str, Any],
-    dify_client: DifyWorkflowClient | None = None,
     workflow_runner: PlanningWorkflowChainRunner | None = None,
     max_packages: int | None = None,
     progress_handler: ProgressHandler | None = None,
@@ -40,54 +36,44 @@ def run_planning_agent(
         packages,
         max_packages=max_packages or _max_hypotheses(data),
     )
-    runner = workflow_runner
-    if runner is None and dify_client is None:
-        auto_runner = PlanningWorkflowChainRunner.from_env(
-            progress_handler=progress_handler,
-            event_handler=workflow_event_handler,
-            cancellation_checker=cancellation_checker,
-        )
-        if _runner_is_configured(auto_runner):
-            runner = auto_runner
-    parallel_calls = _max_parallel_calls(max_parallel_calls)
-    if runner is not None:
-        return _run_planning_chain(
-            data, selected, runner, parallel_calls
-        )
-
-    legacy_event_handler = None
-
-    if workflow_event_handler:
-        def forward_legacy_event(event: dict[str, Any]) -> None:
-            workflow_event_handler("workflow_c", event)
-
-        legacy_event_handler = forward_legacy_event
-    client = dify_client or DifyWorkflowClient(
-        event_handler=legacy_event_handler,
+    runner = workflow_runner or PlanningWorkflowChainRunner.from_env(
+        progress_handler=progress_handler,
+        event_handler=workflow_event_handler,
         cancellation_checker=cancellation_checker,
     )
-    if not client.configured:
+    if not _runner_is_configured(runner):
+        missing = ", ".join(_missing_workflows(runner)) or "workflow_a, workflow_b, workflow_c"
         return _failed_response(
             data,
-            ["Dify workflow is not configured. Set DIFY_API_URL and DIFY_API_KEY."],
+            [
+                "Planning workflow chain is not configured. Set DIFY_API_URL and "
+                "DIFY_WORKFLOW_A_API_KEY, DIFY_WORKFLOW_B_API_KEY, and "
+                f"DIFY_WORKFLOW_C_API_KEY (missing: {missing})."
+            ],
             score=0.0,
         )
-
-    plan_results, dify_errors = _run_selected_packages(
-        data=data,
-        selected=selected,
-        client=client,
-        progress_handler=progress_handler,
-        max_parallel_calls=parallel_calls,
+    return _run_planning_chain(
+        data,
+        selected,
+        runner,
+        _max_parallel_calls(max_parallel_calls),
     )
-
-    return _response_from_plan_results(data, plan_results, dify_errors)
 
 
 def _runner_is_configured(runner: PlanningWorkflowChainRunner) -> bool:
-    return all(
-        bool(item.get("configured")) for item in runner.configuration_summary()
-    )
+    configured = {
+        str(item.get("name")) for item in runner.configuration_summary() if item.get("configured")
+    }
+    return {"workflow_a", "workflow_b", "workflow_c"} <= configured
+
+
+def _missing_workflows(runner: PlanningWorkflowChainRunner) -> list[str]:
+    configured = {
+        str(item.get("name")) for item in runner.configuration_summary() if item.get("configured")
+    }
+    return [
+        stage for stage in ("workflow_a", "workflow_b", "workflow_c") if stage not in configured
+    ]
 
 
 def _run_planning_chain(
@@ -115,9 +101,7 @@ def _run_planning_chain(
         max_revisions=max(0, _env_int("PLANNING_MAX_REVISIONS", 1)),
         max_parallel_hypotheses=max_parallel_calls,
     )
-    packages_by_id = {
-        str(package.get("hypothesis_id") or ""): package for package in selected
-    }
+    packages_by_id = {str(package.get("hypothesis_id") or ""): package for package in selected}
     plan_results: list[dict[str, Any]] = []
     issues = [str(item) for item in report.get("errors", []) if str(item).strip()]
     for hypothesis_run in report.get("hypothesis_runs", []):
@@ -127,20 +111,14 @@ def _run_planning_chain(
         package = packages_by_id.get(hypothesis_id, {"hypothesis_id": hypothesis_id})
         final_result = hypothesis_run.get("final_result")
         if isinstance(final_result, dict) and final_result:
-            plan_results.append(
-                _normalize_plan_result(chain_data, package, final_result)
-            )
+            plan_results.append(_normalize_plan_result(chain_data, package, final_result))
             if hypothesis_run.get("status") != "success":
                 issues.append(
                     f"Hypothesis {hypothesis_id} requires action: "
                     f"{hypothesis_run.get('next_action') or hypothesis_run.get('status')}"
                 )
             continue
-        child_errors = [
-            str(item)
-            for item in hypothesis_run.get("errors", [])
-            if str(item).strip()
-        ]
+        child_errors = [str(item) for item in hypothesis_run.get("errors", []) if str(item).strip()]
         reason = "; ".join(child_errors) or (
             f"Workflow B stopped with decision="
             f"{hypothesis_run.get('decision') or 'unknown'}; "
@@ -170,107 +148,6 @@ def _response_from_plan_results(
         issues=issues,
         score=0.82 if payload["status"] == "success" else 0.62,
     )
-
-
-def _run_selected_packages(
-    data: dict[str, Any],
-    selected: list[dict[str, Any]],
-    client: DifyWorkflowClient,
-    progress_handler: ProgressHandler | None,
-    max_parallel_calls: int,
-) -> tuple[list[dict[str, Any]], list[str]]:
-    if max_parallel_calls <= 1 or len(selected) <= 1:
-        return _run_selected_packages_serial(data, selected, client, progress_handler)
-    return _run_selected_packages_parallel(
-        data, selected, client, progress_handler, max_parallel_calls
-    )
-
-
-def _run_selected_packages_serial(
-    data: dict[str, Any],
-    selected: list[dict[str, Any]],
-    client: DifyWorkflowClient,
-    progress_handler: ProgressHandler | None,
-) -> tuple[list[dict[str, Any]], list[str]]:
-    plan_results: list[dict[str, Any]] = []
-    dify_errors: list[str] = []
-    total = len(selected)
-    for index, package in enumerate(selected, start=1):
-        plan_result, error = _run_one_package(
-            data=data,
-            package=package,
-            client=client,
-            progress_handler=progress_handler,
-            index=index,
-            total=total,
-            parallel=False,
-        )
-        plan_results.append(plan_result)
-        if error:
-            dify_errors.append(error)
-    return plan_results, dify_errors
-
-
-def _run_selected_packages_parallel(
-    data: dict[str, Any],
-    selected: list[dict[str, Any]],
-    client: DifyWorkflowClient,
-    progress_handler: ProgressHandler | None,
-    max_parallel_calls: int,
-) -> tuple[list[dict[str, Any]], list[str]]:
-    _emit_progress(
-        progress_handler,
-        f"Calling Dify in parallel: {len(selected)} hypotheses, max_parallel_calls={max_parallel_calls}",
-    )
-    plan_results: list[dict[str, Any] | None] = [None] * len(selected)
-    dify_errors: list[str] = []
-    total = len(selected)
-    with ThreadPoolExecutor(max_workers=min(max_parallel_calls, total)) as executor:
-        futures = {
-            executor.submit(
-                _run_one_package,
-                data,
-                package,
-                client,
-                progress_handler,
-                index,
-                total,
-                True,
-            ): index - 1
-            for index, package in enumerate(selected, start=1)
-        }
-        for future in as_completed(futures):
-            result_index = futures[future]
-            plan_result, error = future.result()
-            plan_results[result_index] = plan_result
-            if error:
-                dify_errors.append(error)
-    return [item for item in plan_results if item is not None], dify_errors
-
-
-def _run_one_package(
-    data: dict[str, Any],
-    package: dict[str, Any],
-    client: DifyWorkflowClient,
-    progress_handler: ProgressHandler | None,
-    index: int,
-    total: int,
-    parallel: bool,
-) -> tuple[dict[str, Any], str | None]:
-    hypothesis_id = package.get("hypothesis_id", "unknown")
-    mode = "parallel" if parallel else "serial"
-    _emit_progress(
-        progress_handler,
-        f"Calling Dify for hypothesis {index}/{total}: {hypothesis_id} ({mode})",
-    )
-    try:
-        result = client.run_workflow(build_dify_workflow_inputs(data, package))
-    except DifyWorkflowError as exc:
-        error = f"Hypothesis {hypothesis_id}: {exc}"
-        _emit_progress(progress_handler, f"Dify failed for hypothesis {hypothesis_id}: {exc}")
-        return _failed_plan_result(data, package, str(exc)), error
-    _emit_progress(progress_handler, f"Dify finished for hypothesis {hypothesis_id}")
-    return _normalize_plan_result(data, package, result), None
 
 
 def _failed_response(data: dict[str, Any], errors: list[str], score: float) -> dict[str, Any]:
@@ -328,9 +205,7 @@ def _failed_payload(data: dict[str, Any], errors: list[str]) -> dict[str, Any]:
     }
 
 
-def _aggregate_payload(
-    data: dict[str, Any], plan_results: list[dict[str, Any]]
-) -> dict[str, Any]:
+def _aggregate_payload(data: dict[str, Any], plan_results: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "schema_version": "experiment_planner_output_v1",
         "agent_name": "ExperimentPlannerAgent",
@@ -389,9 +264,7 @@ def _payload_status(payload: dict[str, Any], issues: list[str]) -> str:
 
 def _guardrail_issues(data: dict[str, Any], payload: dict[str, Any]) -> list[str]:
     issues: list[str] = []
-    valid_literature_ids = {
-        item.get("literature_id") for item in data.get("literature_cards", [])
-    }
+    valid_literature_ids = {item.get("literature_id") for item in data.get("literature_cards", [])}
     valid_evidence_ids = {item.get("evidence_id") for item in data.get("evidence_cards", [])}
 
     for plan_item in payload.get("plans", []):
@@ -408,8 +281,7 @@ def _guardrail_issues(data: dict[str, Any], payload: dict[str, Any]) -> list[str
             for evidence_id in step.get("evidence_ids", []):
                 if evidence_id not in valid_evidence_ids:
                     issues.append(
-                        f"Plan {plan_item.get('hypothesis_id')} uses unknown evidence "
-                        f"{evidence_id}"
+                        f"Plan {plan_item.get('hypothesis_id')} uses unknown evidence {evidence_id}"
                     )
     return issues
 
@@ -425,7 +297,7 @@ def _max_hypotheses(data: dict[str, Any]) -> int:
 
 def _max_parallel_calls(value: int | None) -> int:
     if value is None:
-        value = _env_int("DIFY_MAX_PARALLEL_CALLS", 1)
+        value = _env_int("PLANNING_MAX_PARALLEL_CALLS", 1)
     return max(1, min(8, value))
 
 
@@ -443,10 +315,5 @@ def _suggestions(status: str, issues: list[str]) -> list[str]:
     if status == "success":
         return []
     if issues:
-        return ["请检查 Dify 配置、工作流输出 JSON、证据 ID 和文献 ID 是否符合模块 5 规范。"]
-    return ["请检查 Dify 工作流是否已发布并返回单个 plan_result。"]
-
-
-def _emit_progress(progress_handler: ProgressHandler | None, message: str) -> None:
-    if progress_handler:
-        progress_handler(message)
+        return ["请检查 A/B/C Dify 配置、工作流输出 JSON、证据 ID 和文献 ID 是否符合模块 5 规范。"]
+    return ["请检查 A/B/C Dify 工作流是否均已发布并返回有效的计划结果。"]

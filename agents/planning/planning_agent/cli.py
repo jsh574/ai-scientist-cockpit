@@ -7,18 +7,22 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from planning_agent.dify_client import DifyWorkflowClient
 from planning_agent.env import ensure_dotenv_loaded
 from planning_agent.sample_data import sample_planner_input, short_sample_planner_input
 from planning_agent.service import run_planning_agent
+from planning_agent.workflow_chain import PlanningWorkflowChainRunner
 
 
 def main(argv: list[str] | None = None) -> int:
     ensure_dotenv_loaded()
     parser = argparse.ArgumentParser(description="Run the research planning agent.")
     parser.add_argument("--input", help="Path to module-5 input JSON.")
-    parser.add_argument("--sample", action="store_true", help="Use short built-in smoke-test input.")
-    parser.add_argument("--full-sample", action="store_true", help="Use full built-in spec-coverage input.")
+    parser.add_argument(
+        "--sample", action="store_true", help="Use short built-in smoke-test input."
+    )
+    parser.add_argument(
+        "--full-sample", action="store_true", help="Use full built-in spec-coverage input."
+    )
     parser.add_argument(
         "--output",
         help="Path to write response JSON. Defaults to samples/output/planning_responseMM_DD-HH_MM.json.",
@@ -29,25 +33,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Print local and Dify streaming progress to stderr.",
     )
     parser.add_argument(
-        "--print-dify-target",
+        "--print-targets",
         action="store_true",
-        help="Print the configured Dify Workflow API target without sending a request.",
+        help="Print all configured A/B/C Dify targets without sending requests.",
     )
     args = parser.parse_args(argv)
 
-    if args.print_dify_target:
-        client = DifyWorkflowClient()
-        target = {
-            "configured": client.configured,
-            "endpoint": f"{client.api_url}/v1/workflows/run" if client.api_url else "",
-            "user": client.user,
-            "api_key_present": bool(client.api_key),
-            "response_mode": client.response_mode,
-            "timeout_seconds": client.timeout_seconds,
-            "max_parallel_calls": _env_int("DIFY_MAX_PARALLEL_CALLS", 1),
-        }
-        print(json.dumps(target, ensure_ascii=False, indent=2))
-        return 0 if client.configured else 1
+    if args.print_targets:
+        targets = PlanningWorkflowChainRunner.from_env().configuration_summary()
+        print(json.dumps(targets, ensure_ascii=False, indent=2))
+        return 0 if all(item.get("configured") for item in targets) else 1
 
     if args.sample and args.full_sample:
         parser.error("Use only one of --sample or --full-sample.")
@@ -88,16 +83,6 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if not value:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
 
 
 if __name__ == "__main__":

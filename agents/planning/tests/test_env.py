@@ -13,15 +13,15 @@ def test_load_dotenv_supports_export_lines_without_overriding_existing_env(monke
         "\n".join(
             [
                 "# comment",
-                "export DIFY_API_URL=\"http://from-dotenv.example\"",
-                "export DIFY_API_KEY='from-dotenv-key'",
+                'export DIFY_API_URL="http://from-dotenv.example"',
+                "export DIFY_WORKFLOW_C_API_KEY='from-dotenv-key'",
                 "export DIFY_RESPONSE_MODE=streaming # inline comment",
                 "BROKEN_LINE",
             ]
         ),
         encoding="utf-8",
     )
-    monkeypatch.setenv("DIFY_API_KEY", "from-shell-key")
+    monkeypatch.setenv("DIFY_WORKFLOW_C_API_KEY", "from-shell-key")
     monkeypatch.delenv("DIFY_API_URL", raising=False)
     monkeypatch.delenv("DIFY_RESPONSE_MODE", raising=False)
 
@@ -30,7 +30,7 @@ def test_load_dotenv_supports_export_lines_without_overriding_existing_env(monke
 
     assert loaded == dotenv
     assert os.environ["DIFY_API_URL"] == "http://from-dotenv.example"
-    assert os.environ["DIFY_API_KEY"] == "from-shell-key"
+    assert os.environ["DIFY_WORKFLOW_C_API_KEY"] == "from-shell-key"
     assert os.environ["DIFY_RESPONSE_MODE"] == "streaming"
 
 

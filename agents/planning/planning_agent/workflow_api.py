@@ -60,8 +60,6 @@ class WorkflowEndpointConfig:
         prefix = f"DIFY_WORKFLOW_{stage}"
         api_url = os.getenv(f"{prefix}_API_URL") or os.getenv("DIFY_API_URL", "")
         api_key = os.getenv(f"{prefix}_API_KEY", "")
-        if stage == "C" and not api_key:
-            api_key = os.getenv("DIFY_API_KEY", "")
         response_mode = (
             (
                 os.getenv("DIFY_CHAIN_RESPONSE_MODE")

@@ -138,9 +138,7 @@ class AdapterContractTests(unittest.TestCase):
         client.max_tokens = 4096
         client.enable_thinking = False
         client.background_context = "ATTACHMENT_SENTINEL_7F31"
-        client.client = SimpleNamespace(
-            chat=SimpleNamespace(completions=FakeCompletions())
-        )
+        client.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
 
         result = client._complete("system", "base prompt", 0.2)
 
@@ -164,15 +162,18 @@ class AdapterContractTests(unittest.TestCase):
                 "user_constraints": {"reasoning_level": "high"},
             },
         }
-        with patch.dict(
-            os.environ,
-            {
-                "DASHSCOPE_API_KEY": "test-key",
-                "LLM_MAX_TOKENS": "8192",
-                "LLM_MAX_RETRIES": "0",
-                "QWEN_ENABLE_THINKING": "false",
-            },
-        ), patch("openai.OpenAI") as openai_client:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "DASHSCOPE_API_KEY": "test-key",
+                    "LLM_MAX_TOKENS": "8192",
+                    "LLM_MAX_RETRIES": "0",
+                    "QWEN_ENABLE_THINKING": "false",
+                },
+            ),
+            patch("openai.OpenAI") as openai_client,
+        ):
             client = ProjectLLMClient(context)
 
         self.assertEqual(client.max_tokens, 6144)
@@ -321,9 +322,7 @@ class AdapterContractTests(unittest.TestCase):
 
     def test_evidence_mapping_adapter_uses_llm_in_auto_mode(self) -> None:
         settings = Settings.from_env()
-        llm_module = _load_package(
-            settings.evidence_agent_root / "src", "evidence_mapping.llm"
-        )
+        llm_module = _load_package(settings.evidence_agent_root / "src", "evidence_mapping.llm")
         llm_output = {
             "bindings": [
                 {
@@ -355,24 +354,23 @@ class AdapterContractTests(unittest.TestCase):
             "evidence_strength_score": 0.75,
             "main_limitations": [],
         }
-        with patch.dict(
-            os.environ,
-            {"DASHSCOPE_API_KEY": "test-key", "EVIDENCE_MAPPING_MODE": "auto"},
-        ), patch.object(
-            llm_module.QwenCompatibleClient,
-            "generate_json",
-            autospec=True,
-            return_value=llm_output,
-        ) as generate_json:
-            response = AgentRegistry(settings).run(
-                "evidence_mapping", self.downstream_context()
-            )
+        with (
+            patch.dict(
+                os.environ,
+                {"DASHSCOPE_API_KEY": "test-key", "EVIDENCE_MAPPING_MODE": "auto"},
+            ),
+            patch.object(
+                llm_module.QwenCompatibleClient,
+                "generate_json",
+                autospec=True,
+                return_value=llm_output,
+            ) as generate_json,
+        ):
+            response = AgentRegistry(settings).run("evidence_mapping", self.downstream_context())
 
         generate_json.assert_called_once()
         self.assertEqual(response["metadata"]["status"], "success")
-        self.assertEqual(
-            response["self_review"]["dimension_scores"]["scoring_backend_llm"], 1.0
-        )
+        self.assertEqual(response["self_review"]["dimension_scores"]["scoring_backend_llm"], 1.0)
 
     def test_planning_request_uses_v01_module_contract(self) -> None:
         request = planning_request(self.downstream_context(), feedback="优先降低样本量")
@@ -385,27 +383,47 @@ class AdapterContractTests(unittest.TestCase):
         self.assertEqual(request["_feedback"], "优先降低样本量")
 
     def test_planning_dify_output_reports_unknown_traceability_ids(self) -> None:
-        class FakeDifyClient:
-            configured = True
+        class FakeWorkflowChainRunner:
+            def configuration_summary(self):
+                return [
+                    {"name": f"workflow_{stage.lower()}", "configured": True} for stage in "ABC"
+                ]
 
-            def run_workflow(self, _inputs):
+            def run_batch(self, data, **_options):
+                hypothesis_id = data["hypothesis_cards"][0]["hypothesis_id"]
                 return {
-                    "plan": {
-                        "problem_statement": "测试研究问题",
-                        "rationale": {
-                            "logic_chain": [
-                                {
-                                    "claim": "测试因果路径",
-                                    "evidence_ids": ["ev_001", "ev_invented"],
-                                    "source_ids": ["lit_001", "lit_invented"],
-                                }
-                            ]
-                        },
-                        "references": [
-                            {"source_id": "lit_001", "used_for": ["rationale"]},
-                            {"source_id": "lit_invented", "used_for": ["rationale"]},
-                        ],
-                    }
+                    "status": "success",
+                    "errors": [],
+                    "hypothesis_runs": [
+                        {
+                            "hypothesis_id": hypothesis_id,
+                            "status": "success",
+                            "decision": "accept",
+                            "next_action": "continue_to_product",
+                            "final_result": {
+                                "hypothesis_id": hypothesis_id,
+                                "status": "success",
+                                "error_message": "",
+                                "plan": {
+                                    "problem_statement": "测试研究问题",
+                                    "rationale": {
+                                        "logic_chain": [
+                                            {
+                                                "claim": "测试因果路径",
+                                                "evidence_ids": ["ev_001", "ev_invented"],
+                                                "source_ids": ["lit_001", "lit_invented"],
+                                            }
+                                        ]
+                                    },
+                                    "references": [
+                                        {"source_id": "lit_001", "used_for": ["rationale"]},
+                                        {"source_id": "lit_invented", "used_for": ["rationale"]},
+                                    ],
+                                },
+                            },
+                            "errors": [],
+                        }
+                    ],
                 }
 
         context = self.downstream_context()
@@ -424,51 +442,21 @@ class AdapterContractTests(unittest.TestCase):
         request = planning_request(context)
         service = _load_package(Settings.from_env().planning_agent_root, "planning_agent.service")
         response = service.run_planning_agent(
-            request, dify_client=FakeDifyClient(), max_packages=1, max_parallel_calls=1
+            request,
+            workflow_runner=FakeWorkflowChainRunner(),
+            max_packages=1,
+            max_parallel_calls=1,
         )
 
         self.assertEqual(response["metadata"]["status"], "partial_success")
         self.assertFalse(response["self_review"]["passed"])
         self.assertTrue(
-            any("unknown source" in issue or "unknown evidence" in issue for issue in response["self_review"]["issues"])
-        )
-
-    def test_registry_uses_native_planning_dify_client(self) -> None:
-        class FakeDifyClient:
-            configured = True
-
-            def __init__(self):
-                self.calls = []
-
-            def run_workflow(self, inputs):
-                self.calls.append(inputs)
-                return {"plan": {"problem_statement": "测试研究问题"}}
-
-        context = self.downstream_context()
-        with patch.dict(os.environ, {"EVIDENCE_MAPPING_MODE": "rules"}):
-            evidence_response = AgentRegistry(Settings.from_env()).run(
-                "evidence_mapping", context
+            any(
+                "unknown source" in issue or "unknown evidence" in issue
+                for issue in response["self_review"]["issues"]
             )
-        context["evidence_map"] = evidence_response["payload"]["evidence_map"]
-        service = _load_package(Settings.from_env().planning_agent_root, "planning_agent.service")
-        client = FakeDifyClient()
-        with patch.dict(
-            os.environ,
-            {
-                "DIFY_WORKFLOW_A_API_KEY": "",
-                "DIFY_WORKFLOW_B_API_KEY": "",
-                "PLANNING_AGENT_SKIP_DOTENV": "1",
-            },
-        ), patch.object(service, "DifyWorkflowClient", return_value=client):
-            response = AgentRegistry(Settings.from_env()).run("research_planning", context)
-
-        self.assertEqual(response["metadata"]["stage"], "research_planning")
-        self.assertIn("research_plan", response["payload"])
-        self.assertTrue(client.calls)
-        self.assertEqual(
-            response["payload"]["research_plan"]["plans"][0]["plan"]["problem_statement"],
-            "测试研究问题",
         )
+
     def test_registry_auto_selects_configured_planning_workflow_chain(self) -> None:
         class FakeWorkflowChainRunner:
             def __init__(self) -> None:
@@ -506,32 +494,22 @@ class AdapterContractTests(unittest.TestCase):
 
         context = self.downstream_context()
         with patch.dict(os.environ, {"EVIDENCE_MAPPING_MODE": "rules"}):
-            evidence_response = AgentRegistry(Settings.from_env()).run(
-                "evidence_mapping", context
-            )
+            evidence_response = AgentRegistry(Settings.from_env()).run("evidence_mapping", context)
         context["evidence_map"] = evidence_response["payload"]["evidence_map"]
-        service = _load_package(
-            Settings.from_env().planning_agent_root, "planning_agent.service"
-        )
+        service = _load_package(Settings.from_env().planning_agent_root, "planning_agent.service")
         runner = FakeWorkflowChainRunner()
 
-        with patch.object(
-            service.PlanningWorkflowChainRunner, "from_env", return_value=runner
-        ):
+        with patch.object(service.PlanningWorkflowChainRunner, "from_env", return_value=runner):
             response = AgentRegistry(Settings.from_env()).run(
                 "research_planning", context, feedback="减少样本量并保留证据约束"
             )
 
         self.assertEqual(response["metadata"]["status"], "success")
         self.assertEqual(
-            response["payload"]["research_plan"]["plans"][0]["plan"][
-                "problem_statement"
-            ],
+            response["payload"]["research_plan"]["plans"][0]["plan"]["problem_statement"],
             "ABC 链路研究计划",
         )
-        self.assertEqual(
-            runner.calls[0][0]["_feedback"], "减少样本量并保留证据约束"
-        )
+        self.assertEqual(runner.calls[0][0]["_feedback"], "减少样本量并保留证据约束")
 
 
 if __name__ == "__main__":

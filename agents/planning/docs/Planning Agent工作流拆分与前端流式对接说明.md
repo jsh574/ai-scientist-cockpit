@@ -2,14 +2,14 @@
 
 ## 1. 先说结论
 
-当前项目同时保留了两条执行路径，它们使用相同的模块 5 输入，但用途不同：
+当前项目只有 A/B/C 一条执行路径，但提供两个使用相同模块 5 输入的 CLI：
 
 | 路径 | 命令 | 实际执行 | 用途 |
 |---|---|---|---|
-| C-only 兼容路径 | `python -m planning_agent.cli` | 直接为每个假设调用 Workflow C | 当前正式服务兼容、批量计划生成 |
-| A/B/C 测试路径 | `python -m planning_agent.workflow_chain_cli` | 单个或多个假设分别执行 A -> B -> C | 验证拆分设计、并发隔离和中间结果 |
+| 正式响应路径 | `python -m planning_agent.cli` | 单个或多个假设分别执行 A -> B -> C | 生成总控使用的标准 AgentResponse |
+| 链路诊断路径 | `python -m planning_agent.workflow_chain_cli` | 单个或多个假设分别执行 A -> B -> C | 验证并发隔离并保留中间结果/HTML |
 
-所以，执行 `planning_agent.cli` 时终端没有 A/B 日志是正常行为，不代表 A/B 出错或没有发布。这个命令从设计上就没有调用 A/B。
+两个命令都会调用 A/B/C；区别只在输出契约和诊断信息，不存在绕过 A/B 的 C-only 入口。
 
 ## 2. 为什么拆成 A、B、C
 
@@ -106,7 +106,7 @@ selected_design 非空
 
 ### 3.3 Workflow C: Research Planning Agent
 
-C 接收一个假设证据包。如果来自 A/B/C 路径，`planning_constraints` 中还会携带 B 选中的设计和选择理由。快速版 C 用一个结构化 LLM 直接将选中设计扩展为完整研究计划，再由确定性 Code 节点执行最终契约检查；C-only 输入仍兼容。
+C 接收一个假设证据包，`planning_constraints` 必须携带 B 选中的设计和选择理由。快速版 C 用一个结构化 LLM 直接将选中设计扩展为完整研究计划，再由确定性 Code 节点执行最终契约检查；缺少 `selected_design` 时按上游契约错误失败。
 
 稳定输出：
 
@@ -126,28 +126,27 @@ C 一次仍只处理一个假设。Python wrapper 负责多假设选择、调用
 }
 ```
 
-## 4. 为什么这次终端没有 A/B/C
+## 4. 两个 CLI 的输出有何不同
 
-你运行的是：
+正式响应测试使用：
 
 ```powershell
 .\.venv\Scripts\python -m planning_agent.cli `
     --input samples\input\module5_input_rag_batch.json `
     --show-progress `
-    --output samples\test-artifacts\rag-batch-c-only.json
+    --output samples\test-artifacts\rag-batch-abc-response.json
 ```
 
-`planning_agent.cli` 调用 `run_planning_agent()`，这是保留的 C-only 兼容服务：
+`planning_agent.cli` 调用正式 `run_planning_agent()`：
 
 ```text
 3 个 hypothesis
-  -> Python 构建 3 个 hypothesis_evidence_package
-  -> 按 selection_score 选择最多 max_hypotheses 个
-  -> 每个 package 调用一次 Workflow C
+  -> Python 按 selection_score 选择最多 max_hypotheses 个
+  -> 每个 hypothesis 完整执行 A 三候选、B 评审和 C 终稿
   -> 聚合成 payload.plans[]
 ```
 
-它不会创建 A 候选，也不会调用 B。测试单个假设的 A/B/C：
+需要查看候选、评审、终稿中间结果和 HTML 时，使用诊断 CLI：
 
 ```powershell
 .\.venv\Scripts\python -m planning_agent.workflow_chain_cli `
@@ -173,7 +172,7 @@ C 一次仍只处理一个假设。Python wrapper 负责多假设选择、调用
 结果文件是：
 
 ```text
-D:\Code\Project\Python\Planning Agent\samples\test-artifacts\rag-batch-c-only.json
+D:\Code\Project\Python\ai-scientist-cockpit\agents\planning\samples\test-artifacts\rag-batch-abc-response.json
 ```
 
 实际检查结果：
@@ -209,7 +208,7 @@ hyp_rag_003: success
 可用 PowerShell 快速检查：
 
 ```powershell
-$r = Get-Content -Raw samples\test-artifacts\rag-batch-c-only.json | ConvertFrom-Json
+$r = Get-Content -Raw samples\test-artifacts\rag-batch-abc-response.json | ConvertFrom-Json
 $r.metadata.status
 $r.payload.status
 $r.payload.plans | Select-Object hypothesis_id, status
@@ -274,7 +273,7 @@ A/B/C 测试链路现在会在本地事件副本中增加 `planning_context`，C
 
 并发事件在终端中的物理到达顺序仍然会交错，这是正确的并发行为；前端应按 correlation 字段分组，而不是等待日志变成串行。终端输出仍不能直接作为前端协议：
 
-1. C-only 兼容 CLI 仍复用原有 `_StreamProgressPrinter`，多个请求的 chunk 计数会交错。
+1. A/B/C runner 为事件附加 hypothesis、variant、round、attempt 等关联字段，并发事件仍可能交错。
 2. 原始事件包含 Dify 内部字段，前端不应该依赖其全部结构。
 3. 浏览器不能直接持有 Dify App API Key，也不应直接连接 Dify。
 4. 总控还需要把清洗后的事件持久化并桥接到自己的 SSE 接口。
@@ -361,15 +360,15 @@ Cockpit backend
 
 ## 9. 多假设下的并发边界
 
-C-only 当前支持多个 hypothesis 串行或并行执行：
+正式 A/B/C 服务支持多个 hypothesis 串行或并行执行：
 
 ```powershell
-$env:DIFY_MAX_PARALLEL_CALLS = "3"
+$env:PLANNING_MAX_PARALLEL_CALLS = "3"
 ```
 
 结果数组会按本地选择顺序恢复，不会因为并发完成顺序而乱序。
 
-当前批量测试器已经实现两层并发；正式产品 `planning_agent/service.py` 仍是 C-only，接入 A/B/C 后也会形成相同结构：
+诊断 runner 和正式 `planning_agent/service.py` 使用相同的两层并发结构：
 
 ```text
 外层: 多个 hypothesis
@@ -384,12 +383,12 @@ $env:DIFY_MAX_PARALLEL_CALLS = "3"
 
 - A/B/C 三个可独立调用的 Dify Workflow；
 - A/B/C 单假设与多假设批量测试 runner，以及结构化 HTML/JSON 报告；
-- C-only 多假设聚合；
+- A/B/C 正式多假设聚合；
 - Dify SSE 读取和终端诊断。
 
 仍需完成：
 
-1. 把 A/B/C runner 接入正式 `planning_agent/service.py`。
+1. 将 A/B/C 中间事件持久化到总控事件日志。
 2. 给每次并发调用增加 hypothesis/variant/round/attempt correlation。
 3. 将清理后的事件桥接到 Cockpit 已有 task event SSE。
 4. 持久化 Planning trace，支持刷新恢复。

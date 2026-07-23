@@ -60,9 +60,7 @@ class FakeHTTPResponse:
 
 class FakeStreamingHTTPResponse:
     def __init__(self, events: list[dict[str, Any]]) -> None:
-        self.lines = [
-            f"data: {json.dumps(event)}\n".encode() for event in events
-        ]
+        self.lines = [f"data: {json.dumps(event)}\n".encode() for event in events]
 
     def __enter__(self) -> FakeStreamingHTTPResponse:
         return self
@@ -134,6 +132,21 @@ def test_endpoint_config_builds_dify_endpoint_without_double_v1():
 
     assert root.endpoint == "https://dify.example/v1/workflows/run"
     assert versioned.endpoint == "https://dify.example/v1/workflows/run"
+
+
+def test_endpoint_config_requires_scoped_api_keys_for_chain_workflows(monkeypatch):
+    monkeypatch.setenv("PLANNING_AGENT_SKIP_DOTENV", "1")
+    monkeypatch.setenv("DIFY_API_URL", "https://dify.example")
+    for stage in "ABC":
+        monkeypatch.setenv(f"DIFY_WORKFLOW_{stage}_API_KEY", f"key-{stage.lower()}")
+
+    assert WorkflowEndpointConfig.from_env("A").api_key == "key-a"
+    assert WorkflowEndpointConfig.from_env("B").api_key == "key-b"
+    assert WorkflowEndpointConfig.from_env("C").api_key == "key-c"
+
+    monkeypatch.delenv("DIFY_WORKFLOW_C_API_KEY")
+    workflow_c = WorkflowEndpointConfig.from_env("C")
+    assert workflow_c.configured is False
 
 
 def test_decode_json_output_removes_fenced_json_but_keeps_plain_text():
@@ -369,6 +382,8 @@ def test_html_report_escapes_model_output_and_shows_intermediate_sections():
     assert "Workflow C result" in rendered
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in rendered
     assert "<script>alert(1)</script>" not in rendered
+
+
 def test_workflow_c_system_identity_is_normalized_locally():
     candidate = FakeWorkflowClient("a", _candidate_outputs)
     selector = FakeWorkflowClient("b", _accept_outputs)
@@ -430,6 +445,8 @@ def test_workflow_c_failed_business_status_is_not_reported_as_success():
     assert report["next_action"] == "inspect_failure"
     assert report["stages"][-1]["status"] == "failed"
     assert report["final_result"]["error_message"] == "Final plan contract failed."
+
+
 def test_workflow_b_failed_guardrail_is_promoted_to_top_level_errors():
     candidate = FakeWorkflowClient("a", _candidate_outputs)
 
@@ -484,6 +501,8 @@ def test_workflow_c_success_with_empty_plan_is_converted_to_failure():
     assert report["stages"][-1]["status"] == "failed"
     assert report["final_result"]["status"] == "failed"
     assert report["errors"] == ["Workflow C returned an empty plan."]
+
+
 def test_workflow_a_soft_rejection_is_repaired_and_included_in_selection():
     def one_rejected_candidate(inputs: dict[str, Any]) -> dict[str, Any]:
         output = _candidate_outputs(inputs)
@@ -564,9 +583,7 @@ def test_workflow_a_all_soft_rejections_still_reach_workflow_c():
             "design_candidate": {
                 "hypothesis_id": inputs["hypothesis_id"],
                 "variant_mode": inputs["variant_mode"],
-                "candidate_id": (
-                    f'{inputs["hypothesis_id"]}::{inputs["variant_mode"]}'
-                ),
+                "candidate_id": (f"{inputs['hypothesis_id']}::{inputs['variant_mode']}"),
                 "status": "partial_success",
                 "text": "Model returned only a grounded fragment.",
             },
@@ -641,9 +658,10 @@ def test_workflow_b_malformed_structured_output_is_retried_once():
     assert len(planner.calls) == 1
     assert [item["attempt"] for item in selection_rounds] == [1, 2]
     assert retry_constraints["selection_format_retry"]["attempt"] == 2
-    assert "schema_version is invalid" in retry_constraints["selection_format_retry"][
-        "previous_issues"
-    ]
+    assert (
+        "schema_version is invalid"
+        in retry_constraints["selection_format_retry"]["previous_issues"]
+    )
 
 
 def test_workflow_b_format_retry_can_be_disabled():
@@ -716,9 +734,7 @@ def test_batch_chain_runs_every_hypothesis_concurrently_and_preserves_order():
     assert any("[hyp_short_001]" in message for message in progress_messages)
     assert any("[hyp_short_002]" in message for message in progress_messages)
 
-    statements = {
-        item["hypothesis_id"]: item["statement"] for item in data["hypothesis_cards"]
-    }
+    statements = {item["hypothesis_id"]: item["statement"] for item in data["hypothesis_cards"]}
     for call in candidate.calls:
         package = json.loads(call["hypothesis_evidence_package"])
         assert package["hypothesis"] == statements[call["hypothesis_id"]]
@@ -775,9 +791,7 @@ def test_batch_html_report_shows_each_hypothesis_and_escapes_output():
     report = PlanningWorkflowChainRunner(candidate, selector, planner).run_batch(
         short_sample_planner_input()
     )
-    report["hypothesis_runs"][0]["final_result"]["plan"]["title"] = (
-        "<script>alert(1)</script>"
-    )
+    report["hypothesis_runs"][0]["final_result"]["plan"]["title"] = "<script>alert(1)</script>"
 
     rendered = render_html_report(report)
 

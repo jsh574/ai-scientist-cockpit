@@ -194,7 +194,10 @@ workflow:
           \ str, planning_constraints: str = \"\", user_constraints: str = \"\") ->\
           \ dict:\n    question = _loads(question_card, {})\n    package = _loads(hypothesis_evidence_package,\
           \ {})\n    constraints = _loads(planning_constraints, {})\n    user = _loads(user_constraints,\
-          \ {})\n    evidence_subset = package.get(\"evidence_subset\", {}) if isinstance(package,\
+          \ {})\n    selected_design = constraints.get(\"selected_design\") if isinstance(constraints,\
+          \ dict) else None\n    if not isinstance(selected_design, dict) or not selected_design:\n\
+          \        raise ValueError(\"planning_constraints.selected_design is required from Workflow B\")\n\
+          \    evidence_subset = package.get(\"evidence_subset\", {}) if isinstance(package,\
           \ dict) else {}\n\n    evidence_rows = []\n    for key, direction in (\n\
           \        (\"supporting_evidence\", \"supporting\"),\n        (\"opposing_evidence\"\
           , \"opposing\"),\n        (\"uncertain_evidence\", \"uncertain\"),\n   \
@@ -291,11 +294,11 @@ workflow:
 
             当前 Workflow 一次只处理一个 hypothesis，批量选择和汇总由本地 wrapper 完成。
 
-            normalized_evidence_context.planning_constraints 可能包含 Workflow B 已接受的 selected_design 和 design_selection。
+            normalized_evidence_context.planning_constraints 必须包含 Workflow B 已接受的 selected_design 和 design_selection。
 
-            若 selected_design 存在，必须以它为方案基线，只补齐执行步骤、统计分析、证伪标准、资源约束和反馈任务；不得重新发散方案或改变 hypothesis 含义。
+            必须以 selected_design 为方案基线，只补齐执行步骤、统计分析、证伪标准、资源约束和反馈任务；不得重新发散方案或改变 hypothesis 含义。
 
-            若 selected_design 不存在，则按 C-only 兼容路径，从 hypothesis、evidence_rows、validation_idea 和约束直接生成计划。
+            selected_design 缺失属于上游契约错误，Workflow C 不提供独立生成或兼容路径。
 
             你必须只输出一个严格 JSON 对象，且该对象是单个 plan_result。
 
@@ -334,7 +337,7 @@ workflow:
             {{#normalize_evidence.normalized_evidence_context#}}
 
 
-            请优先读取 normalized_evidence_context.planning_constraints.selected_design，直接将选中设计扩展成最终计划。
+            请读取 normalized_evidence_context.planning_constraints.selected_design，直接将选中设计扩展成最终计划。
 
             保留选中设计的 candidate_id、设计类型、变量、基线、指标、步骤和证伪逻辑；仅补齐最终 schema 所需细节。
 

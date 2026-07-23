@@ -89,24 +89,24 @@ class Settings:
 
     def source_status(self) -> dict[str, dict[str, object]]:
         any_credential = bool(
-            os.getenv("DASHSCOPE_API_KEY")
-            or os.getenv("QWEN_API_KEY")
-            or os.getenv("LLM_API_KEY")
+            os.getenv("DASHSCOPE_API_KEY") or os.getenv("QWEN_API_KEY") or os.getenv("LLM_API_KEY")
         )
         dashscope_credential = bool(os.getenv("DASHSCOPE_API_KEY"))
         qwen_credential = bool(os.getenv("DASHSCOPE_API_KEY") or os.getenv("QWEN_API_KEY"))
-        dify_credential = bool(os.getenv("DIFY_API_URL") and os.getenv("DIFY_API_KEY"))
+        dify_credential = all(
+            bool(
+                (os.getenv(f"DIFY_WORKFLOW_{stage}_API_URL") or os.getenv("DIFY_API_URL"))
+                and os.getenv(f"DIFY_WORKFLOW_{stage}_API_KEY")
+            )
+            for stage in "ABC"
+        )
         evidence_mapping_mode = os.getenv("EVIDENCE_MAPPING_MODE", "auto").strip().lower()
         if evidence_mapping_mode not in {"auto", "llm", "rules"}:
             evidence_mapping_mode = "auto"
         evidence_mapping_status_mode = {
             "rules": "rule_engine",
             "llm": "model",
-            "auto": (
-                "llm_with_rule_fallback"
-                if any_credential
-                else "rule_engine_fallback"
-            ),
+            "auto": ("llm_with_rule_fallback" if any_credential else "rule_engine_fallback"),
         }[evidence_mapping_mode]
 
         def status(
