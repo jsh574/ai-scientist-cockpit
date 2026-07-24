@@ -188,6 +188,66 @@ class AdapterContractTests(unittest.TestCase):
         self.assertEqual(response["metadata"]["status"], "failed")
         self.assertFalse(response["self_review"]["passed"])
 
+    def test_knowledge_agent_bridges_progress_and_feedback_contract(self) -> None:
+        captured: dict = {}
+
+        class FakeLLM:
+            max_attempts = 1
+
+        class FakeAgent:
+            def __init__(self, llm_client, literature_clients):
+                self.llm_client = llm_client
+
+        class FakeAdapter:
+            def __init__(self, agent, default_search_policy):
+                pass
+
+            def call(self, task_context, progress_callback=None):
+                captured["task_context"] = task_context
+                progress_callback(
+                    {
+                        "event": "retrieval_database_started",
+                        "component": "RetrievalService",
+                        "payload": {"database": "crossref", "query": "tau"},
+                    }
+                )
+                return {
+                    "metadata": {"status": "success"},
+                    "payload": {
+                        "literature_cards": [],
+                        "evidence_cards": [],
+                        "knowledge_gaps": [],
+                    },
+                    "self_review": {"passed": True, "overall_score": 1.0},
+                }
+
+        progress_events: list[dict] = []
+        cancellation_checks: list[bool] = []
+        package = SimpleNamespace(
+            KnowledgeIntegrationAgent=FakeAgent,
+            KnowledgeIntegrationAdapter=FakeAdapter,
+        )
+        with patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-key"}), patch(
+            "backend.app.adapters._load_package", return_value=package
+        ), patch(
+            "backend.app.adapters.ProjectLLMClient", return_value=FakeLLM()
+        ), patch(
+            "backend.app.adapters._literature_clients", return_value=[]
+        ):
+            response = AgentRegistry(Settings.from_env()).run(
+                "knowledge_integration",
+                {**self.context, "question_card": {}},
+                "补充纵向研究。",
+                progress_handler=progress_events.append,
+                cancellation_checker=lambda: cancellation_checks.append(True),
+            )
+
+        self.assertEqual(response["metadata"]["status"], "success")
+        self.assertEqual(captured["task_context"]["_feedback"], "补充纵向研究。")
+        self.assertEqual(progress_events[0]["node_id"], "source_search:crossref")
+        self.assertEqual(progress_events[0]["message"], "正在检索 crossref。")
+        self.assertGreaterEqual(len(cancellation_checks), 2)
+
     def test_knowledge_parser_accepts_adapted_question_card(self) -> None:
         settings = Settings.from_env()
         module = _load_package(settings.knowledge_agent_root, "knowledge_integration_agent.agent")

@@ -595,7 +595,7 @@ class AgentRegistry:
     def _run_knowledge_integration(
         self,
         task_context: dict[str, Any],
-        _feedback: str | None,
+        feedback: str | None,
         progress_handler: ProgressHandler | None = None,
         cancellation_checker: CancellationChecker | None = None,
     ) -> dict[str, Any]:
@@ -607,6 +607,7 @@ class AgentRegistry:
         adapted_context = {
             **task_context,
             "question_card": knowledge_question_card(task_context.get("question_card") or {}),
+            "_feedback": feedback or "",
         }
         agent = package.KnowledgeIntegrationAgent(
             llm_client=ProjectLLMClient(task_context),
@@ -625,13 +626,59 @@ class AgentRegistry:
             "must_verify_sources": True,
             "forbidden_actions": ["invent_references", "invent_dataset_url"],
         }
+
+        def forward_progress(event: dict[str, Any]) -> None:
+            if cancellation_checker:
+                cancellation_checker()
+            if not progress_handler:
+                return
+
+            event_name = str(event.get("event") or "knowledge_integration_progress")
+            payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            database = str(payload.get("database") or "source")
+            if event_name.startswith("retrieval_database_"):
+                node_id = f"source_search:{database}"
+            else:
+                node_id = {
+                    "feedback_routing_completed": "query_planning",
+                    "retrieval_completed": "source_search",
+                    "literature_extraction_completed": "literature_extract",
+                    "evidence_extraction_completed": "evidence_extract",
+                    "gap_synthesis_completed": "gap_synthesis",
+                }.get(event_name, "knowledge_integration")
+            progress_handler(
+                {
+                    "node_id": node_id,
+                    "kind": "partial_output"
+                    if event_name
+                    in {
+                        "retrieval_completed",
+                        "literature_extraction_completed",
+                        "evidence_extraction_completed",
+                        "gap_synthesis_completed",
+                    }
+                    else "progress",
+                    "message": {
+                        "feedback_routing_completed": "已根据反馈调整知识检索策略。",
+                        "retrieval_database_started": f"正在检索 {database}。",
+                        "retrieval_database_completed": f"{database} 检索完成。",
+                        "retrieval_database_failed": f"{database} 检索失败，继续处理其他来源。",
+                        "retrieval_completed": "文献检索完成。",
+                        "literature_extraction_completed": "文献卡片整理完成。",
+                        "evidence_extraction_completed": "证据卡片整理完成。",
+                        "gap_synthesis_completed": "知识空白梳理完成。",
+                    }.get(event_name, event_name.replace("_", " ")),
+                    "payload": dict(payload),
+                    "operation": "replace",
+                }
+            )
+
         raw = package.KnowledgeIntegrationAdapter(
             agent=agent,
             default_search_policy=search_policy,
         ).call(
             adapted_context,
-            progress_handler=progress_handler,
-            cancellation_checker=cancellation_checker,
+            progress_callback=forward_progress,
         )
         raw["metadata"]["status"] = _status(raw.get("metadata", {}).get("status"))
         return raw
