@@ -63,7 +63,7 @@ npm run dev
 - `agents/registry.json` 是机器可读注册表，`backend/app/agent_protocol.py` 是运行时契约；两者变更必须同步并补测试。
 - Agent 只能返回本阶段声明的 payload 字段，Review Gate 会拒绝越权写入。
 - 五个 Agent 源码随主仓库提交；默认配置不包含机器相关的绝对路径。
-- OpenAI 兼容模型 Agent 共享 `ProjectLLMClient`，统一使用 `backend/.env` 中的模型、兼容地址、密钥、超时和 JSON 模式；Planning Agent 使用 `DifyWorkflowClient` 读取 `DIFY_API_URL`、`DIFY_API_KEY` 等配置。
+- OpenAI 兼容模型 Agent 共享 `ProjectLLMClient`，统一使用 `backend/.env` 中的模型、兼容地址、密钥、超时和 JSON 模式；Planning Agent 的 A/B/C 客户端共用 `DIFY_API_URL`，并分别读取 `DIFY_WORKFLOW_A_API_KEY`、`DIFY_WORKFLOW_B_API_KEY`、`DIFY_WORKFLOW_C_API_KEY`。
 - 问题理解模块原有 `{status, meta, data}` 会被转换成标准信封。
 - `research_object`、`key_concepts`、`sub_questions`、`search_keywords` 会在问题理解与知识整合之间双向适配。
 - 任何异常都返回 `metadata.status=failed`，前端停止后续调度并展示 `self_review.issues`。

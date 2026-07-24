@@ -169,100 +169,109 @@ export interface EvidenceMapItem {
 export interface ResearchPlan {
   schema_version: string;
   agent_name: string;
-  run_id: string;
-  round_id: number;
+  task_id?: string;
+  iteration?: number;
+  run_id?: string;
+  round_id?: number;
   status: "success" | "partial_success" | "failed";
-  plans: Array<{
-    hypothesis_id: string;
-    status: "success" | "failed";
-    error_message: string | null;
-    plan: {
-      problem_statement: string;
-      rationale: {
-        text: string;
-        logic_chain: Array<{
-          step: number;
-          claim: string;
-          evidence_ids: string[];
-          source_ids: string[];
-        }>;
-      };
-      technical_details: {
-        required_methods: string[];
-        candidate_models_or_algorithms: string[];
-        statistical_tests: string[];
-        software_stack: string[];
-      };
-      datasets: {
-        source: Array<{
-          dataset_id: string;
-          name: string;
-          usage: string;
-          required_fields: string[];
-          access_status: string;
-        }>;
-        target: Array<{
-          name: string;
-          description: string;
-          fields: string[];
-        }>;
-      };
-      paper_title: string;
-      paper_abstract: string;
-      methods: {
-        overall_design: string;
-        steps: Array<{
-          step_id: string;
-          name: string;
-          description: string;
-          input: string[];
-          output: string[];
-        }>;
-      };
-      experiments: {
-        main_experiment: {
-          objective: string;
-          independent_variables: string[];
-          dependent_variables: string[];
-          control_variables: string[];
-        };
-        baselines: Array<{
-          name: string;
-          description: string;
-        }>;
-        metrics: Array<{
-          name: string;
-          description: string;
-        }>;
-        procedure: string[];
-        ablation_or_sensitivity_analysis: string[];
-      };
-      results: {
-        result_type: string;
-        expected_findings: string[];
-        feasibility_check: string;
-        falsification_criteria: string[];
-      };
-      references: Array<{
-        source_id: string;
-        title: string;
-        authors: string[];
-        year: number;
-        doi: string;
-        url: string;
-        used_for: string[];
-      }>;
-      feedback_tasks: Array<{
-        task_id: string;
-        task_type: string;
-        priority: "high" | "medium" | "low";
-        objective: string;
-        input_requirements: string[];
-        expected_output: string;
-      }>;
-      limitations: string[];
+  plans: ResearchPlanItem[];
+}
+
+export interface ResearchPlanItem {
+  hypothesis_id: string;
+  status: "success" | "partial_success" | "failed";
+  error_message: string | null;
+  plan: ResearchPlanContent;
+}
+
+export interface ResearchPlanContent {
+  problem_statement?: string;
+  rationale?: {
+    text?: string;
+    logic_chain?: Array<{
+      step?: number;
+      claim?: string;
+      evidence_ids?: string[];
+      source_ids?: string[];
+    }>;
+  };
+  technical_details?: {
+    required_methods?: string[];
+    candidate_models_or_algorithms?: string[];
+    statistical_tests?: string[];
+    software_stack?: string[];
+  };
+  datasets?: {
+    source?: Array<
+      | string
+      | {
+          dataset_id?: string;
+          name?: string;
+          usage?: string;
+          required_fields?: string[];
+          access_status?: string;
+        }
+    >;
+    target?: Array<
+      | string
+      | {
+          name?: string;
+          description?: string;
+          fields?: string[];
+        }
+    >;
+  };
+  paper_title?: string;
+  paper_abstract?: string;
+  methods?: {
+    overall_design?: string;
+    steps?: Array<{
+      step_id?: string;
+      name?: string;
+      description?: string;
+      input?: string[];
+      output?: string[];
+      inputs?: string[];
+      outputs?: string[];
+    }>;
+  };
+  experiments?: {
+    main_experiment?: {
+      objective?: string;
+      independent_variables?: string[];
+      dependent_variables?: string[];
+      control_variables?: string[];
+      [key: string]: unknown;
     };
+    baselines?: Array<string | { name?: string; description?: string }>;
+    metrics?: Array<string | { name?: string; description?: string }>;
+    procedure?: string[];
+    ablation_or_sensitivity_analysis?: string[];
+  };
+  results?: {
+    result_type?: string;
+    expected_findings?: string[];
+    feasibility_check?: string;
+    falsification_criteria?: string[];
+  };
+  references?: Array<{
+    source_id?: string;
+    title?: string;
+    authors?: string[];
+    year?: number | string;
+    doi?: string;
+    url?: string;
+    used_for?: string[];
   }>;
+  feedback_tasks?: Array<{
+    task_id?: string;
+    task_type?: string;
+    priority?: "high" | "medium" | "low";
+    objective?: string;
+    input_requirements?: string[];
+    expected_output?: string;
+  }>;
+  limitations?: string[];
 }
 
 export interface FinalReview {

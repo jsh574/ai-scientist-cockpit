@@ -41,3 +41,7 @@ artifacts/tasks/*
 *.njsproj
 *.sln
 *.sw?
+
+# Local agent planning scratch files
+/docs/plans/
+/.test-tmp/

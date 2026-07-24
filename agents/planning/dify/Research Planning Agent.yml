@@ -1,5 +1,6 @@
 app:
-  description: Single-hypothesis Research Planning Agent workflow with evidence normalization, evidence briefing, plan skeleton drafting, full plan generation, and final critic/repair.
+  description: Single-hypothesis Research Planning Agent workflow with evidence normalization,
+    evidence briefing, plan skeleton drafting, full plan generation, and final critic/repair.
   icon: 🧭
   icon_background: '#E0F2FE'
   icon_type: emoji
@@ -81,30 +82,8 @@ workflow:
         isInIteration: false
         sourceType: code
         targetType: llm
-      id: normalize-source-evidence-brief-target
+      id: normalize-source-full-plan-target
       source: normalize_evidence
-      sourceHandle: source
-      target: evidence_brief
-      targetHandle: target
-      type: custom
-      zIndex: 0
-    - data:
-        isInIteration: false
-        sourceType: llm
-        targetType: llm
-      id: evidence-brief-source-skeleton-target
-      source: evidence_brief
-      sourceHandle: source
-      target: plan_skeleton
-      targetHandle: target
-      type: custom
-      zIndex: 0
-    - data:
-        isInIteration: false
-        sourceType: llm
-        targetType: llm
-      id: skeleton-source-full-plan-target
-      source: plan_skeleton
       sourceHandle: source
       target: full_plan
       targetHandle: target
@@ -113,20 +92,20 @@ workflow:
     - data:
         isInIteration: false
         sourceType: llm
-        targetType: llm
-      id: full-plan-source-critic-repair-target
+        targetType: code
+      id: full-plan-source-final-contract-target
       source: full_plan
       sourceHandle: source
-      target: critic_repair
+      target: final_contract
       targetHandle: target
       type: custom
       zIndex: 0
     - data:
         isInIteration: false
-        sourceType: llm
+        sourceType: code
         targetType: end
-      id: critic-repair-source-end-target
-      source: critic_repair
+      id: final-contract-source-end-target
+      source: final_contract
       sourceHandle: source
       target: end
       targetHandle: target
@@ -181,7 +160,7 @@ workflow:
           required: false
           type: paragraph
           variable: user_constraints
-      height: 324
+      height: 325
       id: start
       position:
         x: 80
@@ -195,105 +174,69 @@ workflow:
       type: custom
       width: 242
     - data:
-        code: |
-          import json
-
-          def _loads(value, default):
-              if value is None or value == "":
-                  return default
-              if isinstance(value, (dict, list)):
-                  return value
-              try:
-                  return json.loads(value)
-              except Exception:
-                  return default
-
-          def _as_list(value):
-              return value if isinstance(value, list) else []
-
-          def _compact_literature(item):
-              return {
-                  "literature_id": item.get("literature_id", "unknown"),
-                  "title": item.get("title", "unknown"),
-                  "authors": _as_list(item.get("authors")),
-                  "year": item.get("year", "unknown"),
-                  "doi": item.get("doi", ""),
-                  "url": item.get("url", ""),
-              }
-
-          def _compact_evidence(item, direction):
-              return {
-                  "direction": direction,
-                  "evidence_id": item.get("evidence_id", "unknown"),
-                  "claim": item.get("claim", ""),
-                  "summary": item.get("summary", ""),
-                  "source_literature_id": item.get("source_literature_id", ""),
-                  "support_direction": item.get("support_direction", direction),
-                  "strength_score": item.get("strength_score", 0),
-              }
-
-          def main(question_card: str, hypothesis_id: str, hypothesis_evidence_package: str, planning_constraints: str = "", user_constraints: str = "") -> dict:
-              question = _loads(question_card, {})
-              package = _loads(hypothesis_evidence_package, {})
-              constraints = _loads(planning_constraints, {})
-              user = _loads(user_constraints, {})
-              evidence_subset = package.get("evidence_subset", {}) if isinstance(package, dict) else {}
-
-              evidence_rows = []
-              for key, direction in (
-                  ("supporting_evidence", "supporting"),
-                  ("opposing_evidence", "opposing"),
-                  ("uncertain_evidence", "uncertain"),
-              ):
-                  for item in _as_list(evidence_subset.get(key)):
-                      if isinstance(item, dict):
-                          evidence_rows.append(_compact_evidence(item, direction))
-
-              source_literature = [
-                  _compact_literature(item)
-                  for item in _as_list(package.get("source_literature"))
-                  if isinstance(item, dict)
-              ]
-              knowledge_gaps = [
-                  item.get("description", str(item)) if isinstance(item, dict) else str(item)
-                  for item in _as_list(package.get("knowledge_gaps"))
-              ]
-
-              normalized = {
-                  "task_scope": {
-                      "hypothesis_id": hypothesis_id or package.get("hypothesis_id", "unknown"),
-                      "core_question": question.get("core_question", "unknown"),
-                      "domain": question.get("domain", []),
-                      "research_object": question.get("research_object", {}),
-                      "hypothesis": package.get("hypothesis", "unknown"),
-                      "rationale": package.get("rationale", ""),
-                      "target_variables": package.get("target_variables", []),
-                      "expected_observation": package.get("expected_observation", ""),
-                      "validation_idea": package.get("validation_idea", ""),
-                  },
-                  "scores": package.get("scores", {}),
-                  "evidence_rows": evidence_rows,
-                  "source_literature": source_literature,
-                  "knowledge_gaps": knowledge_gaps,
-                  "limitations": package.get("limitations", []),
-                  "needs_more_evidence": bool(package.get("needs_more_evidence", False)),
-                  "planning_constraints": constraints,
-                  "user_constraints": user,
-                  "guardrails": {
-                      "allowed_evidence_ids": [row.get("evidence_id") for row in evidence_rows],
-                      "allowed_source_ids": [item.get("literature_id") for item in source_literature],
-                      "forbidden_actions": constraints.get("forbidden_actions", []),
-                      "allowed_validation_types": constraints.get("allowed_validation_types", []),
-                  },
-              }
-              return {"normalized_evidence_context": json.dumps(normalized, ensure_ascii=False)}
+        code: "import json\n\ndef _loads(value, default):\n    if value is None or\
+          \ value == \"\":\n        return default\n    if isinstance(value, (dict,\
+          \ list)):\n        return value\n    try:\n        return json.loads(value)\n\
+          \    except Exception:\n        return default\n\ndef _as_list(value):\n\
+          \    return value if isinstance(value, list) else []\n\ndef _compact_literature(item):\n\
+          \    return {\n        \"literature_id\": item.get(\"literature_id\", \"\
+          unknown\"),\n        \"title\": item.get(\"title\", \"unknown\"),\n    \
+          \    \"authors\": _as_list(item.get(\"authors\")),\n        \"year\": item.get(\"\
+          year\", \"unknown\"),\n        \"doi\": item.get(\"doi\", \"\"),\n     \
+          \   \"url\": item.get(\"url\", \"\"),\n    }\n\ndef _compact_evidence(item,\
+          \ direction):\n    return {\n        \"direction\": direction,\n       \
+          \ \"evidence_id\": item.get(\"evidence_id\", \"unknown\"),\n        \"claim\"\
+          : item.get(\"claim\", \"\"),\n        \"summary\": item.get(\"summary\"\
+          , \"\"),\n        \"source_literature_id\": item.get(\"source_literature_id\"\
+          , \"\"),\n        \"support_direction\": item.get(\"support_direction\"\
+          , direction),\n        \"strength_score\": item.get(\"strength_score\",\
+          \ 0),\n    }\n\ndef main(question_card: str, hypothesis_id: str, hypothesis_evidence_package:\
+          \ str, planning_constraints: str = \"\", user_constraints: str = \"\") ->\
+          \ dict:\n    question = _loads(question_card, {})\n    package = _loads(hypothesis_evidence_package,\
+          \ {})\n    constraints = _loads(planning_constraints, {})\n    user = _loads(user_constraints,\
+          \ {})\n    selected_design = constraints.get(\"selected_design\") if isinstance(constraints,\
+          \ dict) else None\n    if not isinstance(selected_design, dict) or not selected_design:\n\
+          \        raise ValueError(\"planning_constraints.selected_design is required from Workflow B\")\n\
+          \    evidence_subset = package.get(\"evidence_subset\", {}) if isinstance(package,\
+          \ dict) else {}\n\n    evidence_rows = []\n    for key, direction in (\n\
+          \        (\"supporting_evidence\", \"supporting\"),\n        (\"opposing_evidence\"\
+          , \"opposing\"),\n        (\"uncertain_evidence\", \"uncertain\"),\n   \
+          \ ):\n        for item in _as_list(evidence_subset.get(key)):\n        \
+          \    if isinstance(item, dict):\n                evidence_rows.append(_compact_evidence(item,\
+          \ direction))\n\n    source_literature = [\n        _compact_literature(item)\n\
+          \        for item in _as_list(package.get(\"source_literature\"))\n    \
+          \    if isinstance(item, dict)\n    ]\n    knowledge_gaps = [\n        item.get(\"\
+          description\", str(item)) if isinstance(item, dict) else str(item)\n   \
+          \     for item in _as_list(package.get(\"knowledge_gaps\"))\n    ]\n\n \
+          \   normalized = {\n        \"task_scope\": {\n            \"hypothesis_id\"\
+          : hypothesis_id or package.get(\"hypothesis_id\", \"unknown\"),\n      \
+          \      \"core_question\": question.get(\"core_question\", \"unknown\"),\n\
+          \            \"domain\": question.get(\"domain\", []),\n            \"research_object\"\
+          : question.get(\"research_object\", {}),\n            \"hypothesis\": package.get(\"\
+          hypothesis\", \"unknown\"),\n            \"rationale\": package.get(\"rationale\"\
+          , \"\"),\n            \"target_variables\": package.get(\"target_variables\"\
+          , []),\n            \"expected_observation\": package.get(\"expected_observation\"\
+          , \"\"),\n            \"validation_idea\": package.get(\"validation_idea\"\
+          , \"\"),\n        },\n        \"scores\": package.get(\"scores\", {}),\n\
+          \        \"evidence_rows\": evidence_rows,\n        \"source_literature\"\
+          : source_literature,\n        \"knowledge_gaps\": knowledge_gaps,\n    \
+          \    \"limitations\": package.get(\"limitations\", []),\n        \"needs_more_evidence\"\
+          : bool(package.get(\"needs_more_evidence\", False)),\n        \"planning_constraints\"\
+          : constraints,\n        \"user_constraints\": user,\n        \"guardrails\"\
+          : {\n            \"allowed_evidence_ids\": [row.get(\"evidence_id\") for\
+          \ row in evidence_rows],\n            \"allowed_source_ids\": [item.get(\"\
+          literature_id\") for item in source_literature],\n            \"forbidden_actions\"\
+          : constraints.get(\"forbidden_actions\", []),\n            \"allowed_validation_types\"\
+          : constraints.get(\"allowed_validation_types\", []),\n        },\n    }\n\
+          \    return {\"normalized_evidence_context\": json.dumps(normalized, ensure_ascii=False)}\n"
         code_language: python3
-        desc: Parses the single hypothesis package and produces a compact evidence table for downstream LLM nodes.
+        desc: Parses the single hypothesis package and produces a compact evidence
+          table for downstream LLM nodes.
         outputs:
           normalized_evidence_context:
             children: null
             type: string
-        selected: false
+        selected: true
         title: Normalize Evidence Context
         type: code
         variables:
@@ -317,7 +260,7 @@ workflow:
           - start
           - user_constraints
           variable: user_constraints
-      height: 147
+      height: 112
       id: normalize_evidence
       position:
         x: 380
@@ -325,7 +268,7 @@ workflow:
       positionAbsolute:
         x: 380
         y: 240
-      selected: false
+      selected: true
       sourcePosition: right
       targetPosition: left
       type: custom
@@ -334,325 +277,78 @@ workflow:
         context:
           enabled: false
           variable_selector: []
-        desc: Converts normalized evidence into a compact citation-grounded evidence brief.
+        desc: Expands the selected A/B design directly into the final single-hypothesis plan_result.
         model:
           completion_params:
             enable_thinking: false
-            max_tokens: 4096
+            max_tokens: 8192
             response_format: json_object
             temperature: 0.15
           mode: chat
-          name: qwen3.6-flash
+          name: qwen3.6-plus
           provider: langgenius/tongyi/tongyi
         prompt_template:
         - id: system_prompt
           role: system
-          text: |
-            你是 Research Planning Agent 的证据整理子模块。
-            你只输出严格 JSON，不要 Markdown、代码块或解释。
-            任务是把 normalized_evidence_context 转换成 citation-grounded evidence brief。
-            不得新增 evidence_id、source_id、文献、数据集 URL 或实验结果。
-            如果输入没有 opposing 或 uncertain 证据，使用空数组并在 missing_evidence 中说明缺口。
-        - id: user_prompt
-          role: user
-          text: |
-            normalized_evidence_context:
-            {{#normalize_evidence.normalized_evidence_context#}}
+          text: '你是 Research Planning Agent，负责为一个候选科学假设生成完整研究计划。
 
-            输出 JSON 顶层结构：
-            {
-              "schema_version": "planning_agent_evidence_brief_v1",
-              "hypothesis_id": "{{#start.hypothesis_id#}}",
-              "evidence_assessment": {
-                "supporting": [],
-                "opposing": [],
-                "uncertain": []
-              },
-              "source_literature": [],
-              "knowledge_gaps": [],
-              "missing_evidence": [],
-              "confidence": "high | medium | low"
-            }
-        selected: false
-        structured_output:
-          schema:
-            additionalProperties: false
-            properties:
-              confidence:
-                enum:
-                - high
-                - medium
-                - low
-                type: string
-              evidence_assessment:
-                additionalProperties: false
-                properties:
-                  opposing:
-                    items: &evidence_item
-                      additionalProperties: false
-                      properties:
-                        evidence_id:
-                          type: string
-                        claim:
-                          type: string
-                        source_id:
-                          type: string
-                        strength:
-                          type: string
-                        implication:
-                          type: string
-                      required:
-                      - evidence_id
-                      - claim
-                      - source_id
-                      - strength
-                      - implication
-                      type: object
-                    type: array
-                  supporting:
-                    items: *evidence_item
-                    type: array
-                  uncertain:
-                    items: *evidence_item
-                    type: array
-                required:
-                - supporting
-                - opposing
-                - uncertain
-                type: object
-              hypothesis_id:
-                type: string
-              knowledge_gaps:
-                items:
-                  type: string
-                type: array
-              missing_evidence:
-                items:
-                  type: string
-                type: array
-              schema_version:
-                enum:
-                - planning_agent_evidence_brief_v1
-                type: string
-              source_literature:
-                items:
-                  additionalProperties: false
-                  properties:
-                    source_id:
-                      type: string
-                    title:
-                      type: string
-                    used_for:
-                      items:
-                        type: string
-                      type: array
-                  required:
-                  - source_id
-                  - title
-                  - used_for
-                  type: object
-                type: array
-            required:
-            - schema_version
-            - hypothesis_id
-            - evidence_assessment
-            - source_literature
-            - knowledge_gaps
-            - missing_evidence
-            - confidence
-            type: object
-        structured_output_enabled: true
-        title: Build Evidence Brief JSON
-        type: llm
-        variables: []
-        vision:
-          enabled: false
-      height: 147
-      id: evidence_brief
-      position:
-        x: 680
-        y: 240
-      positionAbsolute:
-        x: 680
-        y: 240
-      selected: false
-      sourcePosition: right
-      targetPosition: left
-      type: custom
-      width: 242
-    - data:
-        context:
-          enabled: false
-          variable_selector: []
-        desc: Drafts a research design skeleton before full plan writing.
-        model:
-          completion_params:
-            enable_thinking: false
-            max_tokens: 4096
-            response_format: json_object
-            temperature: 0.2
-          mode: chat
-          name: qwen3.6-flash
-          provider: langgenius/tongyi/tongyi
-        prompt_template:
-        - id: system_prompt
-          role: system
-          text: |
-            你是 Research Planning Agent 的计划骨架设计子模块。
-            你必须只输出严格 JSON。
-            你要把 evidence brief 转成可验证研究设计骨架，优先使用 allowed_validation_types。
-            不能写成已经完成的实验，不能新增文献或真实数据集 URL。
-            如果证据不足，必须把缺口转成 feedback_tasks，而不是直接忽略该假设。
-        - id: user_prompt
-          role: user
-          text: |
-            normalized_evidence_context:
-            {{#normalize_evidence.normalized_evidence_context#}}
-
-            evidence_brief:
-            {{#evidence_brief.text#}}
-
-            输出 JSON 顶层结构：
-            {
-              "schema_version": "planning_agent_plan_skeleton_v1",
-              "hypothesis_id": "{{#start.hypothesis_id#}}",
-              "research_design_type": "unknown",
-              "variables": {},
-              "validation_strategy": {},
-              "data_requirements": [],
-              "analysis_plan": [],
-              "falsification_criteria": [],
-              "feedback_tasks": [],
-              "limitations": []
-            }
-        selected: false
-        structured_output:
-          schema:
-            additionalProperties: false
-            properties:
-              analysis_plan:
-                items:
-                  type: string
-                type: array
-              data_requirements:
-                items:
-                  type: string
-                type: array
-              falsification_criteria:
-                items:
-                  type: string
-                type: array
-              feedback_tasks:
-                items:
-                  additionalProperties: false
-                  properties:
-                    objective:
-                      type: string
-                    task_type:
-                      type: string
-                  required:
-                  - task_type
-                  - objective
-                  type: object
-                type: array
-              hypothesis_id:
-                type: string
-              limitations:
-                items:
-                  type: string
-                type: array
-              research_design_type:
-                type: string
-              schema_version:
-                enum:
-                - planning_agent_plan_skeleton_v1
-                type: string
-              validation_strategy:
-                additionalProperties: true
-                type: object
-              variables:
-                additionalProperties: true
-                type: object
-            required:
-            - schema_version
-            - hypothesis_id
-            - research_design_type
-            - variables
-            - validation_strategy
-            - data_requirements
-            - analysis_plan
-            - falsification_criteria
-            - feedback_tasks
-            - limitations
-            type: object
-        structured_output_enabled: true
-        title: Draft Plan Skeleton JSON
-        type: llm
-        variables: []
-        vision:
-          enabled: false
-      height: 147
-      id: plan_skeleton
-      position:
-        x: 980
-        y: 240
-      positionAbsolute:
-        x: 980
-        y: 240
-      selected: false
-      sourcePosition: right
-      targetPosition: left
-      type: custom
-      width: 242
-    - data:
-        context:
-          enabled: false
-          variable_selector: []
-        desc: Generates a complete single-hypothesis plan_result draft.
-        model:
-          completion_params:
-            enable_thinking: false
-            max_tokens: 16384
-            response_format: json_object
-            temperature: 0.2
-          mode: chat
-          name: qwen3.6-flash
-          provider: langgenius/tongyi/tongyi
-        prompt_template:
-        - id: system_prompt
-          role: system
-          text: |
-            你是 Research Planning Agent，负责为一个候选科学假设生成完整研究计划。
             当前 Workflow 一次只处理一个 hypothesis，批量选择和汇总由本地 wrapper 完成。
+
+            normalized_evidence_context.planning_constraints 必须包含 Workflow B 已接受的 selected_design 和 design_selection。
+
+            必须以 selected_design 为方案基线，只补齐执行步骤、统计分析、证伪标准、资源约束和反馈任务；不得重新发散方案或改变 hypothesis 含义。
+
+            selected_design 缺失属于上游契约错误，Workflow C 不提供独立生成或兼容路径。
+
             你必须只输出一个严格 JSON 对象，且该对象是单个 plan_result。
+
             不要 Markdown，不要代码块，不要解释文字，不要输出 plans 数组。
+
             不要编造不存在的文献、数据集 URL、实验结果或已经完成的实验。
+
             顶层 schema_version 必须是 experiment_planner_plan_result_v1。
+
             顶层 agent_name 必须是 ExperimentPlannerAgent。
+
             顶层 hypothesis_id 必须等于输入 hypothesis_id。
+
             references 只能来自 normalized_evidence_context.source_literature。
+
             rationale.logic_chain[].evidence_ids 只能来自 normalized_evidence_context.guardrails.allowed_evidence_ids。
+
             rationale.logic_chain[].source_ids 和 references[].source_id 只能来自 normalized_evidence_context.guardrails.allowed_source_ids。
+
             如果 needs_more_evidence 为 true，必须生成 feedback_tasks。
+
             成功时 error_message 使用空字符串。
+
+            '
         - id: user_prompt
           role: user
-          text: |
-            task_id: {{#start.task_id#}}
+          text: 'task_id: {{#start.task_id#}}
+
             iteration: {{#start.iteration#}}
+
             hypothesis_id: {{#start.hypothesis_id#}}
 
+
             normalized_evidence_context:
+
             {{#normalize_evidence.normalized_evidence_context#}}
 
-            evidence_brief:
-            {{#evidence_brief.text#}}
 
-            plan_skeleton:
-            {{#plan_skeleton.text#}}
+            请读取 normalized_evidence_context.planning_constraints.selected_design，直接将选中设计扩展成最终计划。
+
+            保留选中设计的 candidate_id、设计类型、变量、基线、指标、步骤和证伪逻辑；仅补齐最终 schema 所需细节。
+
 
             输出必须是单个 experiment_planner_plan_result_v1 JSON，plan 必须包含：
-            problem_statement, rationale, technical_details, datasets, paper_title, paper_abstract, methods, experiments, results, references, feedback_tasks, limitations。
+
+            problem_statement, rationale, technical_details, datasets, paper_title,
+            paper_abstract, methods, experiments, results, references, feedback_tasks,
+            limitations。
+
+            '
         selected: false
         structured_output:
           schema:
@@ -945,12 +641,12 @@ workflow:
             - plan
             type: object
         structured_output_enabled: true
-        title: Generate Full Plan Result JSON
+        title: Generate Final Plan Fast
         type: llm
         variables: []
         vision:
           enabled: false
-      height: 147
+      height: 132
       id: full_plan
       position:
         x: 1280
@@ -964,378 +660,129 @@ workflow:
       type: custom
       width: 242
     - data:
-        context:
-          enabled: false
-          variable_selector: []
-        desc: Silently checks traceability and executable design, then returns the repaired final plan_result.
-        model:
-          completion_params:
-            enable_thinking: false
-            max_tokens: 16384
-            response_format: json_object
-            temperature: 0.05
-          mode: chat
-          name: qwen3.6-flash
-          provider: langgenius/tongyi/tongyi
-        prompt_template:
-        - id: system_prompt
-          role: system
-          text: |
-            你是 Research Planning Agent 的最终质检与修复节点。
-            你必须静默检查 draft_plan，然后只输出修复后的最终 plan_result JSON。
-            不要输出检查报告、Markdown、代码块或 JSON 外文本。
-            不要输出 plans 数组。
-            必须检查并修复：
-            1. rationale.logic_chain[].evidence_ids 是否全部来自 allowed_evidence_ids。
-            2. rationale.logic_chain[].source_ids 和 references[].source_id 是否全部来自 allowed_source_ids。
-            3. references 是否只来自 source_literature，不能新增文献。
-            4. needs_more_evidence=true 时 feedback_tasks 是否非空且可被上游 agent 执行。
-            5. methods.steps[] 是否有明确输入、动作和输出。
-            6. results.falsification_criteria[] 是否说明何种结果会推翻假设。
-            7. 是否把可验证计划写成了已完成结论；如有，改成待验证表述。
-            如果无法完全修复，status 使用 partial_success 或 failed，并在 error_message 说明原因。
-        - id: user_prompt
-          role: user
-          text: |
-            task_id: {{#start.task_id#}}
-            iteration: {{#start.iteration#}}
-            hypothesis_id: {{#start.hypothesis_id#}}
+        code: |
+          import json
 
-            normalized_evidence_context:
-            {{#normalize_evidence.normalized_evidence_context#}}
+          def _loads(value, default):
+              if isinstance(value, (dict, list)):
+                  return value
+              try:
+                  return json.loads(value or "")
+              except Exception:
+                  return default
 
-            evidence_brief:
-            {{#evidence_brief.text#}}
+          def _as_list(value):
+              return value if isinstance(value, list) else []
 
-            plan_skeleton:
-            {{#plan_skeleton.text#}}
+          def _string_ids(values):
+              return {value for value in _as_list(values) if isinstance(value, str) and value}
 
-            draft_plan:
-            {{#full_plan.text#}}
+          def main(plan_payload: dict, normalized_evidence_context: str,
+                   task_id: str, iteration: int, hypothesis_id: str) -> dict:
+              plan_result = _loads(plan_payload, {})
+              context = _loads(normalized_evidence_context, {})
+              issues = []
+              if not isinstance(plan_result, dict):
+                  plan_result = {}
+                  issues.append("plan_result must be an object")
+              if not isinstance(context, dict):
+                  context = {}
+              normalized_identity_fields = []
+              expected_identity = {
+                  "schema_version": "experiment_planner_plan_result_v1",
+                  "agent_name": "ExperimentPlannerAgent",
+                  "task_id": task_id,
+                  "iteration": iteration,
+                  "hypothesis_id": hypothesis_id
+              }
+              for field, expected in expected_identity.items():
+                  if plan_result.get(field) != expected:
+                      normalized_identity_fields.append(field)
+                  plan_result[field] = expected
 
-            请输出最终 experiment_planner_plan_result_v1 JSON。成功时 error_message 为空字符串。
-        selected: true
-        structured_output:
-          schema:
-            additionalProperties: false
-            properties:
-              agent_name:
-                enum:
-                - ExperimentPlannerAgent
-                type: string
-              error_message:
-                type: string
-              hypothesis_id:
-                type: string
-              iteration:
-                type: number
-              plan:
-                additionalProperties: false
-                properties:
-                  datasets:
-                    additionalProperties: false
-                    properties:
-                      source:
-                        items:
-                          type: string
-                        type: array
-                      target:
-                        items:
-                          type: string
-                        type: array
-                    required:
-                    - source
-                    - target
-                    type: object
-                  experiments:
-                    additionalProperties: false
-                    properties:
-                      ablation_or_sensitivity_analysis:
-                        items:
-                          type: string
-                        type: array
-                      baselines:
-                        items:
-                          type: string
-                        type: array
-                      main_experiment:
-                        additionalProperties: true
-                        type: object
-                      metrics:
-                        items:
-                          type: string
-                        type: array
-                      procedure:
-                        items:
-                          type: string
-                        type: array
-                    required:
-                    - main_experiment
-                    - baselines
-                    - metrics
-                    - procedure
-                    - ablation_or_sensitivity_analysis
-                    type: object
-                  feedback_tasks:
-                    items:
-                      additionalProperties: false
-                      properties:
-                        expected_output:
-                          type: string
-                        input_requirements:
-                          items:
-                            type: string
-                          type: array
-                        objective:
-                          type: string
-                        priority:
-                          enum:
-                          - high
-                          - medium
-                          - low
-                          type: string
-                        task_id:
-                          type: string
-                        task_type:
-                          enum:
-                          - literature_supplement
-                          - evidence_collection
-                          - hypothesis_refinement
-                          - validation_design
-                          - other
-                          type: string
-                      required:
-                      - task_id
-                      - task_type
-                      - priority
-                      - objective
-                      - input_requirements
-                      - expected_output
-                      type: object
-                    type: array
-                  limitations:
-                    items:
-                      type: string
-                    type: array
-                  methods:
-                    additionalProperties: false
-                    properties:
-                      overall_design:
-                        type: string
-                      steps:
-                        items:
-                          additionalProperties: false
-                          properties:
-                            description:
-                              type: string
-                            inputs:
-                              items:
-                                type: string
-                              type: array
-                            outputs:
-                              items:
-                                type: string
-                              type: array
-                            step_id:
-                              type: string
-                          required:
-                          - step_id
-                          - description
-                          - inputs
-                          - outputs
-                          type: object
-                        type: array
-                    required:
-                    - overall_design
-                    - steps
-                    type: object
-                  paper_abstract:
-                    type: string
-                  paper_title:
-                    type: string
-                  problem_statement:
-                    type: string
-                  rationale:
-                    additionalProperties: false
-                    properties:
-                      logic_chain:
-                        items:
-                          additionalProperties: false
-                          properties:
-                            claim:
-                              type: string
-                            evidence_ids:
-                              items:
-                                type: string
-                              type: array
-                            source_ids:
-                              items:
-                                type: string
-                              type: array
-                            step:
-                              type: number
-                          required:
-                          - step
-                          - claim
-                          - evidence_ids
-                          - source_ids
-                          type: object
-                        type: array
-                      text:
-                        type: string
-                    required:
-                    - text
-                    - logic_chain
-                    type: object
-                  references:
-                    items:
-                      additionalProperties: false
-                      properties:
-                        authors:
-                          items:
-                            type: string
-                          type: array
-                        doi:
-                          type: string
-                        source_id:
-                          type: string
-                        title:
-                          type: string
-                        url:
-                          type: string
-                        used_for:
-                          items:
-                            type: string
-                          type: array
-                        year:
-                          type: string
-                      required:
-                      - source_id
-                      - title
-                      - authors
-                      - year
-                      - doi
-                      - url
-                      - used_for
-                      type: object
-                    type: array
-                  results:
-                    additionalProperties: false
-                    properties:
-                      expected_findings:
-                        items:
-                          type: string
-                        type: array
-                      falsification_criteria:
-                        items:
-                          type: string
-                        type: array
-                      feasibility_check:
-                        type: string
-                      result_type:
-                        enum:
-                        - expected_or_feasibility_result
-                        - planned_evaluation_result
-                        - unknown
-                        type: string
-                    required:
-                    - result_type
-                    - expected_findings
-                    - feasibility_check
-                    - falsification_criteria
-                    type: object
-                  technical_details:
-                    additionalProperties: false
-                    properties:
-                      candidate_models_or_algorithms:
-                        items:
-                          type: string
-                        type: array
-                      required_methods:
-                        items:
-                          type: string
-                        type: array
-                      software_stack:
-                        items:
-                          type: string
-                        type: array
-                      statistical_tests:
-                        items:
-                          type: string
-                        type: array
-                    required:
-                    - required_methods
-                    - candidate_models_or_algorithms
-                    - statistical_tests
-                    - software_stack
-                    type: object
-                required:
-                - problem_statement
-                - rationale
-                - technical_details
-                - datasets
-                - paper_title
-                - paper_abstract
-                - methods
-                - experiments
-                - results
-                - references
-                - feedback_tasks
-                - limitations
-                type: object
-              schema_version:
-                enum:
-                - experiment_planner_plan_result_v1
-                type: string
-              status:
-                enum:
-                - success
-                - partial_success
-                - failed
-                type: string
-              task_id:
-                type: string
-            required:
-            - schema_version
-            - agent_name
-            - task_id
-            - iteration
-            - hypothesis_id
-            - status
-            - error_message
-            - plan
-            type: object
-        structured_output_enabled: true
-        title: Critic and Repair Plan Result JSON
-        type: llm
-        variables: []
-        vision:
-          enabled: false
-      height: 147
-      id: critic_repair
-      position:
-        x: 1580
-        y: 240
-      positionAbsolute:
-        x: 1580
-        y: 240
-      selected: true
-      sourcePosition: right
-      targetPosition: left
-      type: custom
-      width: 242
-    - data:
-        desc: Returns the final repaired single plan_result JSON string.
+              plan = plan_result.get("plan")
+              if not isinstance(plan, dict):
+                  plan = {}
+                  plan_result["plan"] = plan
+                  issues.append("plan must be an object")
+
+              guardrails = context.get("guardrails", {})
+              if not isinstance(guardrails, dict):
+                  guardrails = {}
+              allowed_evidence = _string_ids(guardrails.get("allowed_evidence_ids"))
+              allowed_sources = _string_ids(guardrails.get("allowed_source_ids"))
+              referenced_evidence = set()
+              referenced_sources = set()
+
+              rationale = plan.get("rationale", {})
+              if isinstance(rationale, dict):
+                  for item in _as_list(rationale.get("logic_chain")):
+                      if isinstance(item, dict):
+                          referenced_evidence.update(_string_ids(item.get("evidence_ids")))
+                          referenced_sources.update(_string_ids(item.get("source_ids")))
+              for item in _as_list(plan.get("references")):
+                  if isinstance(item, dict):
+                      source_id = item.get("source_id")
+                      if isinstance(source_id, str) and source_id:
+                          referenced_sources.add(source_id)
+
+              unknown_evidence_ids = sorted(referenced_evidence - allowed_evidence)
+              unknown_source_ids = sorted(referenced_sources - allowed_sources)
+              if unknown_evidence_ids:
+                  issues.append("unknown evidence_ids: " + ", ".join(unknown_evidence_ids))
+              if unknown_source_ids:
+                  issues.append("unknown source_ids: " + ", ".join(unknown_source_ids))
+              if issues:
+                  plan_result["status"] = "failed"
+                  plan_result["error_message"] = "; ".join(issues)
+              report = {
+                  "passed": not issues,
+                  "issues": issues,
+                  "normalized_identity_fields": normalized_identity_fields,
+                  "allowed_evidence_count": len(allowed_evidence),
+                  "allowed_source_count": len(allowed_sources),
+                  "unknown_evidence_ids": unknown_evidence_ids,
+                  "unknown_source_ids": unknown_source_ids
+              }
+              return {
+                  "plan_result": json.dumps(plan_result, ensure_ascii=False),
+                  "contract_report": json.dumps(report, ensure_ascii=False)
+              }
+        code_language: python3
+        desc: Normalizes identity fields and validates final evidence/source references against deterministic allowlists.
         outputs:
-        - value_selector:
-          - critic_repair
-          - text
-          variable: plan_result
+          contract_report:
+            children: null
+            type: string
+          plan_result:
+            children: null
+            type: string
         selected: false
-        title: End
-        type: end
-      height: 131
-      id: end
+        title: Normalize Final Plan Contract
+        type: code
+        variables:
+        - value_selector:
+          - full_plan
+          - structured_output
+          variable: plan_payload
+        - value_selector:
+          - normalize_evidence
+          - normalized_evidence_context
+          variable: normalized_evidence_context
+        - value_selector:
+          - start
+          - task_id
+          variable: task_id
+        - value_selector:
+          - start
+          - iteration
+          variable: iteration
+        - value_selector:
+          - start
+          - hypothesis_id
+          variable: hypothesis_id
+      height: 148
+      id: final_contract
       position:
         x: 1880
         y: 240
@@ -1347,8 +794,35 @@ workflow:
       targetPosition: left
       type: custom
       width: 242
+    - data:
+        desc: Returns the normalized final plan_result and contract report.
+        outputs:
+        - value_selector:
+          - final_contract
+          - plan_result
+          variable: plan_result
+        - value_selector:
+          - final_contract
+          - contract_report
+          variable: contract_report
+        selected: false
+        title: End
+        type: end
+      height: 132
+      id: end
+      position:
+        x: 2200
+        y: 240
+      positionAbsolute:
+        x: 2200
+        y: 240
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
     viewport:
-      x: -450
-      y: 0
-      zoom: 0.7
+      x: -482.6324456507946
+      y: 235.80870671523553
+      zoom: 0.9803467566080696
   rag_pipeline_variables: []

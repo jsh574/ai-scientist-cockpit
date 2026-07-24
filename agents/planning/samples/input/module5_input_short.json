@@ -2,6 +2,7 @@
   "schema_version": "experiment_planner_input_v1",
   "task_id": "task_short_001",
   "iteration": 1,
+  "_feedback": "FEEDBACK_E2E_SHORT_001: 优先使用公开数据集，并补充功效分析。",
   "request_mode": "batch",
   "question_card": {
     "question_id": "q_short_001",

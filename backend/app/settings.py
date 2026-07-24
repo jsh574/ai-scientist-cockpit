@@ -13,14 +13,22 @@ def _load_env_file(path: Path) -> None:
         return
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
-_load_env_file(PROJECT_ROOT / ".env")
-_load_env_file(PROJECT_ROOT / "backend" / ".env")
+def _load_environment_files(project_root: Path = PROJECT_ROOT) -> None:
+    """Load controller and agent-local env files without overriding process env."""
+    _load_env_file(project_root / ".env")
+    _load_env_file(project_root / "agents" / "planning" / ".env")
+    _load_env_file(project_root / "backend" / ".env")
+
+
+_load_environment_files()
 
 
 def _resolve_project_path(value: str | None, default: Path) -> Path:
@@ -81,24 +89,24 @@ class Settings:
 
     def source_status(self) -> dict[str, dict[str, object]]:
         any_credential = bool(
-            os.getenv("DASHSCOPE_API_KEY")
-            or os.getenv("QWEN_API_KEY")
-            or os.getenv("LLM_API_KEY")
+            os.getenv("DASHSCOPE_API_KEY") or os.getenv("QWEN_API_KEY") or os.getenv("LLM_API_KEY")
         )
         dashscope_credential = bool(os.getenv("DASHSCOPE_API_KEY"))
         qwen_credential = bool(os.getenv("DASHSCOPE_API_KEY") or os.getenv("QWEN_API_KEY"))
-        dify_credential = bool(os.getenv("DIFY_API_URL") and os.getenv("DIFY_API_KEY"))
+        dify_credential = all(
+            bool(
+                (os.getenv(f"DIFY_WORKFLOW_{stage}_API_URL") or os.getenv("DIFY_API_URL"))
+                and os.getenv(f"DIFY_WORKFLOW_{stage}_API_KEY")
+            )
+            for stage in "ABC"
+        )
         evidence_mapping_mode = os.getenv("EVIDENCE_MAPPING_MODE", "auto").strip().lower()
         if evidence_mapping_mode not in {"auto", "llm", "rules"}:
             evidence_mapping_mode = "auto"
         evidence_mapping_status_mode = {
             "rules": "rule_engine",
             "llm": "model",
-            "auto": (
-                "llm_with_rule_fallback"
-                if any_credential
-                else "rule_engine_fallback"
-            ),
+            "auto": ("llm_with_rule_fallback" if any_credential else "rule_engine_fallback"),
         }[evidence_mapping_mode]
 
         def status(

@@ -4,10 +4,11 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-
 REQUIRED_INPUT_FIELDS = (
+    "schema_version",
     "task_id",
     "iteration",
+    "request_mode",
     "question_card",
     "hypothesis_cards",
     "evidence_map",
@@ -21,6 +22,12 @@ def validate_planner_input(data: Mapping[str, Any]) -> list[str]:
     for field in REQUIRED_INPUT_FIELDS:
         if field not in data:
             errors.append(f"Missing required field: {field}")
+
+    if "schema_version" in data and data.get("schema_version") != "experiment_planner_input_v1":
+        errors.append("Field must equal experiment_planner_input_v1: schema_version")
+
+    if "request_mode" in data and data.get("request_mode") not in {"single", "batch"}:
+        errors.append("Field must be single or batch: request_mode")
 
     list_fields = (
         "hypothesis_cards",

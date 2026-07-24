@@ -1,0 +1,418 @@
+{
+  "schema_version": "experiment_planner_input_v1",
+  "task_id": "task_rag_batch_001",
+  "iteration": 1,
+  "request_mode": "batch",
+  "question_card": {
+    "question_id": "q_rag_batch_001",
+    "original_question": "在有限推理预算下，如何提高检索增强生成系统回答的事实一致性和可追溯性？",
+    "core_question": "检索重排、自适应检索和冲突证据过滤分别如何影响领域问答的事实准确率、引用可追溯性与推理成本？",
+    "question_type": "method_comparison",
+    "domain": [
+      "natural_language_processing",
+      "information_retrieval",
+      "large_language_models"
+    ],
+    "research_object": {
+      "name": "检索增强生成系统",
+      "type": "ai_system",
+      "aliases": [
+        "retrieval-augmented generation",
+        "RAG"
+      ]
+    },
+    "key_variables": [
+      {
+        "name": "检索与重排策略",
+        "type": "causal_factor",
+        "role": "system_design"
+      },
+      {
+        "name": "检索证据质量",
+        "type": "mediator",
+        "role": "evidence_quality"
+      },
+      {
+        "name": "事实一致性",
+        "type": "outcome",
+        "role": "primary_endpoint"
+      },
+      {
+        "name": "推理成本",
+        "type": "outcome",
+        "role": "resource_endpoint"
+      }
+    ],
+    "sub_questions": [
+      {
+        "sub_question_id": "sq_rag_001",
+        "content": "重排和证据过滤是否比单纯增加 top-k 更有效？"
+      },
+      {
+        "sub_question_id": "sq_rag_002",
+        "content": "是否可以只在模型不确定时触发检索，以降低成本？"
+      },
+      {
+        "sub_question_id": "sq_rag_003",
+        "content": "冲突或无关文档会在什么条件下破坏生成答案？"
+      }
+    ],
+    "research_scope": {
+      "included": [
+        "公开问答数据集上的离线评估",
+        "检索与生成模块的消融实验",
+        "事实准确率、引用质量和推理成本比较"
+      ],
+      "excluded": [
+        "训练新的基础模型",
+        "使用非公开用户数据",
+        "宣称已完成未实际执行的实验"
+      ]
+    }
+  },
+  "hypothesis_cards": [
+    {
+      "hypothesis_id": "hyp_rag_001",
+      "statement": "在相同检索条数下，加入相关性重排和证据去重会比仅使用稠密检索 top-k 获得更高的事实准确率和引用可追溯性。",
+      "rationale": "RAG 和 DPR 证明了检索对知识密集型任务的价值，但原始 top-k 中仍可能包含冗余或弱相关文档，因此排序质量可能比检索数量更关键。",
+      "based_on_evidence_ids": [
+        "ev_rag_001",
+        "ev_rag_002"
+      ],
+      "related_gap_ids": [
+        "gap_rag_001"
+      ],
+      "target_variables": [
+        "重排策略",
+        "证据冗余度",
+        "事实准确率",
+        "引用可追溯性"
+      ],
+      "expected_observation": "重排加去重方案在固定 top-k 和相同生成模型下提高答案准确率与引用支持率，并减少无效上下文比例。",
+      "validation_idea": "在公开知识密集型问答数据集上比较 dense top-k、dense+rerank 和 dense+rerank+deduplicate，并进行配对显著性检验。",
+      "initial_scores": {
+        "novelty": 0.62,
+        "testability": 0.94,
+        "relevance": 0.91,
+        "risk": 0.24
+      }
+    },
+    {
+      "hypothesis_id": "hyp_rag_002",
+      "statement": "基于生成模型不确定性的自适应检索门控可以在基本保持事实准确率的同时，降低平均检索调用次数和上下文 token 消耗。",
+      "rationale": "Self-RAG 表明按需检索和自我反思可能优于固定检索流程，但在统一预算下的质量—成本边界仍需明确验证。",
+      "based_on_evidence_ids": [
+        "ev_rag_003",
+        "ev_rag_004"
+      ],
+      "related_gap_ids": [
+        "gap_rag_002"
+      ],
+      "target_variables": [
+        "检索门控阈值",
+        "模型不确定性",
+        "事实准确率",
+        "检索调用次数",
+        "上下文 token 数"
+      ],
+      "expected_observation": "中等门控阈值下的准确率与固定检索接近，但平均检索次数、延迟和 token 消耗更低。",
+      "validation_idea": "对固定检索、从不检索和多档门控阈值进行成本—质量曲线比较，并报告非劣效区间。",
+      "initial_scores": {
+        "novelty": 0.76,
+        "testability": 0.86,
+        "relevance": 0.89,
+        "risk": 0.38
+      }
+    },
+    {
+      "hypothesis_id": "hyp_rag_003",
+      "statement": "当检索结果包含与问题主题相关但结论冲突的文档时，显式冲突检测比单纯降低相似度阈值更能保持回答校准度和事实一致性。",
+      "rationale": "现有 RAG 系统通常按相关性选择上下文，但相关并不等于一致；冲突证据可能诱导模型生成过度确定的综合结论。",
+      "based_on_evidence_ids": [
+        "ev_rag_001",
+        "ev_rag_005"
+      ],
+      "related_gap_ids": [
+        "gap_rag_003"
+      ],
+      "target_variables": [
+        "冲突证据比例",
+        "冲突检测策略",
+        "回答校准度",
+        "事实一致性"
+      ],
+      "expected_observation": "随着冲突文档比例升高，普通 RAG 的准确率和校准度下降更快；冲突标记或过滤能减缓下降。",
+      "validation_idea": "构造可控的无关、支持和冲突文档混合比例，比较相似度过滤与显式冲突检测的鲁棒性曲线。",
+      "initial_scores": {
+        "novelty": 0.81,
+        "testability": 0.78,
+        "relevance": 0.85,
+        "risk": 0.49
+      }
+    }
+  ],
+  "evidence_map": [
+    {
+      "hypothesis_id": "hyp_rag_001",
+      "supporting_evidence_ids": [
+        "ev_rag_001",
+        "ev_rag_002"
+      ],
+      "opposing_evidence_ids": [],
+      "uncertain_evidence_ids": [
+        "ev_rag_004"
+      ],
+      "evidence_summary": {
+        "support": "RAG 与 DPR 的结果支持高质量检索能够改善知识密集型问答。",
+        "oppose": "",
+        "uncertain": "检索质量收益是否主要来自重排、去重还是更强的检索器尚未分离。"
+      },
+      "evidence_strength_score": 0.81,
+      "main_limitations": [
+        "不同研究使用的生成模型和评估指标不一致",
+        "重排与去重的独立贡献需要消融"
+      ],
+      "needs_more_evidence": false,
+      "detailed_review": {}
+    },
+    {
+      "hypothesis_id": "hyp_rag_002",
+      "supporting_evidence_ids": [
+        "ev_rag_003"
+      ],
+      "opposing_evidence_ids": [
+        "ev_rag_004"
+      ],
+      "uncertain_evidence_ids": [],
+      "evidence_summary": {
+        "support": "Self-RAG 支持按需检索和反思式生成能够改善质量与可控性。",
+        "oppose": "对知识密集型问题跳过检索可能造成不可接受的事实损失。",
+        "uncertain": ""
+      },
+      "evidence_strength_score": 0.69,
+      "main_limitations": [
+        "不确定性分数可能未校准",
+        "不同问题类型的最优阈值可能不同"
+      ],
+      "needs_more_evidence": true,
+      "detailed_review": {}
+    },
+    {
+      "hypothesis_id": "hyp_rag_003",
+      "supporting_evidence_ids": [
+        "ev_rag_005"
+      ],
+      "opposing_evidence_ids": [],
+      "uncertain_evidence_ids": [
+        "ev_rag_001"
+      ],
+      "evidence_summary": {
+        "support": "可控检索和批判机制提示模型需要判断证据是否足以支持生成内容。",
+        "oppose": "",
+        "uncertain": "现有证据不足以确定显式冲突检测一定优于简单相关性过滤。"
+      },
+      "evidence_strength_score": 0.58,
+      "main_limitations": [
+        "缺少统一的冲突证据基准",
+        "冲突检测器自身可能产生误判"
+      ],
+      "needs_more_evidence": true,
+      "detailed_review": {}
+    }
+  ],
+  "literature_cards": [
+    {
+      "literature_id": "lit_rag_001",
+      "title": "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks",
+      "authors": [
+        "Patrick Lewis",
+        "Ethan Perez",
+        "Aleksandra Piktus",
+        "Fabio Petroni"
+      ],
+      "year": 2020,
+      "source": "Advances in Neural Information Processing Systems",
+      "doi": "",
+      "url": "https://arxiv.org/abs/2005.11401",
+      "literature_type": "paper",
+      "relevance_score": 0.95,
+      "main_findings": [
+        "将参数化生成模型与非参数化检索记忆结合，可改善多项知识密集型 NLP 任务。"
+      ],
+      "related_concepts": [
+        "retrieval-augmented generation",
+        "knowledge-intensive NLP",
+        "factual generation"
+      ]
+    },
+    {
+      "literature_id": "lit_rag_002",
+      "title": "Dense Passage Retrieval for Open-Domain Question Answering",
+      "authors": [
+        "Vladimir Karpukhin",
+        "Barlas Oğuz",
+        "Sewon Min",
+        "Patrick Lewis"
+      ],
+      "year": 2020,
+      "source": "Proceedings of EMNLP",
+      "doi": "10.18653/v1/2020.emnlp-main.550",
+      "url": "https://aclanthology.org/2020.emnlp-main.550/",
+      "literature_type": "paper",
+      "relevance_score": 0.92,
+      "main_findings": [
+        "稠密段落检索在多个开放域问答基准上优于传统稀疏检索基线。"
+      ],
+      "related_concepts": [
+        "dense retrieval",
+        "open-domain question answering"
+      ]
+    },
+    {
+      "literature_id": "lit_rag_003",
+      "title": "Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection",
+      "authors": [
+        "Akari Asai",
+        "Zeqiu Wu",
+        "Yizhong Wang",
+        "Avirup Sil",
+        "Hannaneh Hajishirzi"
+      ],
+      "year": 2024,
+      "source": "International Conference on Learning Representations",
+      "doi": "",
+      "url": "https://arxiv.org/abs/2310.11511",
+      "literature_type": "paper",
+      "relevance_score": 0.94,
+      "main_findings": [
+        "通过按需检索和反思标记，模型可以对生成内容及证据支持情况进行自我评估。"
+      ],
+      "related_concepts": [
+        "adaptive retrieval",
+        "self-reflection",
+        "attribution"
+      ]
+    }
+  ],
+  "evidence_cards": [
+    {
+      "evidence_id": "ev_rag_001",
+      "claim": "检索增强生成在知识密集型任务上能够提高答案的事实性和可解释来源能力。",
+      "source_literature_id": "lit_rag_001",
+      "evidence_type": "experimental_result",
+      "support_direction": "support",
+      "related_concepts": [
+        "RAG",
+        "factuality"
+      ],
+      "strength_score": 0.86,
+      "summary": "RAG 将检索文档作为生成上下文，并在多个知识密集型任务上展示收益。"
+    },
+    {
+      "evidence_id": "ev_rag_002",
+      "claim": "稠密检索器能够提高开放域问答的相关段落召回率。",
+      "source_literature_id": "lit_rag_002",
+      "evidence_type": "experimental_result",
+      "support_direction": "support",
+      "related_concepts": [
+        "dense retrieval",
+        "passage recall"
+      ],
+      "strength_score": 0.84,
+      "summary": "DPR 在标准开放域问答基准上取得比 BM25 更好的检索与端到端结果。"
+    },
+    {
+      "evidence_id": "ev_rag_003",
+      "claim": "按需检索和生成后反思可以改善回答质量及证据归因。",
+      "source_literature_id": "lit_rag_003",
+      "evidence_type": "experimental_result",
+      "support_direction": "support",
+      "related_concepts": [
+        "adaptive retrieval",
+        "self-reflection"
+      ],
+      "strength_score": 0.79,
+      "summary": "Self-RAG 使用反思标记控制检索并批判生成结果。"
+    },
+    {
+      "evidence_id": "ev_rag_004",
+      "claim": "对于高度依赖外部知识的问题，跳过检索可能降低答案事实准确率。",
+      "source_literature_id": "lit_rag_001",
+      "evidence_type": "methodological_uncertainty",
+      "support_direction": "oppose",
+      "related_concepts": [
+        "retrieval gating",
+        "knowledge-intensive questions"
+      ],
+      "strength_score": 0.61,
+      "summary": "RAG 的任务收益说明固定关闭检索不是可靠基线，自适应门控需要约束漏检风险。"
+    },
+    {
+      "evidence_id": "ev_rag_005",
+      "claim": "仅依赖检索相关性不足以保证每段证据都支持最终生成内容。",
+      "source_literature_id": "lit_rag_003",
+      "evidence_type": "theoretical_argument",
+      "support_direction": "uncertain",
+      "related_concepts": [
+        "evidence support",
+        "conflicting context",
+        "attribution"
+      ],
+      "strength_score": 0.57,
+      "summary": "Self-RAG 引入对证据支持情况的批判，间接表明相关性与充分支持并不等价。"
+    }
+  ],
+  "knowledge_gaps": [
+    {
+      "gap_id": "gap_rag_001",
+      "description": "在固定检索预算下，重排和证据去重对最终答案质量的独立贡献尚不清楚。",
+      "related_concepts": [
+        "reranking",
+        "deduplication",
+        "context quality"
+      ],
+      "importance_score": 0.82
+    },
+    {
+      "gap_id": "gap_rag_002",
+      "description": "自适应检索门控在事实准确率、延迟和 token 成本之间的稳定非劣效区间尚未明确。",
+      "related_concepts": [
+        "adaptive retrieval",
+        "cost-quality tradeoff"
+      ],
+      "importance_score": 0.88
+    },
+    {
+      "gap_id": "gap_rag_003",
+      "description": "相关但相互冲突的检索证据如何影响生成模型校准度，缺少可控对照实验。",
+      "related_concepts": [
+        "conflicting evidence",
+        "calibration",
+        "robustness"
+      ],
+      "importance_score": 0.86
+    }
+  ],
+  "user_constraints": {
+    "language": "zh",
+    "domain_preference": "artificial_intelligence",
+    "max_hypotheses": 3,
+    "output_detail_level": "standard"
+  },
+  "planning_constraints": {
+    "plan_depth": "standard",
+    "resource_level": "demo",
+    "allowed_validation_types": [
+      "public_dataset_analysis",
+      "statistical_test",
+      "simulation",
+      "literature_based_feasibility"
+    ],
+    "forbidden_actions": [
+      "invent_references",
+      "invent_dataset_url",
+      "claim_real_experiment_completed_without_execution"
+    ],
+    "preferred_output_language": "zh-CN"
+  }
+}

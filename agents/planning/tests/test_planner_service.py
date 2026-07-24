@@ -1,192 +1,193 @@
-import json
-
 from planning_agent.sample_data import sample_planner_input
 from planning_agent.service import run_planning_agent
 
 
-class FakeSingleHypothesisDifyClient:
-    configured = True
-
-    def __init__(self):
+class FakeWorkflowChainRunner:
+    def __init__(
+        self,
+        *,
+        decision: str = "accept",
+        configured_stages: tuple[str, ...] = ("A", "B", "C"),
+        invalid_trace_ids: bool = False,
+        wrong_identity: bool = False,
+    ) -> None:
+        self.decision = decision
+        self.configured_stages = configured_stages
+        self.invalid_trace_ids = invalid_trace_ids
+        self.wrong_identity = wrong_identity
         self.calls = []
 
-    def run_workflow(self, inputs):
-        self.calls.append(inputs)
-        package = json.loads(inputs["hypothesis_evidence_package"])
-        source_ids = [source["literature_id"] for source in package["source_literature"]]
-        evidence_ids = [
-            evidence["evidence_id"]
-            for evidence in package["evidence_subset"]["supporting_evidence"]
+    def configuration_summary(self):
+        return [
+            {
+                "name": f"workflow_{stage.lower()}",
+                "configured": stage in self.configured_stages,
+            }
+            for stage in "ABC"
         ]
-        return {
+
+    def run_batch(self, data, **options):
+        self.calls.append((data, options))
+        runs = [self._run_for_hypothesis(data, card) for card in data["hypothesis_cards"]]
+        status = "success" if self.decision == "accept" else "requires_action"
+        return {"status": status, "errors": [], "hypothesis_runs": runs}
+
+    def _run_for_hypothesis(self, data, card):
+        hypothesis_id = card["hypothesis_id"]
+        if self.decision != "accept":
+            return {
+                "hypothesis_id": hypothesis_id,
+                "status": "requires_action",
+                "decision": self.decision,
+                "next_action": "request_upstream_feedback",
+                "final_result": None,
+                "errors": [],
+            }
+        evidence_ids = ["ev_001", "ev_invented"] if self.invalid_trace_ids else []
+        references = (
+            [
+                {"source_id": "lit_001", "used_for": ["rationale"]},
+                {"source_id": "lit_invented", "used_for": ["rationale"]},
+            ]
+            if self.invalid_trace_ids
+            else []
+        )
+        result = {
             "schema_version": "experiment_planner_plan_result_v1",
             "agent_name": "ExperimentPlannerAgent",
-            "task_id": inputs["task_id"],
-            "iteration": inputs["iteration"],
-            "hypothesis_id": package["hypothesis_id"],
+            "task_id": data["task_id"],
+            "iteration": data["iteration"],
+            "hypothesis_id": hypothesis_id,
             "status": "success",
             "error_message": "",
             "plan": {
-                "problem_statement": package["hypothesis"],
+                "problem_statement": f"ABC plan for {hypothesis_id}",
                 "rationale": {
-                    "text": package["rationale"],
                     "logic_chain": [
                         {
-                            "step": 1,
-                            "claim": package["hypothesis"],
+                            "claim": "Test claim",
                             "evidence_ids": evidence_ids,
-                            "source_ids": source_ids,
+                            "source_ids": [item["source_id"] for item in references],
                         }
-                    ],
+                    ]
                 },
-                "technical_details": {
-                    "required_methods": ["public dataset analysis"],
-                    "candidate_models_or_algorithms": ["regression"],
-                    "statistical_tests": ["correlation"],
-                    "software_stack": ["Python"],
-                },
-                "datasets": {"source": [], "target": []},
-                "paper_title": "demo",
-                "paper_abstract": "demo",
-                "methods": {"overall_design": "demo", "steps": []},
-                "experiments": {
-                    "main_experiment": {
-                        "objective": package["expected_observation"],
-                        "independent_variables": [],
-                        "dependent_variables": [],
-                        "control_variables": [],
-                    },
-                    "baselines": [],
-                    "metrics": [],
-                    "procedure": [],
-                    "ablation_or_sensitivity_analysis": [],
-                },
-                "results": {
-                    "result_type": "expected_or_feasibility_result",
-                    "expected_findings": [],
-                    "feasibility_check": package["validation_idea"],
-                    "falsification_criteria": [],
-                },
-                "references": [
-                    {
-                        "source_id": source["literature_id"],
-                        "title": source["title"],
-                        "authors": source["authors"],
-                        "year": str(source["year"]),
-                        "doi": source["doi"],
-                        "url": source["url"],
-                        "used_for": ["rationale"],
-                    }
-                    for source in package["source_literature"]
-                ],
-                "feedback_tasks": [
-                    {
-                        "task_id": f"fb_{package['hypothesis_id']}",
-                        "task_type": "literature_supplement",
-                        "priority": "high",
-                        "objective": "补充证据",
-                        "input_requirements": [package["hypothesis_id"]],
-                        "expected_output": "补充证据卡片",
-                    }
-                ],
-                "limitations": package["limitations"],
+                "references": references,
+                "feedback_tasks": [],
             },
+        }
+        if self.wrong_identity:
+            result.update(
+                {
+                    "schema_version": "wrong",
+                    "agent_name": "wrong",
+                    "task_id": "wrong",
+                    "iteration": 99,
+                    "hypothesis_id": "wrong",
+                }
+            )
+        return {
+            "hypothesis_id": hypothesis_id,
+            "status": "success",
+            "decision": "accept",
+            "next_action": "continue_to_product",
+            "final_result": result,
+            "errors": [],
         }
 
 
-class UnconfiguredDifyClient:
-    configured = False
-
-    def run_workflow(self, inputs):
-        raise AssertionError("unconfigured client should not be called")
-
-
-def test_run_planning_agent_calls_dify_once_per_selected_hypothesis_and_aggregates_plans():
+def test_run_planning_agent_runs_complete_chain_for_selected_hypotheses():
     data = sample_planner_input()
-    client = FakeSingleHypothesisDifyClient()
+    runner = FakeWorkflowChainRunner()
 
-    response = run_planning_agent(data, dify_client=client)
+    response = run_planning_agent(data, workflow_runner=runner)
 
     assert response["metadata"]["task_id"] == data["task_id"]
-    assert response["metadata"]["agent_id"] == "research_planning_agent"
-    assert response["metadata"]["stage"] == "research_planning"
     assert response["metadata"]["status"] == "success"
     assert response["self_review"]["passed"] is True
-    payload = response["payload"]
-    assert payload["schema_version"] == "experiment_planner_output_v1"
-    assert payload["task_id"] == data["task_id"]
-    assert payload["iteration"] == data["iteration"]
-    assert [plan["hypothesis_id"] for plan in payload["plans"]] == ["hyp_001", "hyp_002"]
-    assert [json.loads(call["hypothesis_evidence_package"])["hypothesis_id"] for call in client.calls] == [
+    assert [plan["hypothesis_id"] for plan in response["payload"]["plans"]] == [
         "hyp_001",
         "hyp_002",
     ]
-    assert all("hypothesis_evidence_packages" not in call for call in client.calls)
+    chain_input, options = runner.calls[0]
+    assert [card["hypothesis_id"] for card in chain_input["hypothesis_cards"]] == [
+        "hyp_001",
+        "hyp_002",
+    ]
+    assert options["max_parallel_hypotheses"] == 1
 
 
-def test_generated_plan_uses_only_input_references_and_evidence_ids():
+def test_run_planning_agent_passes_feedback_and_execution_options_to_chain():
     data = sample_planner_input()
-    valid_literature_ids = {item["literature_id"] for item in data["literature_cards"]}
-    valid_evidence_ids = {item["evidence_id"] for item in data["evidence_cards"]}
+    data["_feedback"] = "Reduce the sample size for this revision."
+    runner = FakeWorkflowChainRunner()
 
-    response = run_planning_agent(data, dify_client=FakeSingleHypothesisDifyClient())
-    first_plan = response["payload"]["plans"][0]["plan"]
-
-    assert {ref["source_id"] for ref in first_plan["references"]} <= valid_literature_ids
-    logic_evidence_ids = {
-        evidence_id
-        for step in first_plan["rationale"]["logic_chain"]
-        for evidence_id in step["evidence_ids"]
-    }
-    assert logic_evidence_ids <= valid_evidence_ids
-
-
-def test_needs_more_evidence_becomes_feedback_task():
-    data = sample_planner_input()
-
-    response = run_planning_agent(data, dify_client=FakeSingleHypothesisDifyClient())
-    first_plan = response["payload"]["plans"][0]["plan"]
-
-    assert any(
-        task["task_type"] == "literature_supplement" for task in first_plan["feedback_tasks"]
+    response = run_planning_agent(
+        data,
+        workflow_runner=runner,
+        max_packages=1,
+        max_parallel_calls=2,
     )
 
+    assert response["metadata"]["status"] == "success"
+    chain_input, options = runner.calls[0]
+    assert chain_input["_feedback"] == data["_feedback"]
+    assert len(chain_input["hypothesis_cards"]) == 1
+    assert options["max_parallel_hypotheses"] == 2
 
-def test_validation_failure_returns_failed_response():
+
+def test_validation_failure_returns_failed_response_without_running_chain():
     data = sample_planner_input()
     data.pop("question_card")
+    runner = FakeWorkflowChainRunner()
 
-    response = run_planning_agent(data)
+    response = run_planning_agent(data, workflow_runner=runner)
 
     assert response["metadata"]["status"] == "failed"
     assert response["payload"]["status"] == "failed"
     assert response["self_review"]["passed"] is False
-    assert response["self_review"]["issues"]
+    assert runner.calls == []
 
 
-def test_dify_not_configured_returns_failed_response():
-    data = sample_planner_input()
+def test_incomplete_abc_configuration_returns_failed_response():
+    runner = FakeWorkflowChainRunner(configured_stages=("A", "B"))
 
-    response = run_planning_agent(data, dify_client=UnconfiguredDifyClient())
+    response = run_planning_agent(sample_planner_input(), workflow_runner=runner)
 
     assert response["metadata"]["status"] == "failed"
-    assert response["payload"]["status"] == "failed"
-    assert "Dify workflow is not configured" in response["self_review"]["issues"][0]
+    assert "DIFY_WORKFLOW_C_API_KEY" in response["self_review"]["issues"][0]
+    assert "workflow_c" in response["self_review"]["issues"][0]
+    assert runner.calls == []
 
 
-class RecordingDifyClient(FakeSingleHypothesisDifyClient):
-    pass
+def test_feedback_required_is_exposed_as_failed_plan_item():
+    runner = FakeWorkflowChainRunner(decision="feedback_required")
+
+    response = run_planning_agent(sample_planner_input(), workflow_runner=runner, max_packages=1)
+
+    assert response["metadata"]["status"] == "failed"
+    assert "decision=feedback_required" in response["payload"]["plans"][0]["error_message"]
 
 
-def test_run_planning_agent_can_call_selected_hypotheses_in_parallel_and_keep_order():
-    data = sample_planner_input()
-    client = RecordingDifyClient()
+def test_chain_output_reports_unknown_traceability_ids():
+    runner = FakeWorkflowChainRunner(invalid_trace_ids=True)
 
-    response = run_planning_agent(data, dify_client=client, max_parallel_calls=2)
+    response = run_planning_agent(sample_planner_input(), workflow_runner=runner, max_packages=1)
+
+    assert response["metadata"]["status"] == "partial_success"
+    assert response["self_review"]["passed"] is False
+    assert any(
+        "unknown source" in issue or "unknown evidence" in issue
+        for issue in response["self_review"]["issues"]
+    )
+
+
+def test_service_normalizes_system_identity_from_local_context():
+    runner = FakeWorkflowChainRunner(wrong_identity=True)
+
+    response = run_planning_agent(sample_planner_input(), workflow_runner=runner)
 
     assert response["metadata"]["status"] == "success"
     assert [plan["hypothesis_id"] for plan in response["payload"]["plans"]] == [
         "hyp_001",
         "hyp_002",
     ]
-    assert len(client.calls) == 2
