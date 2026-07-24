@@ -189,7 +189,7 @@ class PersistenceTests(unittest.TestCase):
 
         self.assertEqual(updated["task_id"], context["task_id"])
         self.assertEqual(updated["mode"], "manual")
-        self.assertEqual(updated["iteration"], 2)
+        self.assertEqual(updated["iteration"], 1)
         constraints = updated["user_input"]["user_constraints"]
         self.assertEqual(constraints["reasoning_level"], "ultra")
         self.assertEqual(constraints["memory_level"], "high")
@@ -234,7 +234,7 @@ class PersistenceTests(unittest.TestCase):
             "Generate a narrower hypothesis.",
         )
 
-        self.assertEqual(updated["iteration"], 2)
+        self.assertEqual(updated["iteration"], 1)
         self.assertIsNotNone(updated["question_card"])
         self.assertEqual(len(updated["literature_cards"]), 1)
         self.assertEqual(updated["hypothesis_cards"], [])
@@ -247,7 +247,7 @@ class PersistenceTests(unittest.TestCase):
         )
 
         manifest = self.artifacts.read_json(context["task_id"], "manifest.json")
-        self.assertEqual(manifest["iteration"], 2)
+        self.assertEqual(manifest["iteration"], 1)
         self.assertEqual(manifest["current_stage"], "hypothesis_generation")
         self.assertEqual(manifest["stage_status"]["knowledge_integration"], "passed")
         self.assertEqual(manifest["stage_status"]["hypothesis_generation"], "retrying")

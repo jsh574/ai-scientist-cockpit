@@ -246,7 +246,7 @@ class OrchestratorTests(unittest.TestCase):
             self.artifacts.latest_stage_output(context["task_id"], "final_review")["payload"],
         )
 
-    def test_feedback_creates_new_iteration_and_version(self) -> None:
+    def test_feedback_rerun_stays_in_current_iteration(self) -> None:
         context = self.create()
         self.orchestrator.run_from(context["task_id"])
         result = self.orchestrator.apply_feedback(
@@ -255,12 +255,12 @@ class OrchestratorTests(unittest.TestCase):
             "Narrow the population and rerank hypotheses.",
             rerun_downstream=False,
         )
-        self.assertEqual(result["task_context"]["iteration"], 2)
+        self.assertEqual(result["task_context"]["iteration"], 1)
         latest = self.artifacts.load_context(context["task_id"])
         self.assertEqual(len(latest["feedback_events"]), 1)
         self.assertGreaterEqual(len(latest["versions"]), 8)
 
-    def test_stage_history_keeps_one_output_per_iteration(self) -> None:
+    def test_stage_history_replaces_local_rerun_within_iteration(self) -> None:
         context = self.create()
         self.orchestrator.run_from(context["task_id"])
         self.orchestrator.apply_feedback(
@@ -281,9 +281,9 @@ class OrchestratorTests(unittest.TestCase):
 
         self.assertEqual(len(identities), len(set(identities)))
         self.assertIn((1, "research_planning"), identities)
-        self.assertIn((2, "research_planning"), identities)
         self.assertIn((1, "final_review"), identities)
-        self.assertIn((2, "final_review"), identities)
+        self.assertNotIn((2, "research_planning"), identities)
+        self.assertNotIn((2, "final_review"), identities)
 
     def test_operator_can_continue_after_quality_gate_retry(self) -> None:
         self.orchestrator.registry = BorderlineHypothesisRegistry()

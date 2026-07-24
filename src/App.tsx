@@ -198,6 +198,7 @@ interface ThreadMessage {
   review?: ReviewRecord | null;
   status?: StageRun["status"];
   needsApproval?: boolean;
+  actionsAvailable?: boolean;
   retryFromStage?: StageId;
   revisionNote?: string;
   durationMs?: number;
@@ -1036,18 +1037,44 @@ function projectMessagesFromRemote(
           finished_at: detail.review?.created_at ?? createdAt,
         }]
       : []);
+  const currentDetailsByStage = new Map(
+    details.map((detail) => [detail.stage.stage, detail]),
+  );
+  const iterationEnded = context.extensions?.iteration_control?.status === "ended";
   historicalDetails.forEach((detail) => {
     if (!detail.output) return;
-    const status = normalizeRemoteStageStatus(detail.status);
+    const historicalStatus = normalizeRemoteStageStatus(detail.status);
+    const currentDetail = currentDetailsByStage.get(detail.stage.stage);
+    const currentIteration = currentDetail?.output?.metadata.iteration;
+    const isCurrentOutput = currentDetail?.output != null
+      && currentIteration === detail.iteration;
+    let status = isCurrentOutput && currentDetail
+      ? normalizeRemoteStageStatus(currentDetail.status)
+      : historicalStatus;
+    if (
+      iterationEnded
+      && detail.stage.stage === "final_review"
+      && detail.iteration === context.iteration
+    ) {
+      status = "passed";
+    }
+    const actionsAvailable = isCurrentOutput
+      && ["human_review", "revision_required", "failed"].includes(status);
     messages.push({
       id: stageMessageId(context.task_id, detail.iteration, detail.stage.stage),
       kind: detail.stage.stage === "final_review" ? "controller" : "agent",
       stage: detail.stage.stage,
       iteration: detail.iteration,
       response: detail.output,
-      review: detail.review,
+      review: isCurrentOutput ? currentDetail.review ?? detail.review : detail.review,
       status,
-      needsApproval: status === "human_review" && detail.stage.stage !== "final_review",
+      actionsAvailable,
+      needsApproval: actionsAvailable
+        && status === "human_review"
+        && detail.stage.stage !== "final_review",
+      retryFromStage: actionsAvailable && status === "revision_required"
+        ? getFeedbackTargetStage(detail.output, detail.stage.stage)
+        : undefined,
       durationMs: detail.output.metadata.duration_ms ?? undefined,
       createdAt: detail.finished_at ?? detail.review?.created_at ?? detail.started_at,
     });
@@ -1126,13 +1153,16 @@ async function restoreRemoteProject(
     fetchTaskStageHistory(manifest.task_id),
   ]);
   const context = record.task_context;
+  const iterationEnded = context.extensions?.iteration_control?.status === "ended";
   const baseStages = createInitialStages(context);
   const stages = baseStages.map((stage) => {
     const detail = details.find((item) => item.stage.stage === stage.id);
     if (!detail) return stage;
     return {
       ...stage,
-      status: normalizeRemoteStageStatus(detail.status),
+      status: iterationEnded && stage.id === "final_review"
+        ? "passed"
+        : normalizeRemoteStageStatus(detail.status),
       input: detail.input ?? stage.input,
       output: detail.output,
       review: detail.review,
@@ -2654,6 +2684,14 @@ function App() {
       const updated = await finishTaskIteration(context.task_id);
       setContext(updated);
       setIterationDraft("");
+      updateStage("final_review", { status: "passed" });
+      setMessages((current) => current.map((message) =>
+        message.stage === "final_review" && messageIteration(message) === context.iteration
+          ? { ...message, status: "passed", needsApproval: false, actionsAvailable: false }
+          : message,
+      ));
+      setReviewStage(null);
+      setPendingIndex(null);
       pushMessage({
         kind: "controller",
         body: language === "zh"
@@ -2666,7 +2704,7 @@ function App() {
     } finally {
       setIterationBusy(false);
     }
-  }, [context, iterationBusy, language, pushMessage, running]);
+  }, [context, iterationBusy, language, pushMessage, running, updateStage]);
 
   const submitControllerQuestion = useCallback(async () => {
     const typedQuestion = stripComposerMentions(questionDraft.trim());
@@ -2845,8 +2883,8 @@ function App() {
             <StatusMetric
               label={t.iteration}
               title={language === "zh"
-                ? "初始任务为第 1 轮；每次提交反馈并回退重跑时增加 1 轮。"
-                : "The initial task is iteration 1; each feedback-driven rerun adds one iteration."}
+                ? "初始任务为第 1 轮；单个 Agent 重跑仍属于当前轮，只有选择继续整轮迭代时才增加 1 轮。"
+                : "The initial task is iteration 1. Agent reruns stay in the current iteration; only continuing full refinement starts the next iteration."}
               value={`${context.iteration}/${maxIterations}`}
             />
           </div>
@@ -4637,9 +4675,15 @@ function ThreadMessageCard({
 
   const title = getMessageTitle(message, language);
   const stage = message.stage;
+  const actionResolved = message.actionsAvailable === false
+    && ["human_review", "revision_required", "failed"].includes(message.status ?? "");
+  const displayStatusClass = actionResolved ? "passed" : message.status ?? "queued";
+  const displayStatusLabel = actionResolved
+    ? language === "zh" ? "已处理" : "Resolved"
+    : statusLabel[language][message.status ?? "queued"];
 
   return (
-    <article className={`thread-message ${message.kind}-message ${message.status ?? ""}`} id={message.id}>
+    <article className={`thread-message ${message.kind}-message ${displayStatusClass}`} id={message.id}>
       <div aria-hidden="true" className="message-avatar ai-message-avatar">
         <img
           alt=""
@@ -4673,7 +4717,7 @@ function ThreadMessageCard({
               durationMs={message.durationMs ?? message.response?.metadata.duration_ms ?? undefined}
               language={language}
             />
-            <span className={`state-chip ${message.status ?? "queued"}`}>{statusLabel[language][message.status ?? "queued"]}</span>
+            <span className={`state-chip ${displayStatusClass}`}>{displayStatusLabel}</span>
           </div>
         </header>
 
@@ -4767,7 +4811,7 @@ function ThreadMessageCard({
               </button>
             </div>
           </section>
-        ) : stage && message.status === "revision_required" ? (
+        ) : stage && message.status === "revision_required" && message.actionsAvailable !== false ? (
           <section className="inline-review revision-required-actions">
             <p>
               {language === "zh"
@@ -4796,7 +4840,7 @@ function ThreadMessageCard({
               </div>
             </div>
           </section>
-        ) : stage && message.status === "failed" ? (
+        ) : stage && message.status === "failed" && message.actionsAvailable !== false ? (
           <section className="inline-review agent-failure-actions">
             <div className="revision-composer">
               <textarea
@@ -4811,6 +4855,10 @@ function ThreadMessageCard({
               </button>
             </div>
           </section>
+        ) : stage && actionResolved ? (
+          <p className="gate-note">
+            {language === "zh" ? "该输出已处理，仅保留为本轮历史记录。" : "This output is resolved and retained as iteration history."}
+          </p>
         ) : stage && message.status === "passed" ? (
           <p className="gate-note">{t.gatePassed}</p>
         ) : stage && message.status === "retrying" ? (

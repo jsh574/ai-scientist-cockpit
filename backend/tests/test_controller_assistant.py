@@ -74,6 +74,7 @@ class ControllerAssistantTests(unittest.TestCase):
         self.assertTrue(updated["evidence_map"])
         self.assertIsNone(updated["research_plan"])
         self.assertIsNone(updated["final_review"])
+        self.assertEqual(updated["iteration"], 2)
         self.assertEqual(updated["extensions"]["iteration_control"]["status"], "active")
 
     def test_finish_iteration_persists_qa_mode(self) -> None:
@@ -81,6 +82,7 @@ class ControllerAssistantTests(unittest.TestCase):
             TaskCreateRequest(original_question="Test iteration finish")
         )
         context["research_plan"] = {"plans": [{"hypothesis_id": "hyp_1"}]}
+        context["final_review"] = {"passed": True}
         context["current_stage"] = "completed"
         self.artifacts.save_context(context["task_id"], context)
 
@@ -92,6 +94,7 @@ class ControllerAssistantTests(unittest.TestCase):
         )
         manifest = self.artifacts.read_json(context["task_id"], "manifest.json")
         self.assertEqual(manifest["status"], "completed")
+        self.assertEqual(manifest["stage_status"]["final_review"], "passed")
 
     def test_controller_review_cannot_override_rubric_ceiling(self) -> None:
         context = self.orchestrator.create_task(

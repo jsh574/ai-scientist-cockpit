@@ -865,13 +865,7 @@ class Orchestrator:
             invalidated_stages, invalidated_fields = self._invalidate_from_stage(
                 context, target_stage
             )
-            iteration = int(context.get("iteration") or 1) + 1
-            if iteration > self.max_iterations:
-                raise OrchestrationError(
-                    "Maximum workflow iterations exceeded "
-                    f"({self.max_iterations}). Export the current task or create a new task "
-                    "before submitting more feedback."
-                )
+            iteration = int(context.get("iteration") or 1)
             event = {
                 "feedback_id": f"feedback_{uuid4().hex[:12]}",
                 "round_id": iteration,
@@ -884,7 +878,6 @@ class Orchestrator:
                 "revision_suggestion": comment,
                 "created_at": utc_now(),
             }
-            context["iteration"] = iteration
             context["current_stage"] = target_stage
             context["feedback_events"] = [*list(context.get("feedback_events") or []), event]
             self.artifacts.snapshot(
@@ -895,7 +888,6 @@ class Orchestrator:
                 changed_fields=[
                     "mode",
                     "user_input.user_constraints",
-                    "iteration",
                     "feedback_events",
                     "reviews",
                     *invalidated_fields,
@@ -907,7 +899,6 @@ class Orchestrator:
                 stage_status[stage] = "retrying" if stage == target_stage else "queued"
             self.artifacts.update_manifest(
                 task_id,
-                iteration=iteration,
                 current_stage=target_stage,
                 status="retrying",
                 stage_status=stage_status,
@@ -1009,11 +1000,16 @@ class Orchestrator:
             context["extensions"] = extensions
             context["current_stage"] = "completed"
             self.artifacts.save_context(task_id, context)
+            manifest = self.artifacts.read_json(task_id, "manifest.json")
+            stage_status = dict(manifest.get("stage_status") or {})
+            if context.get("final_review") is not None:
+                stage_status["final_review"] = "passed"
             self.artifacts.update_manifest(
                 task_id,
                 status="completed",
                 current_stage="completed",
                 active_run_id=None,
+                stage_status=stage_status,
             )
             self._event(
                 task_id,
