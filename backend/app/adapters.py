@@ -312,7 +312,9 @@ def hypothesis_request(task_context: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def evidence_mapping_request(task_context: dict[str, Any]) -> dict[str, Any]:
+def evidence_mapping_request(
+    task_context: dict[str, Any], feedback: str | None = None
+) -> dict[str, Any]:
     evidence_cards = []
     for source in task_context.get("evidence_cards") or []:
         if not isinstance(source, dict):
@@ -340,6 +342,7 @@ def evidence_mapping_request(task_context: dict[str, Any]) -> dict[str, Any]:
         "hypothesis_cards": task_context.get("hypothesis_cards") or [],
         "evidence_cards": evidence_cards,
         "literature_cards": task_context.get("literature_cards") or [],
+        "feedback": feedback or "",
     }
 
 
@@ -711,10 +714,12 @@ class AgentRegistry:
         return raw
 
     def _run_evidence_mapping(
-        self, task_context: dict[str, Any], _feedback: str | None
+        self, task_context: dict[str, Any], feedback: str | None
     ) -> dict[str, Any]:
         package = _load_package(self.settings.evidence_agent_root / "src", "evidence_mapping")
-        raw = package.EvidenceMappingAgent().run_dict(evidence_mapping_request(task_context))
+        raw = package.EvidenceMappingAgent().run_dict(
+            evidence_mapping_request(task_context, feedback)
+        )
         raw["metadata"]["status"] = _status(raw.get("metadata", {}).get("status"))
         for item in raw.get("payload", {}).get("evidence_map", []):
             review = item.get("detailed_review") or {}

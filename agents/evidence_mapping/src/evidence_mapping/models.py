@@ -87,6 +87,7 @@ class EvidenceMappingInput(BaseModel):
     evidence_cards: list[EvidenceCard]
     literature_cards: list[LiteratureCard] = Field(default_factory=list)
     threshold: float = 7.0
+    feedback: str = ""
 
 
 # ---------- 模块 4 输出 ----------

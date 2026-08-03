@@ -217,6 +217,7 @@ def review_one_hypothesis(
     llm: Optional[QwenCompatibleClient] = None,
     scoring_mode: str = "auto",
     llm_errors: Optional[list[str]] = None,
+    feedback: str = "",
 ) -> EvidenceMapItem:
     candidate_ids = select_candidate_ids(hypothesis, evidence_cards)
     use_llm = scoring_mode == "llm" or (
@@ -232,6 +233,7 @@ def review_one_hypothesis(
                 candidate_ids=candidate_ids,
                 threshold=threshold,
                 review_idx=review_idx,
+                feedback=feedback,
             )
         except Exception as exc:  # noqa: BLE001 — 显式降级到规则引擎
             if llm_errors is not None:
@@ -292,6 +294,7 @@ class EvidenceMappingAgent:
                     llm=self.llm,
                     scoring_mode=self.scoring_mode,
                     llm_errors=llm_errors,
+                    feedback=inp.feedback,
                 )
             )
 

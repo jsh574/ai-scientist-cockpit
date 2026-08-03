@@ -54,6 +54,7 @@ def build_llm_payload(
     literature_cards: list[LiteratureCard],
     candidate_ids: list[str],
     threshold: float,
+    feedback: str = "",
 ) -> dict[str, Any]:
     lit_map = {c.literature_id: c for c in literature_cards}
     evidence_by_id = {e.evidence_id: e for e in evidence_cards}
@@ -102,10 +103,12 @@ def build_llm_payload(
             "based_on_evidence_ids": hypothesis.based_on_evidence_ids,
         },
         "evidences": evidences,
+        "feedback": feedback,
         "instructions": (
             "对 evidences 中每条证据输出一条 binding；"
             "无关请标 irrelevant；"
-            "prediction_index 对应 hypothesis.predictions 下标，无法对应可为 null。"
+            "prediction_index 对应 hypothesis.predictions 下标，无法对应可为 null；"
+            "如 feedback 非空，必须据此调整证据筛选、方向复核、局限性和缺口判断。"
         ),
     }
 
@@ -347,9 +350,15 @@ def review_hypothesis_with_llm(
     candidate_ids: list[str],
     threshold: float,
     review_idx: int,
+    feedback: str = "",
 ) -> EvidenceMapItem:
     payload = build_llm_payload(
-        hypothesis, evidence_cards, literature_cards, candidate_ids, threshold
+        hypothesis,
+        evidence_cards,
+        literature_cards,
+        candidate_ids,
+        threshold,
+        feedback,
     )
     raw = llm.generate_json(
         system_prompt=REVIEW_SYSTEM_PROMPT,

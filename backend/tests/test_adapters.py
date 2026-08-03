@@ -91,6 +91,17 @@ class AdapterContractTests(unittest.TestCase):
             ],
         }
 
+    def test_evidence_mapping_request_preserves_iteration_feedback(self) -> None:
+        request = evidence_mapping_request(
+            self.downstream_context(),
+            feedback="Recheck contradictory evidence before scoring.",
+        )
+
+        self.assertEqual(
+            request["feedback"],
+            "Recheck contradictory evidence before scoring.",
+        )
+
     def test_question_card_is_normalized_for_frontend(self) -> None:
         card = canonical_question_card(
             {

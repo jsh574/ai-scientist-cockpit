@@ -10,8 +10,13 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from evidence_mapping import EvidenceMappingAgent
-from evidence_mapping.llm_review import parse_llm_review
-from evidence_mapping.models import EvidenceMappingInput, HypothesisCard, EvidenceCard
+from evidence_mapping.llm_review import build_llm_payload, parse_llm_review
+from evidence_mapping.models import (
+    EvidenceCard,
+    EvidenceMappingInput,
+    HypothesisCard,
+    LiteratureCard,
+)
 
 
 @pytest.fixture
@@ -61,6 +66,30 @@ def test_unknown_evidence_reported() -> None:
         EvidenceMappingInput.model_validate(data)
     )
     assert resp.payload.evidence_map[0].needs_more_evidence is True
+
+
+def test_llm_payload_includes_iteration_feedback() -> None:
+    hypothesis = HypothesisCard(
+        hypothesis_id="hyp_feedback",
+        statement="X causes Y",
+        based_on_evidence_ids=["ev_feedback"],
+    )
+    evidence = EvidenceCard(
+        evidence_id="ev_feedback",
+        claim="X is associated with Y",
+    )
+
+    payload = build_llm_payload(
+        hypothesis,
+        [evidence],
+        [LiteratureCard(literature_id="lit_feedback", title="Feedback study")],
+        ["ev_feedback"],
+        7.0,
+        "Recheck direction and emphasize longitudinal evidence.",
+    )
+
+    assert payload["feedback"] == "Recheck direction and emphasize longitudinal evidence."
+    assert "feedback" in payload["instructions"]
 
 
 def test_no_ad_hardcode_in_scorer_source() -> None:

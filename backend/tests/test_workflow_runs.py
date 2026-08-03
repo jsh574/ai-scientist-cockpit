@@ -345,6 +345,42 @@ class WorkflowRunManagerTests(unittest.TestCase):
             instruction_registry.feedback_by_stage["research_planning"] or "",
         )
 
+    def test_iteration_plan_instructions_reach_all_rerun_agents(self) -> None:
+        instruction_registry = InstructionRegistry()
+        instruction_registry.release.set()
+        self.orchestrator.registry = instruction_registry
+        self.create_task("task_all_iteration_instructions")
+        context = self.artifacts.load_context("task_all_iteration_instructions")
+        context["mode"] = "auto"
+        context["iteration"] = 2
+        stages = [
+            "question_understanding",
+            "knowledge_integration",
+            "hypothesis_generation",
+            "evidence_mapping",
+            "research_planning",
+        ]
+        context["iteration_plans"] = [
+            {
+                "iteration": 2,
+                "instructions_by_agent": {
+                    stage: f"Iteration guidance for {stage}." for stage in stages
+                },
+            }
+        ]
+        self.artifacts.save_context("task_all_iteration_instructions", context)
+
+        created = self.manager.start(
+            "task_all_iteration_instructions", start_stage="question_understanding"
+        )
+        self.wait_for(created["run_id"], {"completed", "human_review", "retry"})
+
+        for stage in stages:
+            self.assertIn(
+                f"Iteration guidance for {stage}.",
+                instruction_registry.feedback_by_stage[stage] or "",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

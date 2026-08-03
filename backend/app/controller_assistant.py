@@ -85,6 +85,7 @@ class ControllerAssistant:
             "evidence_quality": ["knowledge_integration", "evidence_mapping", "research_planning"],
             "experiment_design": ["research_planning"],
         }.get(inferred, ["research_planning"])
+        shared_feedback = self._iteration_feedback(context, comment)
         llm_reason = ""
         llm_instructions: dict[str, str] = {}
         if llm_client is not None:
@@ -98,6 +99,7 @@ class ControllerAssistant:
                     user_payload={
                         "user_score": user_score,
                         "comment": comment,
+                        "combined_feedback": shared_feedback,
                         "current_plan": context.get("research_plan"),
                         "final_review": context.get("final_review"),
                     },
@@ -111,14 +113,7 @@ class ControllerAssistant:
                 ]
                 if selected:
                     earliest = min(STAGE_ORDER.index(stage) for stage in selected)
-                    if earliest == 0:
-                        agents = list(STAGE_ORDER[:-1])
-                    else:
-                        required = set(selected)
-                        if required & {"knowledge_integration", "hypothesis_generation"}:
-                            required.add("evidence_mapping")
-                        required.add("research_planning")
-                        agents = [stage for stage in STAGE_ORDER if stage in required]
+                    agents = list(STAGE_ORDER[earliest:-1])
                 inferred = str(result.get("problem_type") or inferred)
                 llm_reason = str(result.get("reason") or "")
                 if isinstance(result.get("instructions_by_agent"), dict):
@@ -129,6 +124,15 @@ class ControllerAssistant:
                     }
             except Exception:
                 pass
+        earliest = min(STAGE_ORDER.index(stage) for stage in agents)
+        agents = list(STAGE_ORDER[earliest:-1])
+        instructions_by_agent = {}
+        for stage in agents:
+            specific = llm_instructions.get(stage, "").strip()
+            parts = [shared_feedback]
+            if specific and specific not in shared_feedback:
+                parts.append(f"总控给 {get_agent_spec(stage).agent_id} 的专属指令：{specific}")
+            instructions_by_agent[stage] = "\n\n".join(part for part in parts if part)
         decision = {
             "schema_version": "iteration_plan_v1",
             "problem_type": inferred,
@@ -138,9 +142,7 @@ class ControllerAssistant:
                 {field for stage in agents for field in get_agent_spec(stage).writes}
                 | {"final_review"}
             ),
-            "instructions_by_agent": {
-                stage: llm_instructions.get(stage, comment) for stage in agents
-            },
+            "instructions_by_agent": instructions_by_agent,
             "must_regenerate_plan": True,
             "reason": llm_reason or f"User score {user_score}/5; routed as {inferred}.",
         }
@@ -151,6 +153,22 @@ class ControllerAssistant:
             "problem_type": inferred,
         }
         return evaluation, decision
+
+    @staticmethod
+    def _iteration_feedback(context: dict[str, Any], comment: str) -> str:
+        parts: list[str] = []
+        user_comment = comment.strip()
+        if user_comment:
+            parts.append(f"用户意见：{user_comment}")
+        final_review = context.get("final_review")
+        if isinstance(final_review, dict):
+            suggestions = ControllerAssistant._string_list(final_review.get("suggestions"))
+            weaknesses = ControllerAssistant._string_list(final_review.get("weaknesses"))
+            if suggestions:
+                parts.append(f"总控建议：{'；'.join(suggestions)}")
+            if weaknesses:
+                parts.append(f"总控指出的问题：{'；'.join(weaknesses)}")
+        return "\n".join(parts) or "请根据当前总控评价继续优化本阶段输出。"
 
     def evaluate_workflow(
         self,

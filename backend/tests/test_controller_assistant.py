@@ -77,6 +77,37 @@ class ControllerAssistantTests(unittest.TestCase):
         self.assertEqual(updated["iteration"], 2)
         self.assertEqual(updated["extensions"]["iteration_control"]["status"], "active")
 
+    def test_iteration_feedback_reaches_every_downstream_agent(self) -> None:
+        context = self.orchestrator.create_task(
+            TaskCreateRequest(original_question="Test shared iteration feedback")
+        )
+        context["final_review"] = {
+            "suggestions": ["Add an independent validation cohort."],
+            "weaknesses": ["The causal evidence remains indirect."],
+        }
+
+        _, decision = self.assistant.evaluate_plan(
+            context,
+            2,
+            "Prioritize longitudinal evidence.",
+            "evidence_quality",
+        )
+
+        self.assertEqual(
+            decision["agents_to_rerun"],
+            [
+                "knowledge_integration",
+                "hypothesis_generation",
+                "evidence_mapping",
+                "research_planning",
+            ],
+        )
+        for stage in decision["agents_to_rerun"]:
+            instruction = decision["instructions_by_agent"][stage]
+            self.assertIn("Prioritize longitudinal evidence.", instruction)
+            self.assertIn("Add an independent validation cohort.", instruction)
+            self.assertIn("The causal evidence remains indirect.", instruction)
+
     def test_finish_iteration_persists_qa_mode(self) -> None:
         context = self.orchestrator.create_task(
             TaskCreateRequest(original_question="Test iteration finish")

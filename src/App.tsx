@@ -28,7 +28,6 @@ import {
   MessageSquareText,
   Moon,
   Paperclip,
-  Pause,
   Play,
   Plus,
   RotateCcw,
@@ -68,7 +67,6 @@ import {
   fetchWorkflowRun,
   fetchVersionDiff,
   fetchVersions,
-  pauseWorkflowRun,
   queueRunInstruction,
   recordFeedback,
   routeControllerMessage,
@@ -482,7 +480,7 @@ function upsertStageMessage(
     next.push(message);
   });
   if (!inserted) next.push(nextMessage);
-  return next;
+  return next.sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt));
 }
 
 function mergeKnowledgePartialPayload(
@@ -578,16 +576,19 @@ function applyStageDetailToMessages(
       message.kind !== "user"
       && message.stage === stage
       && messageIteration(message) === iteration);
+  const sameRun = existing?.workflowRunId === runId;
   const status = normalizeRemoteStageStatus(detail.status);
+  const messageCreatedAt = sameRun ? existing.createdAt : createdAt;
   const nextMessage: ThreadMessage = {
     ...(existing ?? {
       id,
       kind: stage === "final_review" ? "controller" : "agent",
       stage,
-      createdAt,
+      createdAt: messageCreatedAt,
     }),
     id,
     iteration,
+    createdAt: messageCreatedAt,
     response: detail.output,
     review: detail.review,
     status,
@@ -1987,15 +1988,6 @@ function App() {
     };
   }, [context.task_id, hasSubmittedQuestion, monitorWorkflowRun, trackWorkflowRun]);
 
-  const pauseActiveRun = useCallback(async () => {
-    if (!activeRun || !["queued", "running"].includes(activeRun.status)) return;
-    try {
-      trackWorkflowRun(activeRun.task_id, await pauseWorkflowRun(activeRun.run_id));
-    } catch (error) {
-      setRuntimeError(error instanceof Error ? error.message : String(error));
-    }
-  }, [activeRun, trackWorkflowRun]);
-
   const resumeActiveRun = useCallback(async () => {
     if (!activeRun || !["pausing", "paused", "interrupted", "cancelled"].includes(activeRun.status)) return;
     try {
@@ -2921,12 +2913,6 @@ function App() {
                 </div>
               ) : null}
               <div className="run-controls">
-                {["queued", "running"].includes(activeRun.status) ? (
-                  <button type="button" onClick={() => void pauseActiveRun()}>
-                    <Pause size={13} />
-                    {language === "zh" ? "暂停" : "Pause"}
-                  </button>
-                ) : null}
                 {["pausing", "paused", "interrupted", "cancelled"].includes(activeRun.status) ? (
                   <button type="button" onClick={() => void resumeActiveRun()}>
                     <Play size={13} />
@@ -3315,10 +3301,6 @@ function App() {
             if (action === "history") {
               setTreeOpen(false);
               setPage("system");
-              return;
-            }
-            if (action === "pause") {
-              void pauseActiveRun();
               return;
             }
             void executeNode(context.task_id, stage, action === "only" ? "only" : "from", {})
@@ -5852,7 +5834,7 @@ function StateTreeModal({
   iteration: number;
   language: Language;
   onClose: () => void;
-  onNodeAction: (stage: StageId, action: "only" | "from" | "pause" | "history") => void;
+  onNodeAction: (stage: StageId, action: "only" | "from" | "history") => void;
   onSelectStage: (stage: StageId) => void;
   stages: StageRun[];
   t: (typeof copy)[Language];
@@ -6084,7 +6066,6 @@ function StateTreeModal({
             <div className="tree-node-actions">
               <button type="button" onClick={() => onNodeAction(selectedStage.id, "only")}>{language === "zh" ? "仅运行" : "Run only"}</button>
               <button type="button" onClick={() => onNodeAction(selectedStage.id, "from")}>{language === "zh" ? "从此继续" : "Continue"}</button>
-              <button type="button" onClick={() => onNodeAction(selectedStage.id, "pause")}>{language === "zh" ? "暂停" : "Pause"}</button>
               <button type="button" onClick={() => onNodeAction(selectedStage.id, "history")}>{language === "zh" ? "历史" : "History"}</button>
             </div>
             <pre>{JSON.stringify(inspectorData ?? null, null, 2)}</pre>
