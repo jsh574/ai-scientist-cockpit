@@ -41,6 +41,87 @@ task_context.user_input
 }
 ```
 
+### 1.4 多轮迭代输入
+
+首轮 `user_feedback` 默认为空字符串。后续轮次既可以显式传入
+`prior_rounds`，也可以只沿用相同的 `task_id`、`question_id` 和
+`original_question`；模块会从自己的 SQLite 状态库自动恢复历史。
+
+```json
+{
+  "original_question": "阿尔茨海默病的关键致病机制是什么？",
+  "question_description": "已有的问题背景与解释",
+  "user_feedback": "本轮只关注早发型患者",
+  "prior_rounds": [
+    {
+      "iteration": 1,
+      "user_feedback": "",
+      "prompt_snapshot": {
+        "system": "上一轮实际使用的 System Prompt",
+        "user": "上一轮实际使用的 User Prompt"
+      },
+      "run_result": {
+        "status": "ok",
+        "error": null,
+        "meta": {}
+      },
+      "question_card": {}
+    }
+  ]
+}
+```
+
+下一轮 Prompt 会包含：原始问题、原始问题解释、最近一轮完整 Prompt、
+最近一轮运行状态、最近一轮问题卡，以及本轮用户反馈。更早轮次会直接
+显示为反馈摘要；由于最近一轮 Prompt 本身可能包含更早历史，模块会在
+超过 Prompt 字符预算时返回 `PROMPT_TOO_LARGE`，不会静默截断。
+
+成功响应的 `data.round_snapshot` 是可直接回传到下一轮 `prior_rounds` 的
+标准快照。若总控不回传，模块也会自动保存并恢复。默认数据库位于本模块
+`.runtime/iteration_state.sqlite3`，可通过环境变量
+`PROBLEM_UNDERSTANDING_STATE_DB` 指定其他位置。传入
+`reset_history: true` 可开始全新会话。
+
+### 1.5 统一总控协议
+
+除兼容现有 backend 的 `ProblemUnderstandingAgent.run()` 外，模块还提供
+`ProblemUnderstandingAdapter` 和 `run_protocol()`，与其他 Agent 一样使用
+`metadata / payload / self_review` 响应信封：
+
+```json
+{
+  "schema_version": "problem_understanding_input_v1",
+  "task_id": "task_001",
+  "stage": "question_understanding",
+  "iteration": 2,
+  "_feedback": "本轮只关注早发型患者",
+  "input": {
+    "original_question": "阿尔茨海默病的关键致病机制是什么？"
+  }
+}
+```
+
+`_feedback`、`feedback` 和历史拼写 `_fedback` 均可识别；规范输出字段使用
+团队已有的 `_feedback`。
+
+### 1.6 运行配置
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PROBLEM_UNDERSTANDING_STATE_MODE` | `sqlite` | `sqlite` 自动恢复；`explicit` 仅使用显式历史；`off` 不自动持久化 |
+| `PROBLEM_UNDERSTANDING_STATE_DB` | `.runtime/iteration_state.sqlite3` | SQLite 文件位置 |
+| `PROBLEM_UNDERSTANDING_OUTPUT_RETRIES` | `2` | 模型输出校验失败后的最大修复次数 |
+| `PROBLEM_UNDERSTANDING_REVIEW_THRESHOLD` | `0.75` | 确定性 self-review 通过阈值 |
+| `PROBLEM_UNDERSTANDING_MAX_PROMPT_CHARS` | `120000` | System + User Prompt 字符上限 |
+| `PROBLEM_UNDERSTANDING_HISTORY_LIMIT` | `5` | 每轮直接加载的历史快照数 |
+
+模型返回空对象、非 JSON object 或缺少下游必需字段时，不再直接用占位值
+伪装成成功结果。Agent 会把具体错误加入修复 Prompt，重试耗尽后返回
+`OUTPUT_VALIDATION_FAILED`。LLM 调用异常返回 `LLM_CALL_FAILED`。
+
+确定性 `self_review` 包含字段完整性、问题清晰度、原意保持、可检索性、
+可验证性、反馈落实、修订稳定性和模型置信度八个维度。
+
 ---
 
 ## 2. 输出模块
