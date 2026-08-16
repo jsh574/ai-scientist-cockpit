@@ -1078,20 +1078,22 @@ class QwenDashScopeClient
 
 ### 配置方式
 
-`llm.py` 顶部提供本地一次性配置：
+源码不再提供任何模型密钥。完整项目启动时，后端会先读取根目录 `.env`、
+`agents/planning/.env` 和 `backend/.env`，再向知识整合 Agent 注入统一的
+`ProjectLLMClient`。通常只需在未提交的 `backend/.env` 中配置：
 
-```python
-QWEN_API_KEY = "..."
-QWEN_MODEL = "qwen3.6-flash"
-QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+```env
+DASHSCOPE_API_KEY=<your-bailian-key>
+QWEN_MODEL=qwen3.7-max
+DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 ```
 
-代码读取配置的优先级是：
+直接在后端之外构造 `QwenDashScopeClient` 时，配置优先级是：
 
 ```text
-构造函数传入 api_key/model
--> 环境变量 DASHSCOPE_API_KEY / QWEN_API_KEY / QWEN_MODEL
--> llm.py 顶部常量
+构造函数显式参数
+-> 环境变量 DASHSCOPE_API_KEY / QWEN_API_KEY / LLM_API_KEY
+-> 模型与地址的安全默认值（密钥没有源码默认值）
 ```
 
 实现代码：
@@ -1101,10 +1103,14 @@ self.api_key = (
     api_key
     or os.getenv("DASHSCOPE_API_KEY")
     or os.getenv("QWEN_API_KEY")
-    or QWEN_API_KEY
+    or os.getenv("LLM_API_KEY")
 )
-self.model = model or os.getenv("QWEN_MODEL") or QWEN_MODEL
+self.model = model or os.getenv("QWEN_MODEL") or os.getenv("LLM_MODEL") or DEFAULT_QWEN_MODEL
 ```
+
+如果脱离总控直接运行知识整合包，需要先把这些变量注入当前进程，或者在构造
+`QwenDashScopeClient(api_key=..., model=...)` 时显式传入；该包本身不会猜测或
+保存密钥。旧密钥即使已经从源码删除，也应在百炼控制台吊销并重新创建。
 
 ### 调用方式
 

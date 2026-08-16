@@ -13,22 +13,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 
 from .adapters import REAL_AGENT_STAGES, AgentRegistry, ProjectLLMClient
-from .controller_assistant import ControllerAssistant
 from .agent_protocol import AGENT_SPECS, STAGE_ORDER, slice_context
 from .artifact_service import ArtifactError, ArtifactService, allowed_attachment_extensions
 from .contracts import (
-    FeedbackRequest,
     ControllerRouteRequest,
+    FeedbackRequest,
     HumanReviewRequest,
     LegacyStageRunRequest,
-    RunInstructionRequest,
-    PlanEvaluationRequest,
     NodeExecuteRequest,
+    PlanEvaluationRequest,
+    RunInstructionRequest,
     StageRunRequest,
     TaskArchiveRequest,
     TaskCreateRequest,
     WorkflowStartRequest,
 )
+from .controller_assistant import ControllerAssistant
 from .orchestrator import OrchestrationError, Orchestrator
 from .review_gate import ReviewGate
 from .settings import Settings
@@ -137,11 +137,23 @@ def health() -> dict[str, Any]:
                 "provider", "model", "reasoning", "temperature", "max_tokens",
                 "timeout_seconds", "max_retries", "response_format", "thinking_enabled",
             ],
-            "dify_supported_fields": ["timeout_seconds"],
-            "dify_unsupported_fields": [
-                "model", "reasoning", "temperature", "max_tokens", "max_retries",
-                "response_format", "thinking_enabled",
+        },
+        "planning_runtime": {
+            "mode": "local_protocol_compiler",
+            "model": os.getenv("PLANNING_MODEL")
+            or os.getenv("QWEN_MODEL")
+            or os.getenv("LLM_MODEL")
+            or "qwen3.7-max",
+            "stages": [
+                "draft", "review_methodology", "review_statistics",
+                "review_feasibility", "synthesis", "repair_optional",
             ],
+            "thinking_enabled_for": (
+                ["draft", "review_methodology", "review_statistics", "review_feasibility"]
+                if os.getenv("QWEN_ENABLE_THINKING", "false").lower() == "true"
+                else []
+            ),
+            "synthesis_thinking": False,
         },
         "mcp": {"server": "backend.mcp_server", "transport": "stdio"},
     }

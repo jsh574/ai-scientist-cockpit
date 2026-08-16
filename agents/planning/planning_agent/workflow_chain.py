@@ -1,1017 +1,566 @@
 from __future__ import annotations
 
-import json
 import os
+import threading
 import time
 from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any, Protocol
+from uuid import uuid4
 
-from planning_agent.adapter import (
-    build_dify_workflow_inputs,
-    build_hypothesis_evidence_packages,
-    select_top_packages,
-    validate_planner_input,
+from planning_agent.adapter import build_hypothesis_evidence_packages
+from planning_agent.local_nodes import (
+    compact_for_synthesis,
+    compile_planning_brief,
+    merge_protocol_reviews,
+    planning_brief_issues,
 )
-from planning_agent.workflow_api import (
-    DifyWorkflowAPIError,
-    GenericDifyWorkflowClient,
-    WorkflowEndpointConfig,
-    WorkflowRunResult,
+from planning_agent.runtime import (
+    CancellationChecker,
+    ExecutionEventHandler,
+    PlanningExecutionError,
+    PlanningFormatError,
+    PlanningLLMClient,
+    PlanningLLMConfig,
+    StageRunResult,
 )
+from planning_agent.schemas import REVIEW_ROLES
+from planning_agent.stage_clients import LocalPlanningProtocolClient
 
-CHAIN_SCHEMA_VERSION = "planning_workflow_chain_test_v1"
-BATCH_CHAIN_SCHEMA_VERSION = "planning_workflow_chain_batch_test_v1"
-DEFAULT_VARIANTS = (
-    "minimum_viable",
-    "high_information",
-    "resource_efficient",
-)
-SOFT_CANDIDATE_GUARD_ISSUE_PREFIXES = (
-    "schema_version is invalid",
-    "method_steps must be non-empty",
-    "falsification_matrix must be non-empty",
-    "unknown evidence_id:",
-    "unknown source_id:",
-)
+DEFAULT_REVIEW_ROLES = REVIEW_ROLES
 ProgressHandler = Callable[[str], None]
 
 
-class WorkflowClient(Protocol):
+class ProtocolClient(Protocol):
     @property
     def configured(self) -> bool: ...
 
     def run(
-        self, inputs: dict[str, Any], event_context: dict[str, Any] | None = None
-    ) -> WorkflowRunResult: ...
+        self,
+        stage: str,
+        inputs: dict[str, Any],
+        event_context: dict[str, Any] | None = None,
+    ) -> StageRunResult: ...
+
+    def public_summary(self) -> dict[str, Any]: ...
 
 
-class PlanningWorkflowChainRunner:
-    """Exercise Workflow A -> B -> C without changing the production planner service."""
+class PlanningProtocolRunner:
+    """Evidence-grounded protocol compiler controlled by deterministic Python."""
 
     def __init__(
         self,
-        candidate_client: WorkflowClient,
-        selector_client: WorkflowClient,
-        planner_client: WorkflowClient,
+        client: ProtocolClient,
+        *,
         progress_handler: ProgressHandler | None = None,
-        max_c_context_chars: int | None = None,
-        max_selection_retries: int | None = None,
+        event_handler: ExecutionEventHandler | None = None,
+        cancellation_checker: CancellationChecker | None = None,
+        max_parallel_calls: int = 1,
+        max_repair_attempts: int = 1,
+        synthesis_context_max_chars: int = 16000,
     ) -> None:
-        self.candidate_client = candidate_client
-        self.selector_client = selector_client
-        self.planner_client = planner_client
+        self.client = client
         self.progress_handler = progress_handler
-        self.max_c_context_chars = max_c_context_chars or _env_int(
-            "DIFY_WORKFLOW_C_PLANNING_CONSTRAINTS_MAX_CHARS", 12000
-        )
-        retry_limit = (
-            max_selection_retries
-            if max_selection_retries is not None
-            else _env_int("DIFY_WORKFLOW_B_MAX_FORMAT_RETRIES", 1)
-        )
-        self.max_selection_retries = max(0, min(2, retry_limit))
+        self.event_handler = event_handler
+        self.cancellation_checker = cancellation_checker
+        self.max_parallel_calls = max(1, min(8, int(max_parallel_calls)))
+        self.max_repair_attempts = max(0, min(1, int(max_repair_attempts)))
+        self.synthesis_context_max_chars = max(4000, int(synthesis_context_max_chars))
+        self._model_slots = threading.BoundedSemaphore(self.max_parallel_calls)
 
     @classmethod
     def from_env(
         cls,
+        *,
         progress_handler: ProgressHandler | None = None,
-        event_handler: Callable[[str, dict[str, Any]], None] | None = None,
-        cancellation_checker: Callable[[], None] | None = None,
-    ) -> PlanningWorkflowChainRunner:
+        event_handler: ExecutionEventHandler | None = None,
+        cancellation_checker: CancellationChecker | None = None,
+        model_policy: Mapping[str, Any] | None = None,
+    ) -> PlanningProtocolRunner:
+        config = PlanningLLMConfig.from_env(model_policy)
+        llm = PlanningLLMClient(
+            config,
+            event_handler=event_handler,
+            cancellation_checker=cancellation_checker,
+        )
         return cls(
-            candidate_client=GenericDifyWorkflowClient(
-                WorkflowEndpointConfig.from_env("A"), event_handler, cancellation_checker
-            ),
-            selector_client=GenericDifyWorkflowClient(
-                WorkflowEndpointConfig.from_env("B"), event_handler, cancellation_checker
-            ),
-            planner_client=GenericDifyWorkflowClient(
-                WorkflowEndpointConfig.from_env("C"), event_handler, cancellation_checker
-            ),
+            LocalPlanningProtocolClient(llm, config),
             progress_handler=progress_handler,
+            event_handler=event_handler,
+            cancellation_checker=cancellation_checker,
+            max_parallel_calls=_env_int("PLANNING_MAX_PARALLEL_CALLS", 1),
+            max_repair_attempts=_repair_attempts(),
+            synthesis_context_max_chars=_context_limit(),
         )
 
     def configuration_summary(self) -> list[dict[str, Any]]:
-        summaries: list[dict[str, Any]] = []
-        for name, client in (
-            ("workflow_a", self.candidate_client),
-            ("workflow_b", self.selector_client),
-            ("workflow_c", self.planner_client),
-        ):
-            config = getattr(client, "config", None)
-            if config is not None and hasattr(config, "public_summary"):
-                summaries.append(config.public_summary())
-            else:
-                summaries.append(
-                    {"name": name, "configured": bool(getattr(client, "configured", True))}
-                )
-        return summaries
+        base = self.client.public_summary()
+        stages = (
+            "draft",
+            "review_methodology",
+            "review_statistics",
+            "review_feasibility",
+            "synthesis",
+            "repair",
+        )
+        return [
+            {
+                **base,
+                "name": stage,
+                "configured": bool(self.client.configured),
+                "thinking_enabled": bool(base.get("thinking_enabled"))
+                and stage not in {"synthesis", "repair"},
+                "optional": stage == "repair",
+            }
+            for stage in stages
+        ]
 
     def run(
         self,
         data: dict[str, Any],
         hypothesis_id: str | None = None,
-        variants: tuple[str, ...] = DEFAULT_VARIANTS,
-        max_revisions: int = 1,
+        **_compatibility_options: Any,
     ) -> dict[str, Any]:
-        report = _new_report(data, hypothesis_id, variants, max_revisions)
-        started = time.monotonic()
-        try:
-            self._validate_configuration()
-            errors = validate_planner_input(data)
-            if errors:
-                raise ValueError("; ".join(errors))
-            package = _select_package(data, hypothesis_id)
-            report["hypothesis_id"] = package.get("hypothesis_id", "")
-            report["hypothesis"] = package.get("hypothesis", "")
-            self._run_rounds(
-                report=report,
-                data=data,
-                package=package,
-                variants=variants,
-                max_revisions=max(0, max_revisions),
-            )
-        except (DifyWorkflowAPIError, ValueError) as exc:
-            report["status"] = "failed"
-            report["next_action"] = "inspect_failure"
-            report["errors"].append(str(exc))
-        except Exception as exc:  # Preserve a report for unexpected live API behavior.
-            report["status"] = "failed"
-            report["next_action"] = "inspect_failure"
-            report["errors"].append(f"Unexpected {type(exc).__name__}: {exc}")
-        report["completed_at"] = _utc_now()
-        report["duration_seconds"] = round(time.monotonic() - started, 3)
-        return report
+        packages = build_hypothesis_evidence_packages(data)
+        package = _select_package(packages, hypothesis_id)
+        return self._run_package(data, package)
 
     def run_batch(
         self,
         data: dict[str, Any],
-        variants: tuple[str, ...] = DEFAULT_VARIANTS,
-        max_revisions: int = 1,
+        *,
         max_parallel_hypotheses: int = 1,
+        max_parallel_calls: int | None = None,
+        **_compatibility_options: Any,
     ) -> dict[str, Any]:
-        parallelism = max(1, min(8, int(max_parallel_hypotheses)))
-        report = _new_batch_report(data, variants, max_revisions, parallelism)
-        started = time.monotonic()
-        try:
-            self._validate_configuration()
-            errors = validate_planner_input(data)
-            if errors:
-                raise ValueError("; ".join(errors))
-            packages = select_top_packages(
-                build_hypothesis_evidence_packages(data),
-                max_packages=len(data.get("hypothesis_cards", [])),
-            )
-            _validate_batch_packages(packages)
-            report["hypothesis_ids"] = [
-                str(package.get("hypothesis_id") or "") for package in packages
-            ]
-            self._emit(
-                f"Batch A/B/C: running {len(packages)} hypotheses with "
-                f"max_parallel_hypotheses={parallelism}."
-            )
-            report["hypothesis_runs"] = self._run_batch_packages(
-                data=data,
-                packages=packages,
-                variants=variants,
-                max_revisions=max(0, max_revisions),
-                max_parallel_hypotheses=parallelism,
-            )
-            _finalize_batch_status(report)
-        except (DifyWorkflowAPIError, ValueError) as exc:
+        if max_parallel_calls is not None and int(max_parallel_calls) != self.max_parallel_calls:
+            self.max_parallel_calls = max(1, min(8, int(max_parallel_calls)))
+            self._model_slots = threading.BoundedSemaphore(self.max_parallel_calls)
+        packages = build_hypothesis_evidence_packages(data)
+        report = {
+            "schema_version": "planning_protocol_batch_v1",
+            "task_id": str(data.get("task_id") or ""),
+            "iteration": int(data.get("iteration") or 1),
+            "status": "running",
+            "workflow_mode": "local_protocol_compiler",
+            "hypothesis_runs": [],
+            "errors": [],
+            "started_at": _utc_timestamp(),
+        }
+        if not packages:
             report["status"] = "failed"
-            report["next_action"] = "inspect_failure"
-            report["errors"].append(str(exc))
-        except Exception as exc:
+            report["errors"] = ["No hypothesis evidence packages were available."]
+            report["finished_at"] = _utc_timestamp()
+            return report
+
+        workers = max(1, min(int(max_parallel_hypotheses), len(packages)))
+        ordered: list[dict[str, Any] | None] = [None] * len(packages)
+        if workers == 1:
+            for index, package in enumerate(packages):
+                self._check_cancelled()
+                ordered[index] = self._safe_run_package(data, package)
+        else:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="planning-hypothesis"
+            ) as executor:
+                futures: dict[Future[dict[str, Any]], int] = {
+                    executor.submit(self._safe_run_package, data, package): index
+                    for index, package in enumerate(packages)
+                }
+                for future in as_completed(futures):
+                    self._check_cancelled()
+                    ordered[futures[future]] = future.result()
+
+        runs = [item for item in ordered if isinstance(item, dict)]
+        report["hypothesis_runs"] = runs
+        usable = [item for item in runs if item.get("final_result")]
+        successful = [item for item in runs if item.get("status") == "success"]
+        if len(successful) == len(runs):
+            report["status"] = "success"
+        elif usable:
+            report["status"] = "partial_success"
+        else:
             report["status"] = "failed"
-            report["next_action"] = "inspect_failure"
-            report["errors"].append(f"Unexpected {type(exc).__name__}: {exc}")
-        report["completed_at"] = _utc_now()
-        report["duration_seconds"] = round(time.monotonic() - started, 3)
+        report["errors"] = [
+            f"Hypothesis {item.get('hypothesis_id')}: {error}"
+            for item in runs
+            for error in item.get("errors", [])
+            if item.get("status") == "failed"
+        ]
+        report["finished_at"] = _utc_timestamp()
         return report
 
-    def _run_batch_packages(
-        self,
-        data: dict[str, Any],
-        packages: list[dict[str, Any]],
-        variants: tuple[str, ...],
-        max_revisions: int,
-        max_parallel_hypotheses: int,
-    ) -> list[dict[str, Any]]:
-        if max_parallel_hypotheses <= 1 or len(packages) <= 1:
-            return [
-                self._run_batch_package(data, package, variants, max_revisions)
-                for package in packages
-            ]
-
-        reports: list[dict[str, Any] | None] = [None] * len(packages)
-        with ThreadPoolExecutor(
-            max_workers=min(max_parallel_hypotheses, len(packages))
-        ) as executor:
-            futures = {
-                executor.submit(
-                    self._run_batch_package,
-                    data,
-                    package,
-                    variants,
-                    max_revisions,
-                ): index
-                for index, package in enumerate(packages)
-            }
-            for future in as_completed(futures):
-                reports[futures[future]] = future.result()
-        return [item for item in reports if item is not None]
-
-    def _run_batch_package(
-        self,
-        data: dict[str, Any],
-        package: dict[str, Any],
-        variants: tuple[str, ...],
-        max_revisions: int,
+    def _safe_run_package(
+        self, data: dict[str, Any], package: dict[str, Any]
     ) -> dict[str, Any]:
+        try:
+            return self._run_package(data, package)
+        except PlanningExecutionError as exc:
+            return _failed_hypothesis_report(package, str(exc))
+        except ValueError as exc:
+            return _failed_hypothesis_report(package, str(exc))
+
+    def _run_package(
+        self, data: dict[str, Any], package: dict[str, Any]
+    ) -> dict[str, Any]:
+        self._check_cancelled()
+        started = time.monotonic()
+        task_id = str(data.get("task_id") or "")
+        iteration = int(data.get("iteration") or 1)
         hypothesis_id = str(package.get("hypothesis_id") or "")
-        child_progress_handler = None
-        if self.progress_handler:
-            parent_progress_handler = self.progress_handler
+        run = {
+            "schema_version": "planning_protocol_run_v1",
+            "hypothesis_id": hypothesis_id,
+            "status": "running",
+            "workflow_mode": "local_protocol_compiler",
+            "next_action": "compile_protocol",
+            "stages": [],
+            "intermediate_results": {},
+            "final_result": None,
+            "errors": [],
+            "model_call_count": 0,
+            "total_tokens": 0,
+        }
 
-            def emit_child_progress(message: str) -> None:
-                parent_progress_handler(f"[{hypothesis_id}] {message}")
-
-            child_progress_handler = emit_child_progress
-        child = PlanningWorkflowChainRunner(
-            candidate_client=self.candidate_client,
-            selector_client=self.selector_client,
-            planner_client=self.planner_client,
-            progress_handler=child_progress_handler,
-            max_c_context_chars=self.max_c_context_chars,
-            max_selection_retries=self.max_selection_retries,
+        brief_context = _event_context(hypothesis_id, "brief")
+        self._emit_local("brief", "stage_started", brief_context)
+        brief = compile_planning_brief(
+            data.get("question_card", {}),
+            hypothesis_id,
+            package,
+            data.get("planning_constraints", {}),
+            data.get("user_constraints", {}),
+            str(data.get("_feedback") or ""),
         )
-        return child.run(
-            data,
-            hypothesis_id=hypothesis_id,
-            variants=variants,
-            max_revisions=max_revisions,
+        brief_errors = planning_brief_issues(brief)
+        run["intermediate_results"]["planning_brief"] = brief
+        brief_stage = {
+            "name": "brief",
+            "status": "failed" if brief_errors else "success",
+            "issues": brief_errors,
+        }
+        run["stages"].append(brief_stage)
+        if brief_errors:
+            self._emit_local(
+                "brief", "stage_failed", brief_context, error="; ".join(brief_errors)
+            )
+            run["status"] = "failed"
+            run["next_action"] = "request_upstream_evidence"
+            run["errors"] = brief_errors
+            return _finish_run(run, started)
+        self._emit_local("brief", "stage_finished", brief_context)
+
+        self._emit(f"Compiling protocol draft for {hypothesis_id}.")
+        draft_result = self._call(
+            "draft",
+            {
+                "task_id": task_id,
+                "iteration": iteration,
+                "hypothesis_id": hypothesis_id,
+                "planning_brief": brief,
+            },
+            _event_context(hypothesis_id, "draft"),
         )
-
-
-    def _validate_configuration(self) -> None:
-        missing = [
-            name
-            for name, client in (
-                ("Workflow A", self.candidate_client),
-                ("Workflow B", self.selector_client),
-                ("Workflow C", self.planner_client),
+        _record_call(run, draft_result)
+        draft = _required_output(draft_result, "protocol_draft")
+        draft_contract = _required_output(draft_result, "contract_report")
+        run["stages"].append(_stage_record(draft_result, draft_contract))
+        run["intermediate_results"]["protocol_draft"] = draft
+        if not draft_contract.get("passed"):
+            raise PlanningExecutionError(
+                "Protocol draft failed deterministic validation: "
+                + "; ".join(str(item) for item in draft_contract.get("issues", []))
             )
-            if not bool(getattr(client, "configured", True))
-        ]
-        if missing:
-            raise ValueError(f"Missing Dify configuration for: {', '.join(missing)}")
 
-    def _run_rounds(
-        self,
-        report: dict[str, Any],
-        data: dict[str, Any],
-        package: dict[str, Any],
-        variants: tuple[str, ...],
-        max_revisions: int,
-    ) -> None:
-        constraints = _mapping(data.get("planning_constraints"))
-        revision_count = 0
-        round_number = 1
-        while True:
-            candidate_stage, candidates, guardrails = self._run_candidates(
-                data, package, variants, constraints, round_number
-            )
-            report["stages"].append(candidate_stage)
-            report["intermediate_results"]["candidate_rounds"].append(
+        self._emit(f"Running scoped protocol reviews for {hypothesis_id}.")
+        reviews, review_failures, review_stage_records, review_calls = self._run_reviews(
+            task_id, iteration, hypothesis_id, brief, draft
+        )
+        for result in review_calls:
+            _record_call(run, result)
+        # Failed review calls have no StageRunResult but still consumed a request.
+        run["model_call_count"] += len(review_failures)
+        run["stages"].extend(review_stage_records)
+        run["intermediate_results"]["specialist_reviews"] = reviews
+        merged = merge_protocol_reviews(reviews, review_failures)
+        run["intermediate_results"]["merged_reviews"] = merged
+
+        synthesis_brief = compact_for_synthesis(brief, self.synthesis_context_max_chars)
+        self._emit(f"Synthesizing reviewed protocol for {hypothesis_id}.")
+        try:
+            synthesis_result = self._call(
+                "synthesis",
                 {
-                    "round": round_number,
-                    "candidates": candidates,
-                    "guardrail_reports": guardrails,
-                }
+                    "task_id": task_id,
+                    "iteration": iteration,
+                    "hypothesis_id": hypothesis_id,
+                    "planning_brief": synthesis_brief,
+                    "protocol_draft": draft,
+                    "merged_reviews": merged,
+                },
+                _event_context(hypothesis_id, "synthesis"),
             )
-            if not candidates:
-                raise DifyWorkflowAPIError(
-                    f"Workflow A round {round_number} returned no usable design candidates."
-                )
-
-            selection_attempt = 1
-            selection_constraints = constraints
-            while True:
-                selection_stage, selection, selected_design, selection_guardrail = (
-                    self._run_selection(
-                        data,
-                        package,
-                        candidates,
-                        selection_constraints,
-                        round_number,
-                        selection_attempt,
-                    )
-                )
-                report["stages"].append(selection_stage)
-                report["intermediate_results"]["selection_rounds"].append(
-                    {
-                        "round": round_number,
-                        "attempt": selection_attempt,
-                        "design_selection": selection,
-                        "selected_design": selected_design,
-                        "selection_guardrail_report": selection_guardrail,
-                    }
-                )
-                decision = str(selection.get("decision") or "failed")
-                if (
-                    decision == "failed"
-                    and selection_guardrail.get("passed") is False
-                    and selection_attempt <= self.max_selection_retries
-                ):
-                    issues = selection_guardrail.get("issues", [])
-                    selection_attempt += 1
-                    selection_constraints = {
-                        **constraints,
-                        "selection_format_retry": {
-                            "attempt": selection_attempt,
-                            "previous_issues": issues if isinstance(issues, list) else [],
-                            "instruction": "Return the complete design_selection_v1 root object.",
-                        },
-                    }
-                    self._emit(
-                        "Workflow B returned malformed structured output; "
-                        f"retrying selection attempt {selection_attempt}."
-                    )
-                    continue
-                break
-            report["decision"] = decision
-
-            if decision == "accept":
-                if not selected_design:
-                    raise DifyWorkflowAPIError(
-                        "Workflow B accepted a candidate but returned an empty selected_design."
-                    )
-                self._run_final_plan(
-                    report, data, package, constraints, selection, selected_design
-                )
-                return
-
-            if decision == "revise_once" and revision_count < max_revisions:
-                instruction = str(selection.get("revision_instruction") or "").strip()
-                if not instruction:
-                    self._stop_for_action(report, decision, "revise_candidates")
-                    report["errors"].append(
-                        "Workflow B requested revise_once without revision_instruction."
-                    )
-                    return
-                revision_count += 1
-                round_number += 1
-                constraints = {
-                    **constraints,
-                    "candidate_revision": {
-                        "revision_round": revision_count,
-                        "revision_instruction": instruction,
-                        "source_decision": "revise_once",
-                    },
-                }
-                self._emit(
-                    f"Workflow B requested one bounded revision; starting A/B round {round_number}."
-                )
-                continue
-
-            next_action = {
-                "revise_once": "revise_candidates",
-                "feedback_required": "request_upstream_feedback",
-                "human_review": "human_review",
-                "failed": "inspect_failure",
-            }.get(decision, "inspect_failure")
-            if decision == "failed":
-                guard_issues = selection_guardrail.get("issues", [])
-                if isinstance(guard_issues, list) and guard_issues:
-                    report["errors"].extend(
-                        f"Workflow B guardrail: {issue}" for issue in guard_issues
-                    )
-                else:
-                    report["errors"].append("Workflow B returned decision=failed.")
-            self._stop_for_action(report, decision, next_action)
-            return
-
-    def _run_candidates(
-        self,
-        data: dict[str, Any],
-        package: dict[str, Any],
-        variants: tuple[str, ...],
-        constraints: dict[str, Any],
-        round_number: int,
-    ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
-        if not variants:
-            raise ValueError("At least one Workflow A variant is required.")
-        self._emit(
-            f"Workflow A round {round_number}: generating {len(variants)} candidates in parallel."
-        )
-        started = time.monotonic()
-        runs_by_variant: dict[str, dict[str, Any]] = {}
-        with ThreadPoolExecutor(max_workers=len(variants)) as executor:
-            futures = {
-                executor.submit(
-                    self._run_candidate,
-                    data,
-                    package,
-                    variant,
-                    constraints,
-                    round_number,
-                ): variant
-                for variant in variants
+        except PlanningFormatError as exc:
+            if not self.max_repair_attempts:
+                raise
+            run["model_call_count"] += 1
+            run["stages"].append(
+                {"name": "synthesis", "status": "failed", "issues": [str(exc)]}
+            )
+            plan_result = {}
+            contract = {
+                "passed": False,
+                "repairable": True,
+                "issues": ["synthesis returned invalid JSON"],
             }
+        else:
+            _record_call(run, synthesis_result)
+            plan_result = _required_output(synthesis_result, "plan_result")
+            contract = _required_output(synthesis_result, "contract_report")
+            run["stages"].append(_stage_record(synthesis_result, contract))
+
+        if not contract.get("passed") and contract.get("repairable") and self.max_repair_attempts:
+            self._emit(f"Repairing final protocol contract for {hypothesis_id}.")
+            repair_result = self._call(
+                "repair",
+                {
+                    "task_id": task_id,
+                    "iteration": iteration,
+                    "hypothesis_id": hypothesis_id,
+                    "planning_brief": synthesis_brief,
+                    "invalid_result": plan_result,
+                    "contract_issues": contract.get("issues", []),
+                },
+                _event_context(hypothesis_id, "repair"),
+            )
+            _record_call(run, repair_result)
+            plan_result = _required_output(repair_result, "plan_result")
+            contract = _required_output(repair_result, "contract_report")
+            run["stages"].append(_stage_record(repair_result, contract))
+
+        if not contract.get("passed"):
+            run["status"] = "failed"
+            run["next_action"] = "inspect_contract_failure"
+            run["errors"] = [str(item) for item in contract.get("issues", [])]
+            run["final_result"] = plan_result
+            return _finish_run(run, started)
+
+        if review_failures:
+            plan_result["status"] = "partial_success"
+            plan = plan_result.get("plan")
+            if isinstance(plan, dict):
+                limitations = plan.setdefault("limitations", [])
+                if isinstance(limitations, list):
+                    limitations.append(
+                        "Specialist review unavailable: " + ", ".join(sorted(review_failures))
+                    )
+        run["final_result"] = plan_result
+        run["status"] = str(plan_result.get("status") or "success")
+        run["next_action"] = "continue_to_product"
+        return _finish_run(run, started)
+
+    def _run_reviews(
+        self,
+        task_id: str,
+        iteration: int,
+        hypothesis_id: str,
+        brief: dict[str, Any],
+        draft: dict[str, Any],
+    ) -> tuple[
+        list[dict[str, Any]],
+        dict[str, str],
+        list[dict[str, Any]],
+        list[StageRunResult],
+    ]:
+        reviews_by_role: dict[str, dict[str, Any]] = {}
+        failures: dict[str, str] = {}
+        stage_by_role: dict[str, dict[str, Any]] = {}
+        calls_by_role: dict[str, StageRunResult] = {}
+
+        def review(role: str) -> tuple[str, StageRunResult]:
+            result = self._call(
+                f"review_{role}",
+                {
+                    "task_id": task_id,
+                    "iteration": iteration,
+                    "hypothesis_id": hypothesis_id,
+                    "planning_brief": brief,
+                    "protocol_draft": draft,
+                },
+                _event_context(hypothesis_id, "review", review_role=role),
+            )
+            return role, result
+
+        with ThreadPoolExecutor(max_workers=len(REVIEW_ROLES), thread_name_prefix="planning-review") as executor:
+            futures = {executor.submit(review, role): role for role in REVIEW_ROLES}
             for future in as_completed(futures):
-                variant = futures[future]
+                role = futures[future]
                 try:
-                    runs_by_variant[variant] = future.result()
-                except DifyWorkflowAPIError as exc:
-                    runs_by_variant[variant] = {
-                        "variant_mode": variant,
+                    _, result = future.result()
+                    calls_by_role[role] = result
+                    contract = _required_output(result, "contract_report")
+                    stage_by_role[role] = _stage_record(result, contract, review_role=role)
+                    if not contract.get("passed"):
+                        failures[role] = "; ".join(
+                            str(item) for item in contract.get("issues", [])
+                        ) or "review contract failed"
+                        continue
+                    reviews_by_role[role] = _required_output(result, "protocol_review")
+                except PlanningExecutionError as exc:
+                    failures[role] = str(exc)
+                    stage_by_role[role] = {
+                        "name": f"review_{role}",
+                        "review_role": role,
                         "status": "failed",
-                        "error": str(exc),
+                        "issues": [str(exc)],
                     }
-        runs = [runs_by_variant[variant] for variant in variants]
-        candidates = [
-            item["outputs"]["design_candidate"]
-            for item in runs
-            if item.get("status") in {"success", "degraded"}
-            and isinstance(item.get("outputs", {}).get("design_candidate"), dict)
-        ]
-        degraded_count = sum(item.get("status") == "degraded" for item in runs)
-        guardrails = [
-            item["outputs"]["guardrail_report"]
-            for item in runs
-            if isinstance(item.get("outputs", {}).get("guardrail_report"), dict)
-        ]
-        stage_status = (
-            "success"
-            if len(candidates) == len(variants) and degraded_count == 0
-            else "partial_success" if candidates else "failed"
-        )
-        stage = {
-            "stage_id": "candidate_generation",
-            "round": round_number,
-            "status": stage_status,
-            "duration_seconds": round(time.monotonic() - started, 3),
-            "accepted_candidate_count": len(candidates),
-            "rejected_candidate_count": len(variants) - len(candidates),
-            "degraded_candidate_count": degraded_count,
-            "runs": runs,
-        }
-        return stage, candidates, guardrails
 
-    def _run_candidate(
-        self,
-        data: dict[str, Any],
-        package: dict[str, Any],
-        variant: str,
-        constraints: dict[str, Any],
-        round_number: int,
-    ) -> dict[str, Any]:
-        inputs = build_dify_workflow_inputs(data, package)
-        inputs["variant_mode"] = variant
-        inputs["_feedback"] = str(data.get("_feedback") or "")
-        inputs["planning_constraints"] = _json_text(constraints)
-        result = self.candidate_client.run(
-            inputs,
-            event_context={
-                "workflow_stage": "A",
-                "hypothesis_id": str(package.get("hypothesis_id") or ""),
-                "variant_mode": variant,
-                "round": round_number,
-                "attempt": 1,
-            },
-        )
-        candidate = _required_object(result.outputs, "design_candidate", "Workflow A")
-        guardrail = _required_object(result.outputs, "guardrail_report", "Workflow A")
-        if candidate.get("hypothesis_id") != package.get("hypothesis_id"):
-            raise DifyWorkflowAPIError(
-                f"Workflow A {variant} returned a mismatched hypothesis_id."
-            )
-        outputs = dict(result.outputs)
-        accepted = guardrail.get("passed") is True and candidate.get("status") != "failed"
-        guard_issues = [
-            str(issue)
-            for issue in guardrail.get("issues", [])
-            if isinstance(issue, str) and issue.strip()
-        ]
-        repairable = (
-            not accepted
-            and candidate.get("status") != "failed"
-            and bool(guard_issues)
-            and all(_is_soft_candidate_guard_issue(issue) for issue in guard_issues)
-        )
-        if repairable:
-            candidate = _repair_degraded_candidate(
-                candidate, package, variant, constraints, guard_issues
-            )
-            guardrail = {
-                **guardrail,
-                "passed": True,
-                "soft_repair_applied": True,
-                "original_issues": guard_issues,
-            }
-            outputs["design_candidate"] = candidate
-            outputs["guardrail_report"] = guardrail
-        return {
-            "variant_mode": variant,
-            "status": "success" if accepted else "degraded" if repairable else "rejected",
-            "error": "" if accepted or repairable else "Workflow A guardrail rejected the candidate.",
-            "workflow_run_id": result.workflow_run_id,
-            "task_id": result.task_id,
-            "elapsed_time": result.elapsed_time,
-            "total_tokens": result.total_tokens,
-            "outputs": outputs,
-        }
+        reviews = [reviews_by_role[role] for role in REVIEW_ROLES if role in reviews_by_role]
+        stages = [stage_by_role[role] for role in REVIEW_ROLES]
+        calls = [calls_by_role[role] for role in REVIEW_ROLES if role in calls_by_role]
+        return reviews, failures, stages, calls
 
-    def _run_selection(
-        self,
-        data: dict[str, Any],
-        package: dict[str, Any],
-        candidates: list[dict[str, Any]],
-        constraints: dict[str, Any],
-        round_number: int,
-        attempt: int,
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
-        self._emit(
-            f"Workflow B round {round_number} attempt {attempt}: "
-            f"judging {len(candidates)} candidates."
-        )
-        started = time.monotonic()
-        base = build_dify_workflow_inputs(data, package)
-        inputs = {
-            "task_id": base["task_id"],
-            "iteration": base["iteration"],
-            "hypothesis_id": base["hypothesis_id"],
-            "design_candidates": _json_text(candidates),
-            "hypothesis_evidence_package": base["hypothesis_evidence_package"],
-            "planning_constraints": _json_text(constraints),
-            "user_constraints": base["user_constraints"],
-        }
-        result = self.selector_client.run(
-            inputs,
-            event_context={
-                "workflow_stage": "B",
-                "hypothesis_id": str(base["hypothesis_id"]),
-                "round": round_number,
-                "attempt": attempt,
-            },
-        )
-        selection = _required_object(result.outputs, "design_selection", "Workflow B")
-        selected_design = _required_object(result.outputs, "selected_design", "Workflow B")
-        guardrail = _required_object(
-            result.outputs, "selection_guardrail_report", "Workflow B"
-        )
-        stage = {
-            "stage_id": "design_selection",
-            "round": round_number,
-            "attempt": attempt,
-            "status": "success",
-            "decision": selection.get("decision", "failed"),
-            "duration_seconds": round(time.monotonic() - started, 3),
-            "workflow_run_id": result.workflow_run_id,
-            "task_id": result.task_id,
-            "elapsed_time": result.elapsed_time,
-            "total_tokens": result.total_tokens,
-            "outputs": result.outputs,
-        }
-        return stage, selection, selected_design, guardrail
+    def _call(
+        self, stage: str, inputs: dict[str, Any], event_context: dict[str, Any]
+    ) -> StageRunResult:
+        while not self._model_slots.acquire(timeout=0.2):
+            self._check_cancelled()
+        try:
+            self._check_cancelled()
+            return self.client.run(stage, inputs, event_context)
+        finally:
+            self._model_slots.release()
 
-    def _run_final_plan(
-        self,
-        report: dict[str, Any],
-        data: dict[str, Any],
-        package: dict[str, Any],
-        constraints: dict[str, Any],
-        selection: dict[str, Any],
-        selected_design: dict[str, Any],
-    ) -> None:
-        self._emit("Workflow C: generating the final research plan from the accepted design.")
-        started = time.monotonic()
-        base = build_dify_workflow_inputs(data, package)
-        c_constraints, context_info = _build_c_constraints(
-            constraints,
-            selection,
-            selected_design,
-            self.max_c_context_chars,
-        )
-        base["planning_constraints"] = _json_text(c_constraints)
-        result = self.planner_client.run(
-            base,
-            event_context={
-                "workflow_stage": "C",
-                "hypothesis_id": str(base["hypothesis_id"]),
-                "selected_candidate_id": str(selected_design.get("candidate_id") or ""),
-            },
-        )
-        plan_result = dict(_required_object(result.outputs, "plan_result", "Workflow C"))
-        normalized_identity_fields = []
-        expected_identity = {
-            "schema_version": "experiment_planner_plan_result_v1",
-            "agent_name": "ExperimentPlannerAgent",
-            "task_id": base["task_id"],
-            "iteration": base["iteration"],
-            "hypothesis_id": base["hypothesis_id"],
-        }
-        for field, expected in expected_identity.items():
-            if plan_result.get(field) != expected:
-                normalized_identity_fields.append(field)
-            plan_result[field] = expected
-        plan = plan_result.get("plan")
-        if not isinstance(plan, dict):
-            raise DifyWorkflowAPIError("Workflow C plan_result.plan must be an object.")
-        business_status = str(
-            plan_result.get("status") or ("success" if plan else "failed")
-        )
-        if business_status not in {"success", "partial_success", "failed"}:
-            business_status = "failed"
-            plan_result["status"] = "failed"
-            plan_result["error_message"] = "Workflow C returned an invalid business status."
-        else:
-            plan_result["status"] = business_status
-        if not plan and business_status in {"success", "partial_success"}:
-            business_status = "failed"
-            plan_result["status"] = "failed"
-            plan_result["error_message"] = str(
-                plan_result.get("error_message") or "Workflow C returned an empty plan."
-            )
-        stage = {
-            "stage_id": "final_plan_generation",
-            "round": 1,
-            "status": business_status,
-            "duration_seconds": round(time.monotonic() - started, 3),
-            "workflow_run_id": result.workflow_run_id,
-            "task_id": result.task_id,
-            "elapsed_time": result.elapsed_time,
-            "total_tokens": result.total_tokens,
-            "context_control": context_info,
-            "normalized_identity_fields": normalized_identity_fields,
-            "contract_report": result.outputs.get("contract_report", {}),
-            "outputs": result.outputs,
-        }
-        report["stages"].append(stage)
-        report["final_result"] = plan_result
-        if business_status == "success" and plan:
-            report["status"] = "success"
-            report["next_action"] = "continue_to_product"
-        elif business_status == "partial_success" and plan:
-            report["status"] = "requires_action"
-            report["next_action"] = "review_partial_plan"
-        else:
-            report["status"] = "failed"
-            report["next_action"] = "inspect_failure"
-            report["errors"].append(
-                str(plan_result.get("error_message") or "Workflow C returned a failed plan_result.")
-            )
-
-    def _stop_for_action(
-        self, report: dict[str, Any], decision: str, next_action: str
-    ) -> None:
-        report["status"] = "failed" if decision == "failed" else "requires_action"
-        report["next_action"] = next_action
-        self._emit(f"Stopping before Workflow C: decision={decision}, next_action={next_action}.")
+    def _check_cancelled(self) -> None:
+        if self.cancellation_checker:
+            self.cancellation_checker()
 
     def _emit(self, message: str) -> None:
         if self.progress_handler:
             self.progress_handler(message)
 
+    def _emit_local(
+        self,
+        stage: str,
+        event_name: str,
+        context: dict[str, Any],
+        **payload: Any,
+    ) -> None:
+        if not self.event_handler:
+            return
+        self.event_handler(
+            stage,
+            {"event": event_name, "stage": stage, **context, **payload},
+        )
 
-def _new_report(
-    data: dict[str, Any],
-    hypothesis_id: str | None,
-    variants: tuple[str, ...],
-    max_revisions: int,
+
+# One-version compatibility alias for callers that injected the former runner type.
+PlanningWorkflowChainRunner = PlanningProtocolRunner
+
+
+def _event_context(
+    hypothesis_id: str, planning_stage: str, *, review_role: str = ""
 ) -> dict[str, Any]:
-    return {
-        "schema_version": CHAIN_SCHEMA_VERSION,
-        "task_id": str(data.get("task_id") or ""),
-        "iteration": int(data.get("iteration") or 1),
-        "hypothesis_id": hypothesis_id or "",
-        "hypothesis": "",
-        "status": "running",
-        "decision": "",
-        "next_action": "",
-        "started_at": _utc_now(),
-        "completed_at": "",
-        "duration_seconds": 0.0,
-        "configuration": {
-            "variants": list(variants),
-            "max_revisions": max(0, max_revisions),
-        },
-        "stages": [],
-        "intermediate_results": {
-            "candidate_rounds": [],
-            "selection_rounds": [],
-        },
-        "final_result": None,
-        "errors": [],
+    context = {
+        "planning_stage": planning_stage,
+        "hypothesis_id": hypothesis_id,
+        "attempt": 1,
     }
-
-
-def _new_batch_report(
-    data: dict[str, Any],
-    variants: tuple[str, ...],
-    max_revisions: int,
-    max_parallel_hypotheses: int,
-) -> dict[str, Any]:
-    return {
-        "schema_version": BATCH_CHAIN_SCHEMA_VERSION,
-        "task_id": str(data.get("task_id") or ""),
-        "iteration": int(data.get("iteration") or 1),
-        "status": "running",
-        "next_action": "",
-        "started_at": _utc_now(),
-        "completed_at": "",
-        "duration_seconds": 0.0,
-        "configuration": {
-            "variants": list(variants),
-            "max_revisions": max(0, max_revisions),
-            "max_parallel_hypotheses": max_parallel_hypotheses,
-            "selection_order": "selection_score_desc",
-        },
-        "hypothesis_ids": [],
-        "summary": {
-            "total": 0,
-            "success": 0,
-            "requires_action": 0,
-            "failed": 0,
-        },
-        "hypothesis_runs": [],
-        "errors": [],
-    }
-
-
-def _validate_batch_packages(packages: list[dict[str, Any]]) -> None:
-    if not packages:
-        raise ValueError("No hypothesis evidence packages could be built from the input.")
-    hypothesis_ids = [str(package.get("hypothesis_id") or "") for package in packages]
-    if any(not hypothesis_id for hypothesis_id in hypothesis_ids):
-        raise ValueError("Every hypothesis must have a non-empty hypothesis_id.")
-    if len(set(hypothesis_ids)) != len(hypothesis_ids):
-        raise ValueError("Duplicate hypothesis_id values are not allowed in batch mode.")
-
-
-def _finalize_batch_status(report: dict[str, Any]) -> None:
-    runs = report.get("hypothesis_runs", [])
-    statuses = [str(item.get("status") or "failed") for item in runs]
-    summary = {
-        "total": len(statuses),
-        "success": statuses.count("success"),
-        "requires_action": statuses.count("requires_action"),
-        "failed": statuses.count("failed"),
-    }
-    report["summary"] = summary
-    if summary["total"] and summary["success"] == summary["total"]:
-        report["status"] = "success"
-        report["next_action"] = "continue_to_product"
-    elif summary["failed"] == summary["total"]:
-        report["status"] = "failed"
-        report["next_action"] = "inspect_failure"
-    elif summary["failed"]:
-        report["status"] = "partial_success"
-        report["next_action"] = "inspect_partial_failure"
-    elif summary["requires_action"]:
-        report["status"] = "requires_action"
-        report["next_action"] = "resolve_hypothesis_actions"
-    else:
-        report["status"] = "failed"
-        report["next_action"] = "inspect_failure"
-
-    report["errors"] = [
-        f"{run.get('hypothesis_id')}: {error}"
-        for run in runs
-        if run.get("status") == "failed"
-        for error in run.get("errors", [])
-    ]
-
+    if review_role:
+        context["review_role"] = review_role
+    return context
 
 
 def _select_package(
-    data: dict[str, Any], hypothesis_id: str | None
+    packages: list[dict[str, Any]], hypothesis_id: str | None
 ) -> dict[str, Any]:
-    packages = build_hypothesis_evidence_packages(data)
-    if hypothesis_id:
-        for package in packages:
-            if package.get("hypothesis_id") == hypothesis_id:
-                return package
-        raise ValueError(f"Unknown hypothesis_id: {hypothesis_id}")
-    selected = select_top_packages(packages, max_packages=1)
-    if not selected:
-        raise ValueError("No hypothesis evidence package could be built from the input.")
-    return selected[0]
+    if not packages:
+        raise ValueError("No hypothesis evidence package is available.")
+    if hypothesis_id is None:
+        return packages[0]
+    for package in packages:
+        if str(package.get("hypothesis_id") or "") == hypothesis_id:
+            return package
+    raise ValueError(f"Unknown hypothesis_id: {hypothesis_id}")
 
 
-def _required_object(outputs: dict[str, Any], key: str, workflow: str) -> dict[str, Any]:
-    value = outputs.get(key)
+def _required_output(result: StageRunResult, key: str) -> dict[str, Any]:
+    value = result.outputs.get(key)
     if not isinstance(value, dict):
-        raise DifyWorkflowAPIError(f"{workflow} output `{key}` is not a JSON object.")
+        raise PlanningExecutionError(f"Planning stage {result.stage} omitted {key}.")
     return value
-def _is_soft_candidate_guard_issue(issue: str) -> bool:
-    return any(
-        issue.startswith(prefix) for prefix in SOFT_CANDIDATE_GUARD_ISSUE_PREFIXES
-    )
 
 
-def _repair_degraded_candidate(
-    candidate: dict[str, Any],
-    package: dict[str, Any],
-    variant: str,
-    constraints: dict[str, Any],
-    guard_issues: list[str],
+def _record_call(run: dict[str, Any], result: StageRunResult) -> None:
+    run["model_call_count"] += 1
+    if isinstance(result.total_tokens, int):
+        run["total_tokens"] += result.total_tokens
+
+
+def _stage_record(
+    result: StageRunResult,
+    contract: dict[str, Any],
+    *,
+    review_role: str = "",
 ) -> dict[str, Any]:
-    hypothesis_id = str(package.get("hypothesis_id") or candidate.get("hypothesis_id") or "")
-    hypothesis = str(package.get("hypothesis") or "")
-    target_variables = [str(value) for value in package.get("target_variables", []) if value]
-    validation_types = [
-        str(value) for value in constraints.get("allowed_validation_types", []) if value
-    ]
-    evidence_ids: list[str] = []
-    subset = package.get("evidence_subset", {})
-    if isinstance(subset, Mapping):
-        for key in ("supporting_evidence", "opposing_evidence", "uncertain_evidence"):
-            values = subset.get(key, [])
-            if not isinstance(values, list):
-                continue
-            for item in values:
-                if isinstance(item, Mapping) and item.get("evidence_id"):
-                    evidence_ids.append(str(item["evidence_id"]))
-    source_ids = [
-        str(item["literature_id"])
-        for item in package.get("source_literature", [])
-        if isinstance(item, Mapping) and item.get("literature_id")
-    ]
-    expected_observation = str(package.get("expected_observation") or "")
-    validation_idea = str(package.get("validation_idea") or "")
-    existing_limitations = candidate.get("limitations", [])
-    if not isinstance(existing_limitations, list):
-        existing_limitations = [str(existing_limitations)]
-    limitations = list(
-        dict.fromkeys(
-            [str(item) for item in existing_limitations if item]
-            + guard_issues
-            + [
-                "Workflow A returned a fragment; "
-                "a conservative local contract repair was applied."
-            ]
-        )
-    )
-    design_type = str(candidate.get("design_type") or "")
-    if not design_type:
-        design_type = (
-            validation_types[0] if validation_types else "evidence_grounded_feasibility"
-        )
-    method_action = validation_idea or (
-        "Evaluate the supplied hypothesis using an allowed validation method "
-        "and available data."
-    )
-    metric_definition = expected_observation or (
-        "Estimate whether the observed pattern supports or weakens the supplied hypothesis."
-    )
+    record = {
+        "name": result.stage,
+        "status": "success" if contract.get("passed") else "failed",
+        "run_id": result.run_id,
+        "elapsed_time": result.elapsed_time,
+        "total_tokens": result.total_tokens,
+        "issues": contract.get("issues", []),
+    }
+    if review_role:
+        record["review_role"] = review_role
+    return record
+
+
+def _failed_hypothesis_report(
+    package: Mapping[str, Any], error: str
+) -> dict[str, Any]:
     return {
-        "schema_version": "design_candidate_v1",
-        "candidate_id": f"{hypothesis_id}::{variant}",
-        "hypothesis_id": hypothesis_id,
-        "variant_mode": variant,
-        "status": "partial_success",
-        "planning_objective": str(candidate.get("planning_objective") or hypothesis),
-        "design_type": design_type,
-        "rationale": {
-            "summary": str(package.get("rationale") or ""),
-            "evidence_ids": list(dict.fromkeys(evidence_ids)),
-            "source_ids": list(dict.fromkeys(source_ids)),
-        },
-        "variables": {"target_variables": target_variables},
-        "operationalization": [
-            {
-                "variable": variable,
-                "measurement": "Use an available documented measure and record provenance.",
-            }
-            for variable in target_variables
-        ],
-        "data_contract": {
-            "required_fields": target_variables,
-            "source_policy": (
-                "Use only user-provided or documented accessible data; "
-                "do not invent URLs."
-            ),
-        },
-        "method_steps": [
-            {
-                "step_id": 1,
-                "input": "Allowed evidence, supplied constraints, and available data",
-                "action": method_action,
-                "output": "Effect estimates, uncertainty, diagnostics, and provenance",
-            }
-        ],
-        "baselines": ["No-effect or simplest valid baseline"],
-        "metrics": [
-            {"name": "primary_hypothesis_metric", "definition": metric_definition}
-        ],
-        "statistical_analysis": validation_types or ["bounded feasibility analysis"],
-        "falsification_matrix": [
-            {
-                "scenario": (
-                    "The expected pattern is absent or reverses under valid analysis."
-                ),
-                "interpretation": "The supplied hypothesis is weakened or falsified.",
-            }
-        ],
-        "contingencies": [
-            {
-                "condition": "Required data are unavailable",
-                "action": (
-                    "Report the limitation and request the missing data "
-                    "without inventing a source."
-                ),
-            }
-        ],
-        "resource_profile": {
-            "resource_level": constraints.get("resource_level", "bounded"),
-            "plan_depth": constraints.get("plan_depth", "brief"),
-        },
-        "feedback_tasks": [],
-        "limitations": limitations,
+        "schema_version": "planning_protocol_run_v1",
+        "hypothesis_id": str(package.get("hypothesis_id") or ""),
+        "status": "failed",
+        "workflow_mode": "local_protocol_compiler",
+        "next_action": "inspect_failure",
+        "stages": [],
+        "intermediate_results": {},
+        "final_result": None,
+        "errors": [error],
+        "model_call_count": 0,
+        "total_tokens": 0,
     }
 
 
+def _finish_run(run: dict[str, Any], started: float) -> dict[str, Any]:
+    run["elapsed_time"] = round(time.monotonic() - started, 3)
+    return run
 
 
-def _build_c_constraints(
-    constraints: dict[str, Any],
-    selection: dict[str, Any],
-    selected_design: dict[str, Any],
-    max_chars: int,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    full = {
-        **constraints,
-        "selected_design": selected_design,
-        "design_selection": selection,
-    }
-    full_text = _json_text(full)
-    if len(full_text) <= max_chars:
-        return full, {
-            "strategy": "full_selection_context",
-            "serialized_chars": len(full_text),
-            "max_chars": max_chars,
-        }
-
-    compact_selection = {
-        key: selection.get(key)
-        for key in (
-            "schema_version",
-            "task_id",
-            "iteration",
-            "hypothesis_id",
-            "decision",
-            "selected_candidate_id",
-            "revision_instruction",
-            "meta_review",
-            "limitations",
-        )
-        if key in selection
-    }
-    compact = {
-        **constraints,
-        "selected_design": selected_design,
-        "design_selection": compact_selection,
-        "context_compaction": {
-            "applied": True,
-            "removed_fields": ["design_selection.candidate_reviews", "design_selection.feedback_tasks"],
-            "reason": "Workflow C planning_constraints character budget",
-        },
-    }
-    compact_text = _json_text(compact)
-    if len(compact_text) > max_chars:
-        raise ValueError(
-            "Accepted Workflow B context exceeds Workflow C planning_constraints limit: "
-            f"{len(compact_text)} > {max_chars} characters after safe compaction."
-        )
-    return compact, {
-        "strategy": "compact_selection_context",
-        "serialized_chars": len(compact_text),
-        "original_serialized_chars": len(full_text),
-        "max_chars": max_chars,
-    }
+def _repair_attempts() -> int:
+    if os.getenv("PLANNING_MAX_REPAIR_ATTEMPTS") is not None:
+        return _env_int("PLANNING_MAX_REPAIR_ATTEMPTS", 1)
+    # Deprecated compatibility alias for one release.
+    return _env_int("PLANNING_SELECTOR_MAX_FORMAT_RETRIES", 1)
 
 
-def _mapping(value: Any) -> dict[str, Any]:
-    return dict(value) if isinstance(value, Mapping) else {}
-
-
-def _json_text(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _context_limit() -> int:
+    if os.getenv("PLANNING_SYNTHESIS_CONTEXT_MAX_CHARS") is not None:
+        return _env_int("PLANNING_SYNTHESIS_CONTEXT_MAX_CHARS", 16000)
+    return _env_int("PLANNING_FINAL_CONTEXT_MAX_CHARS", 16000)
 
 
 def _env_int(name: str, default: int) -> int:
     value = os.getenv(name)
-    if value is None:
+    if not value:
         return default
     try:
         return int(value)
     except ValueError:
         return default
+
+
+def _utc_timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

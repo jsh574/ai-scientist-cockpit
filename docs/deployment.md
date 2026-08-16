@@ -10,7 +10,9 @@ Copy-Item backend\.env.example backend\.env
 .\start.ps1
 ```
 
-## Docker Compose
+在 `backend/.env` 填入 `DASHSCOPE_API_KEY`（或兼容的 Qwen/LLM Key）。Planning 使用本地 Python 协议编译器（草案、三类并行审查、综合定稿）远程调用百炼，不下载模型权重，也不要求 Docker Desktop、WSL 或 Dify。`start.ps1` 是 Windows 正式快速启动路径。
+
+## 可选的项目 Docker Compose
 
 先创建 `backend/.env` 并填入运行所需凭据，然后执行：
 
@@ -23,6 +25,8 @@ docker compose up --build
 - OpenAPI：http://localhost:8000/docs
 
 任务 Artifact 保存在命名卷 `scientist_artifacts` 中。不要把凭据写进 Dockerfile、镜像构建参数或 Git。
+
+这只是整个项目的可选部署方式，不是 Planning Agent 的运行依赖。
 
 ## 生产注意事项
 

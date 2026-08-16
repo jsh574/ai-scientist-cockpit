@@ -3,26 +3,27 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-
 _ENV_LOADED = False
 
 
 def load_dotenv(path: str | Path | None = None) -> Path | None:
-    """Load a small export-style .env file without overriding shell env vars."""
+    """Load export-style env files without overriding higher-priority values."""
     global _ENV_LOADED
-    env_path = Path(path) if path is not None else _find_env_file()
-    if env_path is None or not env_path.exists():
-        _ENV_LOADED = True
-        return None
-
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        parsed = _parse_env_line(raw_line)
-        if parsed is None:
+    env_paths = [Path(path)] if path is not None else _find_env_files()
+    first_loaded: Path | None = None
+    for env_path in env_paths:
+        if not env_path.is_file():
             continue
-        key, value = parsed
-        os.environ.setdefault(key, value)
+        if first_loaded is None:
+            first_loaded = env_path
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            parsed = _parse_env_line(raw_line)
+            if parsed is None:
+                continue
+            key, value = parsed
+            os.environ.setdefault(key, value)
     _ENV_LOADED = True
-    return env_path
+    return first_loaded
 
 
 def ensure_dotenv_loaded() -> None:
@@ -37,16 +38,21 @@ def ensure_dotenv_loaded() -> None:
         load_dotenv()
 
 
-def _find_env_file() -> Path | None:
-    candidates = [Path.cwd()]
+def _find_env_files() -> list[Path]:
     package_root = Path(__file__).resolve().parent.parent
-    if package_root not in candidates:
-        candidates.append(package_root)
-    for base in candidates:
-        env_path = base / ".env"
-        if env_path.exists():
-            return env_path
-    return None
+    project_root = package_root.parents[1]
+    candidates = [
+        project_root / ".env",
+        package_root / ".env",
+        project_root / "backend" / ".env",
+        Path.cwd() / ".env",
+    ]
+    unique: list[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in unique:
+            unique.append(resolved)
+    return unique
 
 
 def _parse_env_line(line: str) -> tuple[str, str] | None:

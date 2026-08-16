@@ -93,13 +93,6 @@ class Settings:
         )
         dashscope_credential = bool(os.getenv("DASHSCOPE_API_KEY"))
         qwen_credential = bool(os.getenv("DASHSCOPE_API_KEY") or os.getenv("QWEN_API_KEY"))
-        dify_credential = all(
-            bool(
-                (os.getenv(f"DIFY_WORKFLOW_{stage}_API_URL") or os.getenv("DIFY_API_URL"))
-                and os.getenv(f"DIFY_WORKFLOW_{stage}_API_KEY")
-            )
-            for stage in "ABC"
-        )
         evidence_mapping_mode = os.getenv("EVIDENCE_MAPPING_MODE", "auto").strip().lower()
         if evidence_mapping_mode not in {"auto", "llm", "rules"}:
             evidence_mapping_mode = "auto"
@@ -152,8 +145,8 @@ class Settings:
             "research_planning": status(
                 self.planning_agent_root,
                 credential_required=True,
-                credential_configured=dify_credential,
-                mode="dify_workflow",
+                credential_configured=any_credential,
+                mode="local_protocol_compiler",
             ),
             "artifact_service": {
                 "path": str(self.artifacts_root),

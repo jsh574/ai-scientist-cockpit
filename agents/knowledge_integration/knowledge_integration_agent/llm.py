@@ -7,16 +7,8 @@ import urllib.error
 import urllib.request
 from typing import Any, Protocol
 
-
-# Optional one-time local configuration.
-#
-# Preferred for shared code: set environment variables DASHSCOPE_API_KEY or
-# QWEN_API_KEY, and QWEN_MODEL.
-#
-# If this file is only used locally, you may fill QWEN_API_KEY once here.
-QWEN_API_KEY = "sk-fde4d29af91a4e71881e4b3fb217ad12"
-QWEN_MODEL = "qwen3.7-max"
-QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_QWEN_MODEL = "qwen3.7-max"
+DEFAULT_QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 
 class LLMClient(Protocol):
@@ -45,13 +37,14 @@ class QwenDashScopeClient:
             api_key
             or os.getenv("DASHSCOPE_API_KEY")
             or os.getenv("QWEN_API_KEY")
-            or QWEN_API_KEY
+            or os.getenv("LLM_API_KEY")
         )
-        self.model = model or os.getenv("QWEN_MODEL") or QWEN_MODEL
+        self.model = model or os.getenv("QWEN_MODEL") or os.getenv("LLM_MODEL") or DEFAULT_QWEN_MODEL
         self.base_url = (
             base_url
             or os.getenv("DASHSCOPE_BASE_URL")
-            or QWEN_BASE_URL
+            or os.getenv("LLM_BASE_URL")
+            or DEFAULT_QWEN_BASE_URL
         ).rstrip("/")
         self.timeout_seconds = timeout_seconds
 

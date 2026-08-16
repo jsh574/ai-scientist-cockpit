@@ -410,11 +410,12 @@ const stageActivityLabel: Record<StageId, Record<Language, string>> = {
 
 function getNodeActivityLabel(event: EventLog, language: Language) {
   const nodeId = String(event.data?.node_id ?? event.stage ?? "workflow");
-  if (nodeId.startsWith("dify_call:")) {
-    const hypothesisId = nodeId.slice("dify_call:".length);
+  if (nodeId.startsWith("planning:")) {
+    const [, hypothesisId, stage, variant] = nodeId.split(":");
+    const suffix = [stage, variant].filter(Boolean).join(" / ");
     return language === "zh"
-      ? `调用研究规划工作流（${hypothesisId}）`
-      : `Calling the planning workflow (${hypothesisId})`;
+      ? `本地研究规划 ${suffix}（${hypothesisId}）`
+      : `Local planning ${suffix} (${hypothesisId})`;
   }
   if (nodeActivityLabel[nodeId]) return nodeActivityLabel[nodeId][language];
   if (event.stage && stageOrder.includes(event.stage as StageId)) {
@@ -3429,7 +3430,7 @@ function ResearchStarter({
             <label><span>{zh ? "超时（秒）" : "Timeout (seconds)"}</span><input min={1} max={3600} type="number" value={modelPolicy?.timeout_seconds ?? 120} onChange={(event) => onModelPolicyChange({ timeout_seconds: Number(event.target.value) })} /></label>
             <label className="model-policy-check"><input type="checkbox" checked={modelPolicy?.thinking_enabled ?? false} onChange={(event) => onModelPolicyChange({ thinking_enabled: event.target.checked })} /><span>{zh ? "启用思考模式" : "Enable thinking"}</span></label>
             <p>{(modelPolicy?.max_tokens ?? 6144) >= 8192 || (modelPolicy?.thinking_enabled ?? false) ? (zh ? "高耗时/高成本配置" : "Higher latency/cost configuration") : (zh ? "标准耗时/成本" : "Standard latency/cost")}</p>
-            {health?.model_policy?.dify_unsupported_fields.length ? <small>Dify {zh ? "不支持统一下发" : "does not accept"}: {health.model_policy.dify_unsupported_fields.join(", ")}</small> : null}
+            {health?.planning_runtime ? <small>{zh ? "Planning 本地协议编译" : "Planning local protocol compiler"}: {health.planning_runtime.model}; thinking: {health.planning_runtime.thinking_enabled_for.join(", ") || "off"}; synthesis: off</small> : null}
           </details>
         </section>
 
@@ -5149,6 +5150,14 @@ interface DisplayPlanStep {
   outputs: string[];
 }
 
+interface DisplayPlanExperiment {
+  id: string;
+  objective: string;
+  independent_variables: string[];
+  dependent_variables: string[];
+  control_variables: string[];
+}
+
 interface DisplayResearchPlan {
   problem_statement: string;
   paper_title: string;
@@ -5167,6 +5176,7 @@ interface DisplayResearchPlan {
     candidate_models_or_algorithms: string[];
     statistical_tests: string[];
     software_stack: string[];
+    reproducibility_settings: string[];
   };
   methods: {
     overall_design: string;
@@ -5177,6 +5187,7 @@ interface DisplayResearchPlan {
     target: DisplayPlanDataset[];
   };
   experiments: {
+    items: DisplayPlanExperiment[];
     main_experiment: {
       objective: string;
       independent_variables: string[];
@@ -5191,6 +5202,7 @@ interface DisplayResearchPlan {
   results: {
     result_type: string;
     expected_findings: string[];
+    uncertainty_reporting: string[];
     feasibility_check: string;
     falsification_criteria: string[];
   };
@@ -5201,6 +5213,7 @@ interface DisplayResearchPlan {
     year: string;
     doi: string;
     url: string;
+    citation: string;
   }>;
   feedback_tasks: Array<{
     priority: string;
@@ -5216,20 +5229,29 @@ function researchPlanRecord(value: unknown): Record<string, unknown> {
 }
 
 function researchPlanStrings(value: unknown): string[] {
-  return arrayValue(value)
-    .map((item) => stringValue(item).trim())
-    .filter(Boolean);
+  if (typeof value === "string") return value.trim() ? [value.trim()] : [];
+  return arrayValue(value).map((item) => {
+    if (typeof item === "string") return item.trim();
+    const record = researchPlanRecord(item);
+    return objectField(record, "name")
+      || objectField(record, "description")
+      || objectField(record, "definition")
+      || objectField(record, "action");
+  }).filter(Boolean);
 }
 
 function researchPlanNamedItems(value: unknown): DisplayPlanNamedItem[] {
-  return arrayValue(value).map((item, index) => {
+  const values = typeof value === "string"
+    ? [value]
+    : (value && typeof value === "object" && !Array.isArray(value) ? [value] : arrayValue(value));
+  return values.map((item, index) => {
     if (typeof item === "string") {
       return { name: item, description: "" };
     }
     const record = researchPlanRecord(item);
     return {
-      name: objectField(record, "name") || objectField(record, "description") || `Item ${index + 1}`,
-      description: objectField(record, "description"),
+      name: objectField(record, "name") || objectField(record, "metric") || objectField(record, "description") || `Item ${index + 1}`,
+      description: objectField(record, "description") || objectField(record, "definition") || objectField(record, "usage"),
     };
   });
 }
@@ -5249,9 +5271,9 @@ function researchPlanDatasets(value: unknown, target = false): DisplayPlanDatase
     return {
       id: objectField(record, "dataset_id"),
       name: objectField(record, "name") || `Dataset ${index + 1}`,
-      description: objectField(record, target ? "description" : "usage"),
-      fields: researchPlanStrings(objectValue(record, target ? "fields" : "required_fields")),
-      status: target ? "" : objectField(record, "access_status"),
+      description: objectField(record, target ? "description" : "usage") || objectField(record, "description"),
+      fields: researchPlanStrings(record[target ? "fields" : "required_fields"] ?? record.fields),
+      status: target ? "" : objectField(record, "access_status") || objectField(record, "status"),
     };
   });
 }
@@ -5260,18 +5282,68 @@ function normalizeResearchPlan(plan: unknown): DisplayResearchPlan {
   const raw = researchPlanRecord(plan);
   const rationale = researchPlanRecord(raw.rationale);
   const technicalDetails = researchPlanRecord(raw.technical_details);
-  const methods = researchPlanRecord(raw.methods);
-  const datasets = researchPlanRecord(raw.datasets);
-  const experiments = researchPlanRecord(raw.experiments);
-  const mainExperiment = researchPlanRecord(experiments.main_experiment);
+  const legacyMethods = researchPlanRecord(raw.methods);
+  const methodRows = Array.isArray(raw.methods) ? arrayValue(raw.methods) : arrayValue(legacyMethods.steps);
+  const legacyDatasets = researchPlanRecord(raw.datasets);
+  const flatDatasets = Array.isArray(raw.datasets) ? arrayValue(raw.datasets) : [];
+  const sourceDatasets = flatDatasets.length
+    ? flatDatasets.filter((value) => {
+      const dataset = researchPlanRecord(value);
+      return (objectField(dataset, "role") || objectField(dataset, "dataset_role")).toLowerCase() !== "target";
+    })
+    : legacyDatasets.source;
+  const targetDatasets = flatDatasets.length
+    ? flatDatasets.filter((value) => {
+      const dataset = researchPlanRecord(value);
+      return (objectField(dataset, "role") || objectField(dataset, "dataset_role")).toLowerCase() === "target";
+    })
+    : legacyDatasets.target;
+  const legacyExperiments = researchPlanRecord(raw.experiments);
+  const experimentRows = Array.isArray(raw.experiments)
+    ? arrayValue(raw.experiments)
+    : arrayValue(legacyExperiments.items ?? legacyExperiments.experiments);
+  const declaredMainExperiment = researchPlanRecord(legacyExperiments.main_experiment);
+  const mainExperiment = Object.keys(declaredMainExperiment).length
+    ? declaredMainExperiment
+    : researchPlanRecord(experimentRows[0]);
+  const mainVariables = researchPlanRecord(mainExperiment.variables);
   const results = researchPlanRecord(raw.results);
+  const experimentValues = (key: string) => {
+    const declared = researchPlanStrings(legacyExperiments[key]);
+    return declared.length
+      ? declared
+      : experimentRows.flatMap((value) => researchPlanStrings(researchPlanRecord(value)[key]));
+  };
+  const experimentNamedValues = (key: string) => {
+    const declared = researchPlanNamedItems(legacyExperiments[key]);
+    return declared.length
+      ? declared
+      : experimentRows.flatMap((value) => researchPlanNamedItems(researchPlanRecord(value)[key]));
+  };
+  const displayExperiments = experimentRows.map((value, index) => {
+    const experiment = researchPlanRecord(value);
+    const variables = researchPlanRecord(experiment.variables);
+    return {
+      id: objectField(experiment, "experiment_id") || objectField(experiment, "id") || `E${index + 1}`,
+      objective: objectField(experiment, "objective"),
+      independent_variables: researchPlanStrings(
+        variables.independent ?? experiment.independent_variables ?? experiment.interventions,
+      ),
+      dependent_variables: researchPlanStrings(
+        variables.dependent ?? experiment.dependent_variables ?? experiment.outcomes,
+      ),
+      control_variables: researchPlanStrings(
+        variables.control ?? experiment.control_variables ?? experiment.controls,
+      ),
+    };
+  });
 
   return {
     problem_statement: objectField(raw, "problem_statement"),
     paper_title: objectField(raw, "paper_title"),
     paper_abstract: objectField(raw, "paper_abstract"),
     rationale: {
-      text: objectField(rationale, "text"),
+      text: objectField(rationale, "text") || objectField(rationale, "summary"),
       logic_chain: arrayValue(rationale.logic_chain).map((value, index) => {
         const step = researchPlanRecord(value);
         return {
@@ -5283,50 +5355,66 @@ function normalizeResearchPlan(plan: unknown): DisplayResearchPlan {
       }),
     },
     technical_details: {
-      required_methods: researchPlanStrings(technicalDetails.required_methods),
+      required_methods: researchPlanStrings(
+        technicalDetails.required_methods ?? technicalDetails.methods_required,
+      ),
       candidate_models_or_algorithms: researchPlanStrings(
-        technicalDetails.candidate_models_or_algorithms,
+        technicalDetails.candidate_models_or_algorithms ?? technicalDetails.candidate_algorithms,
       ),
       statistical_tests: researchPlanStrings(technicalDetails.statistical_tests),
-      software_stack: researchPlanStrings(technicalDetails.software_stack),
+      software_stack: researchPlanStrings(
+        technicalDetails.software_stack ?? technicalDetails.software_environment,
+      ),
+      reproducibility_settings: researchPlanStrings(technicalDetails.reproducibility_settings),
     },
     methods: {
-      overall_design: objectField(methods, "overall_design"),
-      steps: arrayValue(methods.steps).map((value, index) => {
+      overall_design: objectField(legacyMethods, "overall_design")
+        || objectField(mainExperiment, "design")
+        || objectField(mainExperiment, "objective"),
+      steps: methodRows.map((value, index) => {
         const step = researchPlanRecord(value);
         const id = objectField(step, "step_id");
         return {
           id,
-          name: objectField(step, "name") || id || `Step ${index + 1}`,
-          description: objectField(step, "description"),
+          name: objectField(step, "name") || objectField(step, "action") || id || `Step ${index + 1}`,
+          description: objectField(step, "description") || objectField(step, "action"),
           inputs: researchPlanStrings(step.inputs ?? step.input),
           outputs: researchPlanStrings(step.outputs ?? step.output),
         };
       }),
     },
     datasets: {
-      source: researchPlanDatasets(datasets.source),
-      target: researchPlanDatasets(datasets.target, true),
+      source: researchPlanDatasets(sourceDatasets),
+      target: researchPlanDatasets(targetDatasets, true),
     },
     experiments: {
+      items: displayExperiments,
       main_experiment: {
         objective: objectField(mainExperiment, "objective"),
-        independent_variables: researchPlanStrings(mainExperiment.independent_variables),
-        dependent_variables: researchPlanStrings(mainExperiment.dependent_variables),
-        control_variables: researchPlanStrings(mainExperiment.control_variables),
+        independent_variables: researchPlanStrings(
+          mainExperiment.independent_variables ?? mainVariables.independent ?? mainExperiment.interventions,
+        ),
+        dependent_variables: researchPlanStrings(
+          mainExperiment.dependent_variables ?? mainVariables.dependent ?? mainExperiment.outcomes,
+        ),
+        control_variables: researchPlanStrings(
+          mainExperiment.control_variables ?? mainVariables.control ?? mainExperiment.controls,
+        ),
       },
-      metrics: researchPlanNamedItems(experiments.metrics),
-      baselines: researchPlanNamedItems(experiments.baselines),
-      procedure: researchPlanStrings(experiments.procedure),
-      ablation_or_sensitivity_analysis: researchPlanStrings(
-        experiments.ablation_or_sensitivity_analysis,
-      ),
+      metrics: experimentNamedValues("metrics"),
+      baselines: experimentNamedValues("baselines"),
+      procedure: experimentValues("procedure"),
+      ablation_or_sensitivity_analysis: [
+        ...experimentValues("ablation_or_sensitivity_analysis"),
+        ...experimentValues("ablation_or_sensitivity"),
+      ],
     },
     results: {
       result_type: objectField(results, "result_type"),
-      expected_findings: researchPlanStrings(results.expected_findings),
+      expected_findings: researchPlanStrings(results.expected_findings ?? results.expected_results),
+      uncertainty_reporting: researchPlanStrings(results.uncertainty_reporting),
       feasibility_check: objectField(results, "feasibility_check"),
-      falsification_criteria: researchPlanStrings(results.falsification_criteria),
+      falsification_criteria: researchPlanStrings(results.falsification_criteria ?? results.stopping_or_falsification),
     },
     references: arrayValue(raw.references).map((value) => {
       const reference = researchPlanRecord(value);
@@ -5337,13 +5425,17 @@ function normalizeResearchPlan(plan: unknown): DisplayResearchPlan {
         year: stringValue(reference.year),
         doi: objectField(reference, "doi"),
         url: objectField(reference, "url"),
+        citation: objectField(reference, "citation"),
       };
     }),
     feedback_tasks: arrayValue(raw.feedback_tasks).map((value) => {
+      if (typeof value === "string") {
+        return { priority: "", objective: value.trim() };
+      }
       const task = researchPlanRecord(value);
       return {
         priority: objectField(task, "priority"),
-        objective: objectField(task, "objective"),
+        objective: objectField(task, "objective") || objectField(task, "description") || objectField(task, "expected_output"),
       };
     }),
     limitations: researchPlanStrings(raw.limitations),
@@ -5371,6 +5463,9 @@ ${values.length ? values.map((value) => `- ${value}`).join("\n") : "- --"}
 **Hypothesis:** ${item.hypothesis_id}`,
     `
 **Status:** ${item.status}`,
+    item.error_message ? `
+## Planning Error
+${item.error_message}` : "",
     `
 ## Problem
 ${plan.problem_statement}`,
@@ -5385,14 +5480,31 @@ ${plan.methods.overall_design}`,
     section("Models or Algorithms", plan.technical_details.candidate_models_or_algorithms),
     section("Statistical Tests", plan.technical_details.statistical_tests),
     section("Software Stack", plan.technical_details.software_stack),
+    section("Reproducibility Settings", plan.technical_details.reproducibility_settings),
     section("Source Datasets", plan.datasets.source.map(displayPlanDataset)),
-    section("Target Datasets", plan.datasets.target.map(displayPlanDataset)),
+    plan.datasets.target.length
+      ? section("Target Datasets", plan.datasets.target.map(displayPlanDataset))
+      : "",
+    section(
+      "Experiments",
+      plan.experiments.items.map((experiment) => [
+        experiment.objective,
+        `independent=${experiment.independent_variables.join(", ") || "--"}`,
+        `dependent=${experiment.dependent_variables.join(", ") || "--"}`,
+        `controls=${experiment.control_variables.join(", ") || "--"}`,
+      ].join(" | ")),
+    ),
     section("Metrics", plan.experiments.metrics.map(displayPlanNamedItem)),
     section("Baselines", plan.experiments.baselines.map(displayPlanNamedItem)),
     section("Procedure", plan.experiments.procedure),
     section("Expected Findings", plan.results.expected_findings),
+    section("Uncertainty Reporting", plan.results.uncertainty_reporting),
     section("Falsification Criteria", plan.results.falsification_criteria),
-    section("References", plan.references.map((reference) => `${reference.title} (${reference.year}) ${reference.doi || reference.url}`)),
+    section("References", plan.references.map((reference) => reference.citation
+      || `${reference.title || reference.source_id} (${reference.year}) ${reference.doi || reference.url}`)),
+    section("Feedback Tasks", plan.feedback_tasks.map((task) => task.priority
+      ? `[${task.priority}] ${task.objective}`
+      : task.objective)),
     section("Limitations", plan.limitations),
   ].join("\n");
 }
@@ -5471,23 +5583,23 @@ function ResearchPlanOutput({ language, researchPlan }: { language: Language; re
 
       <section className="plan-section plan-grid">
         <div><h4>{language === "zh" ? "技术路线" : "Technical approach"}</h4><PillList label={language === "zh" ? "必要方法" : "Required methods"} values={plan.technical_details.required_methods} /><PillList label={language === "zh" ? "模型或算法" : "Models or algorithms"} values={plan.technical_details.candidate_models_or_algorithms} /></div>
-        <div><h4>{language === "zh" ? "统计与软件" : "Statistics and software"}</h4><PillList label={language === "zh" ? "统计检验" : "Statistical tests"} values={plan.technical_details.statistical_tests} /><PillList label={language === "zh" ? "软件栈" : "Software stack"} values={plan.technical_details.software_stack} /></div>
+        <div><h4>{language === "zh" ? "统计、软件与复现" : "Statistics, software and reproducibility"}</h4><PillList label={language === "zh" ? "统计检验" : "Statistical tests"} values={plan.technical_details.statistical_tests} /><PillList label={language === "zh" ? "软件栈" : "Software stack"} values={plan.technical_details.software_stack} /><PillList label={language === "zh" ? "复现设置" : "Reproducibility"} values={plan.technical_details.reproducibility_settings} /></div>
       </section>
 
       <section className="plan-section plan-grid">
-        <div><h4>{language === "zh" ? "实验变量" : "Variables"}</h4><KeyValue label={language === "zh" ? "目标" : "Objective"} value={plan.experiments.main_experiment.objective} /><PillList label={language === "zh" ? "自变量" : "Independent"} values={plan.experiments.main_experiment.independent_variables} /><PillList label={language === "zh" ? "因变量" : "Dependent"} values={plan.experiments.main_experiment.dependent_variables} /><PillList label={language === "zh" ? "控制变量" : "Controls"} values={plan.experiments.main_experiment.control_variables} /></div>
+        <div><h4>{language === "zh" ? "实验变量" : "Variables"}</h4>{(plan.experiments.items.length ? plan.experiments.items : [{ id: "main", ...plan.experiments.main_experiment }]).map((experiment, index) => <div key={`${experiment.id}-${index}`}><KeyValue label={`${language === "zh" ? "目标" : "Objective"} ${index + 1}`} value={experiment.objective} /><PillList label={language === "zh" ? "自变量" : "Independent"} values={experiment.independent_variables} /><PillList label={language === "zh" ? "因变量" : "Dependent"} values={experiment.dependent_variables} /><PillList label={language === "zh" ? "控制变量" : "Controls"} values={experiment.control_variables} /></div>)}</div>
         <div><h4>{language === "zh" ? "指标与基线" : "Metrics and baselines"}</h4><BulletList label={language === "zh" ? "指标" : "Metrics"} values={plan.experiments.metrics.map(displayPlanNamedItem)} /><BulletList label={language === "zh" ? "基线" : "Baselines"} values={plan.experiments.baselines.map(displayPlanNamedItem)} /></div>
       </section>
 
       <section className="plan-section">
         <h4>{language === "zh" ? "数据" : "Data"}</h4>
-        <BulletList label={language === "zh" ? "源数据" : "Source datasets"} values={plan.datasets.source.map(displayPlanDataset)} />
-        <BulletList label={language === "zh" ? "目标数据" : "Target datasets"} values={plan.datasets.target.map(displayPlanDataset)} />
+        <BulletList label={language === "zh" ? "数据源与数据需求" : "Data sources and requirements"} values={plan.datasets.source.map(displayPlanDataset)} />
+        {plan.datasets.target.length ? <BulletList label={language === "zh" ? "目标数据" : "Target datasets"} values={plan.datasets.target.map(displayPlanDataset)} /> : null}
       </section>
 
       <section className="plan-section plan-grid">
         <div><h4>{language === "zh" ? "实验过程" : "Procedure"}</h4><BulletList label={language === "zh" ? "步骤" : "Steps"} values={plan.experiments.procedure} /><BulletList label={language === "zh" ? "消融/敏感性" : "Ablation/sensitivity"} values={plan.experiments.ablation_or_sensitivity_analysis} /></div>
-        <div><h4>{language === "zh" ? "预期结果" : "Expected results"}</h4><BulletList label={plan.results.result_type || (language === "zh" ? "预期发现" : "Expected findings")} values={plan.results.expected_findings} /><KeyValue label={language === "zh" ? "可行性" : "Feasibility"} value={plan.results.feasibility_check} /><BulletList label={language === "zh" ? "失败判据" : "Falsification"} values={plan.results.falsification_criteria} /></div>
+        <div><h4>{language === "zh" ? "预期结果" : "Expected results"}</h4><BulletList label={plan.results.result_type || (language === "zh" ? "预期发现" : "Expected findings")} values={plan.results.expected_findings} /><BulletList label={language === "zh" ? "不确定性报告" : "Uncertainty reporting"} values={plan.results.uncertainty_reporting} /><KeyValue label={language === "zh" ? "可行性" : "Feasibility"} value={plan.results.feasibility_check} /><BulletList label={language === "zh" ? "失败判据" : "Falsification"} values={plan.results.falsification_criteria} /></div>
       </section>
 
       <section className="plan-section">
@@ -5508,14 +5620,14 @@ function ResearchPlanOutput({ language, researchPlan }: { language: Language; re
         </div>
         <div className="reference-list">
           {plan.references.map((reference, index) => (
-            <article key={`${reference.source_id}-${index}`}><strong>{reference.title || reference.source_id}</strong><p>{reference.authors.join(", ") || "--"} · {reference.year || "--"}</p><a href={reference.url || (reference.doi ? `https://doi.org/${reference.doi}` : undefined)} target="_blank" rel="noreferrer">{reference.doi || reference.source_id}</a></article>
+            <article key={`${reference.source_id}-${index}`}><strong>{reference.title || reference.source_id}</strong><p>{reference.citation || `${reference.authors.join(", ") || "--"} · ${reference.year || "--"}`}</p><a href={reference.url || (reference.doi ? `https://doi.org/${reference.doi}` : undefined)} target="_blank" rel="noreferrer">{reference.doi || reference.source_id}</a></article>
           ))}
         </div>
       </section>
 
       <section className="plan-section plan-grid">
         <BulletList label={language === "zh" ? "限制" : "Limitations"} values={plan.limitations} />
-        <BulletList label={language === "zh" ? "反馈任务" : "Feedback tasks"} values={plan.feedback_tasks.map((item) => `[${item.priority || "-"}] ${item.objective}`)} />
+        <BulletList label={language === "zh" ? "反馈任务" : "Feedback tasks"} values={plan.feedback_tasks.map((item) => item.priority ? `[${item.priority}] ${item.objective}` : item.objective)} />
       </section>
 
       <details className="json-fallback-panel">
@@ -5767,20 +5879,21 @@ function getStageExpansionNodes(stage: StageRun, language: Language): StateTreeD
     ];
   }
   if (stage.id === "research_planning") {
-    const plan = ((payload.research_plan as Record<string, unknown> | undefined)?.plans as Array<Record<string, unknown>> | undefined)?.[0]?.plan as Record<string, unknown> | undefined;
+    const rawPlan = ((payload.research_plan as Record<string, unknown> | undefined)?.plans as Array<Record<string, unknown>> | undefined)?.[0]?.plan;
+    const plan = normalizeResearchPlan(rawPlan);
     return [
       {
         id: "problem_methods",
         sourceArtifact: "research_plan",
         title: language === "zh" ? "问题与方法" : "Problem and methods",
-        subtitle: trimPreview(`${stringValue(plan?.problem_statement)} · ${arrayValue(objectValue(plan?.technical_details, "required_methods")).slice(0, 3).join(", ")}`, 128),
+        subtitle: trimPreview(`${plan.problem_statement} · ${plan.technical_details.required_methods.slice(0, 3).join(", ")}`, 128),
       },
       {
         id: "data_metrics",
         sourceArtifact: "research_plan",
         title: language === "zh" ? "数据与指标" : "Data and metrics",
         subtitle: trimPreview(
-          `${joinPreview(arrayValue(objectValue(plan?.datasets, "source")), (item) => objectField(item, "name"), language)} · ${joinPreview(arrayValue(objectValue(plan?.experiments, "metrics")), (item) => objectField(item, "name"), language, 3)}`,
+          `${plan.datasets.source.slice(0, 3).map((item) => item.name).join(", ")} · ${plan.experiments.metrics.slice(0, 3).map(displayPlanNamedItem).join(", ")}`,
           128,
         ),
       },
@@ -5789,7 +5902,7 @@ function getStageExpansionNodes(stage: StageRun, language: Language): StateTreeD
         sourceArtifact: "research_plan",
         title: language === "zh" ? "失败判据与反馈" : "Falsification and feedback",
         subtitle: trimPreview(
-          `${joinPreview(arrayValue(objectValue(plan?.results, "falsification_criteria")), (item) => stringValue(item), language)} · ${joinPreview(arrayValue(plan?.feedback_tasks), (item) => objectField(item, "objective"), language)}`,
+          `${plan.results.falsification_criteria.slice(0, 3).join(", ")} · ${plan.feedback_tasks.slice(0, 3).map((item) => item.objective).join(", ")}`,
           128,
         ),
       },

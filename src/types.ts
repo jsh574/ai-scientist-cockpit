@@ -200,57 +200,36 @@ export interface ResearchPlanContent {
     candidate_models_or_algorithms?: string[];
     statistical_tests?: string[];
     software_stack?: string[];
+    reproducibility_settings?: string[];
   };
   datasets?: {
-    source?: Array<
-      | string
-      | {
-          dataset_id?: string;
-          name?: string;
-          usage?: string;
-          required_fields?: string[];
-          access_status?: string;
-        }
-    >;
-    target?: Array<
-      | string
-      | {
-          name?: string;
-          description?: string;
-          fields?: string[];
-        }
-    >;
+    source?: ResearchPlanDataset[];
+    target?: ResearchPlanDataset[];
   };
   paper_title?: string;
   paper_abstract?: string;
   methods?: {
     overall_design?: string;
-    steps?: Array<{
-      step_id?: string;
-      name?: string;
-      description?: string;
-      input?: string[];
-      output?: string[];
-      inputs?: string[];
-      outputs?: string[];
-    }>;
+    steps?: ResearchPlanMethodStep[];
   };
   experiments?: {
+    items?: ResearchPlanExperiment[];
     main_experiment?: {
       objective?: string;
       independent_variables?: string[];
       dependent_variables?: string[];
       control_variables?: string[];
-      [key: string]: unknown;
     };
-    baselines?: Array<string | { name?: string; description?: string }>;
-    metrics?: Array<string | { name?: string; description?: string }>;
+    baselines?: ResearchPlanNamedItem[];
+    metrics?: ResearchPlanNamedItem[];
     procedure?: string[];
     ablation_or_sensitivity_analysis?: string[];
+    stopping_or_falsification?: string[];
   };
   results?: {
     result_type?: string;
     expected_findings?: string[];
+    uncertainty_reporting?: string[];
     feasibility_check?: string;
     falsification_criteria?: string[];
   };
@@ -262,6 +241,7 @@ export interface ResearchPlanContent {
     doi?: string;
     url?: string;
     used_for?: string[];
+    citation?: string;
   }>;
   feedback_tasks?: Array<{
     task_id?: string;
@@ -272,6 +252,45 @@ export interface ResearchPlanContent {
     expected_output?: string;
   }>;
   limitations?: string[];
+}
+
+export interface ResearchPlanNamedItem {
+  name?: string;
+  description?: string;
+}
+
+export interface ResearchPlanDataset {
+  dataset_id?: string;
+  name?: string;
+  description?: string;
+  usage?: string;
+  required_fields?: string[];
+  access_status?: string;
+  source_hint?: string;
+}
+
+export interface ResearchPlanMethodStep {
+  step_id?: string;
+  name?: string;
+  description?: string;
+  inputs?: string[];
+  outputs?: string[];
+}
+
+export interface ResearchPlanExperiment {
+  experiment_id?: string;
+  objective?: string;
+  design?: string;
+  variables?: {
+    independent?: string[];
+    dependent?: string[];
+    control?: string[];
+  };
+  baselines?: ResearchPlanNamedItem[];
+  metrics?: ResearchPlanNamedItem[];
+  procedure?: string[];
+  ablation_or_sensitivity?: string[];
+  stopping_or_falsification?: string[];
 }
 
 export interface FinalReview {

@@ -107,12 +107,22 @@ class ReviewGate:
             for plan_item in plans or []:
                 plan = plan_item.get("plan") if isinstance(plan_item, dict) else {}
                 rationale = plan.get("rationale") if isinstance(plan, dict) else {}
-                for link in (rationale or {}).get("logic_chain") or []:
+                if not isinstance(rationale, dict):
+                    issues.append("Research plan rationale must be an object.")
+                    continue
+                logic_chain = rationale.get("logic_chain") or []
+                if not isinstance(logic_chain, list):
+                    issues.append("Research plan rationale.logic_chain must be an array.")
+                    continue
+                for link in logic_chain:
+                    if not isinstance(link, dict):
+                        issues.append("Research plan logic_chain entries must be objects.")
+                        continue
                     unknown.update(set(map(str, link.get("evidence_ids") or [])) - valid_evidence)
                     unknown.update(set(map(str, link.get("source_ids") or [])) - valid_literature)
             if unknown:
                 issues.append(f"Unknown source IDs in research plan: {sorted(unknown)}")
-            return (1.0 if not unknown else 0.0), issues
+            return (1.0 if not issues else 0.0), issues
 
         return 1.0, issues
 

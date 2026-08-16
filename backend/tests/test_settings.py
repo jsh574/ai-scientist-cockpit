@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 
+from backend.app.main import health
 from backend.app.settings import Settings, _load_environment_files
 
 
@@ -44,22 +45,19 @@ def test_load_environment_files_uses_documented_precedence(tmp_path, monkeypatch
     assert os.getenv("TEST_BACKEND_ONLY") == "backend-only"
 
 
-def test_planning_status_requires_complete_scoped_workflow_credentials(monkeypatch):
-    monkeypatch.setenv("DIFY_API_URL", "https://dify.example")
-    for stage in "ABC":
-        monkeypatch.setenv(f"DIFY_WORKFLOW_{stage}_API_KEY", f"key-{stage.lower()}")
+def test_planning_status_requires_a_bailian_compatible_credential(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
 
     planning = Settings.from_env().source_status()["research_planning"]
 
     assert planning["credential_configured"] is True
     assert planning["ready"] is True
+    assert planning["mode"] == "local_protocol_compiler"
 
 
-def test_planning_status_rejects_missing_workflow_c_key(monkeypatch):
-    monkeypatch.setenv("DIFY_API_URL", "https://dify.example")
-    monkeypatch.setenv("DIFY_WORKFLOW_A_API_KEY", "key-a")
-    monkeypatch.setenv("DIFY_WORKFLOW_B_API_KEY", "key-b")
-    monkeypatch.delenv("DIFY_WORKFLOW_C_API_KEY", raising=False)
+def test_planning_status_rejects_missing_model_credential(monkeypatch):
+    for name in ("DASHSCOPE_API_KEY", "QWEN_API_KEY", "LLM_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
 
     planning = Settings.from_env().source_status()["research_planning"]
 
@@ -67,10 +65,29 @@ def test_planning_status_rejects_missing_workflow_c_key(monkeypatch):
     assert planning["ready"] is False
 
 
-def test_planning_status_allows_per_workflow_urls(monkeypatch):
-    monkeypatch.delenv("DIFY_API_URL", raising=False)
-    for stage in "ABC":
-        monkeypatch.setenv(f"DIFY_WORKFLOW_{stage}_API_URL", f"https://{stage}.example")
-        monkeypatch.setenv(f"DIFY_WORKFLOW_{stage}_API_KEY", f"key-{stage.lower()}")
-
+def test_planning_status_accepts_shared_llm_credential(monkeypatch):
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    monkeypatch.delenv("QWEN_API_KEY", raising=False)
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
     assert Settings.from_env().source_status()["research_planning"]["ready"] is True
+
+
+def test_health_exposes_local_planning_runtime_without_dify_fields(monkeypatch):
+    monkeypatch.setenv("PLANNING_MODEL", "qwen-planning-test")
+    monkeypatch.setenv("QWEN_ENABLE_THINKING", "true")
+
+    payload = health()
+
+    assert payload["planning_runtime"] == {
+        "mode": "local_protocol_compiler",
+        "model": "qwen-planning-test",
+        "stages": [
+            "draft", "review_methodology", "review_statistics",
+            "review_feasibility", "synthesis", "repair_optional",
+        ],
+        "thinking_enabled_for": [
+            "draft", "review_methodology", "review_statistics", "review_feasibility",
+        ],
+        "synthesis_thinking": False,
+    }
+    assert set(payload["model_policy"]) == {"supported_fields"}

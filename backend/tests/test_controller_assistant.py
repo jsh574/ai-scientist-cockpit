@@ -153,6 +153,56 @@ class ControllerAssistantTests(unittest.TestCase):
         )
         self.assertEqual(review["agents_to_rerun"], ["research_planning"])
 
+    def test_workflow_rubric_scores_canonical_planning_contract(self) -> None:
+        context = {
+            "hypothesis_cards": [{"hypothesis_id": "hyp_1"}],
+            "research_plan": {
+                "plans": [
+                    {
+                        "hypothesis_id": "hyp_1",
+                        "plan": {
+                            "problem_statement": "Test the fixed hypothesis.",
+                            "paper_title": "Protocol",
+                            "paper_abstract": "A planned analysis.",
+                            "rationale": {
+                                "text": "Evidence-grounded rationale",
+                                "logic_chain": [{"evidence_ids": [], "source_ids": []}],
+                            },
+                            "technical_details": {
+                                "statistical_tests": ["TOST"],
+                                "software_stack": ["Python"],
+                            },
+                            "datasets": {"source": [{"name": "Input"}], "target": []},
+                            "methods": {
+                                "overall_design": "Controlled comparison",
+                                "steps": [{"name": "Prepare"}],
+                            },
+                            "experiments": {
+                                "items": [
+                                    {
+                                        "objective": "Compare groups",
+                                        "metrics": [{"name": "RMSD"}],
+                                        "baselines": [{"name": "Null"}],
+                                        "stopping_or_falsification": ["CI crosses zero"],
+                                    }
+                                ],
+                                "main_experiment": {"objective": "Compare groups"},
+                                "metrics": [{"name": "RMSD"}],
+                                "baselines": [{"name": "Null"}],
+                                "stopping_or_falsification": ["CI crosses zero"],
+                            },
+                            "results": {"falsification_criteria": ["CI crosses zero"]},
+                        },
+                    }
+                ]
+            },
+        }
+
+        rubric = self.assistant._workflow_rubric(context)
+
+        self.assertEqual(rubric["plan_executability"], 1.0)
+        self.assertEqual(rubric["reproducibility"], 1.0)
+
     def test_model_policy_is_snapshotted_without_credentials(self) -> None:
         context = self.orchestrator.create_task(
             TaskCreateRequest(

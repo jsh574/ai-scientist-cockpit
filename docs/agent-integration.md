@@ -63,11 +63,12 @@ npm run dev
 - `agents/registry.json` 是机器可读注册表，`backend/app/agent_protocol.py` 是运行时契约；两者变更必须同步并补测试。
 - Agent 只能返回本阶段声明的 payload 字段，Review Gate 会拒绝越权写入。
 - 五个 Agent 源码随主仓库提交；默认配置不包含机器相关的绝对路径。
-- OpenAI 兼容模型 Agent 共享 `ProjectLLMClient`，统一使用 `backend/.env` 中的模型、兼容地址、密钥、超时和 JSON 模式；Planning Agent 的 A/B/C 客户端共用 `DIFY_API_URL`，并分别读取 `DIFY_WORKFLOW_A_API_KEY`、`DIFY_WORKFLOW_B_API_KEY`、`DIFY_WORKFLOW_C_API_KEY`。
+- OpenAI 兼容模型 Agent 统一从 `backend/.env` 读取模型、兼容地址、密钥、超时和 JSON 模式；Planning Agent 的本地协议草案、三类审查、综合与可选修复共用百炼凭据，不需要第三方工作流平台。
 - 问题理解模块原有 `{status, meta, data}` 会被转换成标准信封。
 - `research_object`、`key_concepts`、`sub_questions`、`search_keywords` 会在问题理解与知识整合之间双向适配。
 - 任何异常都返回 `metadata.status=failed`，前端停止后续调度并展示 `self_review.issues`。
-- Planning Agent 保留原有输入校验、假设排序、多方案聚合和引用 ID 护栏；总控只负责适配模块 5 输入，实际计划生成继续调用其原生 Dify Workflow。
+- Planning Agent 保留输入校验、假设排序、协议草案、三类并行专家审查、确定性合并、综合定稿、可选契约修复、多方案聚合和引用 ID 护栏；总控传入模块 5 输入与任务 `model_policy`，本地 Python 编排直接调用百炼。
+- Planning 正式写出统一的 `experiment_planner_plan_result_v1` 嵌套契约，字段细节见 `agents/planning/docs/数据规范_v0.1.md`。模型数组/别名只在 Python 确定性边界归一化；前端对历史任务保持只读兼容，Markdown、详情页和摘要卡片复用同一归一化视图。
 - Evidence Mapping Agent 保留原有规则引擎，通过字段适配兼容总控的 `source_literature_id`、`support_direction` 和 `strength_score`。
 - 问题理解、知识整合、候选假设生成、证据梳理和研究计划调用真实 Agent；最终审核由后端 Orchestrator Review Gate 根据完整上下文生成。
 
@@ -90,7 +91,7 @@ npm run dev
 
 ## 附件输入
 
-附件上传后，Agent 可从 `user_input.attachments` 读取文件元数据，从 `user_input.question_description` 读取受长度限制的文本背景。OpenAI 兼容 Agent 的 `ProjectLLMClient` 会在模型调用前把这段背景加入用户消息；Planning Agent 使用 Dify Workflow，依赖上游结构化上下文和模块 5 输入传递背景。Agent 不应直接访问用户原始文件路径，也不能假设附件是二进制 PDF、图片或 Office 文档。
+附件上传后，Agent 可从 `user_input.attachments` 读取文件元数据，从 `user_input.question_description` 读取受长度限制的文本背景。Planning Agent 通过上游结构化上下文和模块 5 输入获得任务背景。Agent 不应直接访问用户原始文件路径，也不能假设附件是二进制 PDF、图片或 Office 文档。
 
 ## 新增 Agent 检查表
 

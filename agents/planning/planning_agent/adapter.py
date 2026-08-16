@@ -101,6 +101,9 @@ def build_hypothesis_evidence_packages(data: Mapping[str, Any]) -> list[dict[str
                 "limitations": evidence_map.get("main_limitations", []),
                 "needs_more_evidence": bool(evidence_map.get("needs_more_evidence")),
                 "evidence_summary": evidence_map.get("evidence_summary", {}),
+                # Preserve Evidence Mapping's completed analysis. Planning consumes
+                # these bindings/conflicts/gaps; it must not re-score the evidence.
+                "evidence_review": evidence_map.get("detailed_review", {}),
             }
         )
     return packages
@@ -116,7 +119,7 @@ def select_top_packages(
     )[: max(1, max_packages)]
 
 
-def build_dify_workflow_inputs(
+def build_stage_inputs(
     data: Mapping[str, Any], package: Mapping[str, Any]
 ) -> dict[str, Any]:
     return {

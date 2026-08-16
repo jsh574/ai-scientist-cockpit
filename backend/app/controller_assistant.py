@@ -367,31 +367,71 @@ class ControllerAssistant:
         for item in plans:
             plan = item.get("plan") if isinstance(item.get("plan"), dict) else {}
             rationale = plan.get("rationale") if isinstance(plan.get("rationale"), dict) else {}
-            methods = plan.get("methods") if isinstance(plan.get("methods"), dict) else {}
-            experiments = plan.get("experiments") if isinstance(plan.get("experiments"), dict) else {}
+            methods_value = plan.get("methods")
+            methods = methods_value if isinstance(methods_value, dict) else {}
+            method_steps = (
+                methods.get("steps")
+                if isinstance(methods.get("steps"), list)
+                else (methods_value if isinstance(methods_value, list) else [])
+            )
+            experiments_value = plan.get("experiments")
+            experiments = experiments_value if isinstance(experiments_value, dict) else {}
+            experiment_items = (
+                experiments.get("items")
+                if isinstance(experiments.get("items"), list)
+                else (experiments_value if isinstance(experiments_value, list) else [])
+            )
+            experiment_metrics = experiments.get("metrics") or [
+                metric
+                for experiment in experiment_items
+                if isinstance(experiment, dict)
+                for metric in (experiment.get("metrics") or [])
+            ]
             technical = plan.get("technical_details") if isinstance(plan.get("technical_details"), dict) else {}
-            datasets = plan.get("datasets") if isinstance(plan.get("datasets"), dict) else {}
+            datasets_value = plan.get("datasets")
+            datasets = datasets_value if isinstance(datasets_value, dict) else {}
+            dataset_entries = (
+                [*(datasets.get("source") or []), *(datasets.get("target") or [])]
+                if datasets
+                else (datasets_value if isinstance(datasets_value, list) else [])
+            )
+            results = plan.get("results") if isinstance(plan.get("results"), dict) else {}
+            falsification = (
+                results.get("falsification_criteria")
+                or experiments.get("stopping_or_falsification")
+                or experiments.get("falsification_criteria")
+                or [
+                    criterion
+                    for experiment in experiment_items
+                    if isinstance(experiment, dict)
+                    for criterion in (experiment.get("stopping_or_falsification") or [])
+                ]
+            )
+            software = technical.get("software_stack") or technical.get("software_environment")
             plan_scores.append(sum(
                 score
                 for score, present in (
                     (0.10, str(item.get("hypothesis_id") or "") in hypothesis_ids),
                     (0.10, bool(plan.get("problem_statement"))),
                     (0.15, bool(rationale.get("text")) and bool(rationale.get("logic_chain"))),
-                    (0.20, bool(methods.get("overall_design")) and bool(methods.get("steps"))),
-                    (0.15, bool(experiments.get("main_experiment")) and bool(experiments.get("metrics"))),
-                    (0.10, bool(experiments.get("falsification_criteria"))),
-                    (0.10, bool(experiments.get("baselines"))),
-                    (0.05, bool(datasets.get("source")) or bool(datasets.get("target"))),
+                    (0.20, bool(method_steps) and bool(methods.get("overall_design") or experiment_items)),
+                    (0.15, bool(experiments.get("main_experiment") or experiment_items) and bool(experiment_metrics)),
+                    (0.10, bool(falsification)),
+                    (0.10, bool(experiments.get("baselines")) or any(
+                        isinstance(experiment, dict) and bool(experiment.get("baselines"))
+                        for experiment in experiment_items
+                    )),
+                    (0.05, bool(dataset_entries)),
                     (0.05, bool(plan.get("paper_title")) and bool(plan.get("paper_abstract"))),
                 )
                 if present
             ))
             reproducibility_scores.append(self._average([
-                1.0 if technical.get("statistical_tests") and technical.get("software_stack") else 0.0,
-                1.0 if datasets.get("source") or datasets.get("target") else 0.0,
-                1.0 if methods.get("steps") else 0.0,
-                1.0 if experiments.get("metrics") else 0.0,
-                1.0 if experiments.get("falsification_criteria") else 0.0,
+                1.0 if technical.get("statistical_tests") and software else 0.0,
+                1.0 if dataset_entries else 0.0,
+                1.0 if method_steps else 0.0,
+                1.0 if experiment_metrics else 0.0,
+                1.0 if falsification else 0.0,
             ]))
 
         return {

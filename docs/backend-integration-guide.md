@@ -101,7 +101,7 @@ POST /api/tasks/{id}/attachments   multipart/form-data，字段名 files
 - 注入上下文的总字符数默认 30,000，可用 `ATTACHMENT_CONTEXT_CHARS` 调整。
 - 文件必须是 UTF-8 文本；服务端重新校验文件名、扩展名、编码和任务目录边界。
 - 前端先校验以改善体验，但不能替代服务端校验。
-- Artifact Service 把附件文本写入 `task_context.user_input.question_description`；OpenAI 兼容 Agent 的 `ProjectLLMClient` 会把该背景注入用户消息，Planning Agent 则通过上游结构化上下文和 Dify Workflow 输入获得任务背景。
+- Artifact Service 把附件文本写入 `task_context.user_input.question_description`；Planning Agent 通过上游结构化上下文和模块 5 输入获得任务边界，再由本地协议编译器调用百炼，不重复前置检索或假设生成。
 - 自动测试使用唯一标记断言附件文本实际出现在 OpenAI 兼容请求的 `messages[1].content`，用于防止“上传成功但模型看不到”的回归。
 
 ## 模型耗时与超时
@@ -144,3 +144,5 @@ POST /api/tasks/{id}/attachments   multipart/form-data，字段名 files
 ```
 
 前端必须用 `model` 动态显示真实模型名，不能写死 GPT 或 Qwen 版本；只能把 `ready=true` 计为可执行 Agent。源码目录存在但缺少模型密钥时应显示降级状态。
+
+健康响应另含 `planning_runtime`，其 `mode` 为 `local_protocol_compiler`，并展示 Planning 模型、draft / 三类 review / synthesis / optional repair，以及 synthesis 强制关闭 thinking。Planning 结构化事件节点 ID 为 `planning:{hypothesis_id}:brief`、`planning:{hypothesis_id}:draft`、`planning:{hypothesis_id}:review:{role}`、`planning:{hypothesis_id}:synthesis` 和可选 `planning:{hypothesis_id}:repair`。
