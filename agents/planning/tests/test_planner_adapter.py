@@ -1,8 +1,8 @@
 import json
 
 from planning_agent.adapter import (
-    build_dify_workflow_inputs,
     build_hypothesis_evidence_packages,
+    build_stage_inputs,
     select_top_packages,
     validate_planner_input,
 )
@@ -11,6 +11,9 @@ from planning_agent.sample_data import sample_planner_input, short_sample_planne
 
 def test_builds_evidence_packages_from_module_outputs():
     data = sample_planner_input()
+    data["evidence_map"][0]["detailed_review"] = {
+        "conflict_pairs": [{"evidence_id_a": "ev_001", "evidence_id_b": "ev_003"}]
+    }
 
     packages = build_hypothesis_evidence_packages(data)
 
@@ -30,6 +33,7 @@ def test_builds_evidence_packages_from_module_outputs():
     ]
     assert [gap["gap_id"] for gap in first["knowledge_gaps"]] == ["gap_001"]
     assert first["needs_more_evidence"] is True
+    assert first["evidence_review"]["conflict_pairs"]
 
 
 def test_selects_top_packages_by_relevance_testability_strength_and_risk():
@@ -62,11 +66,11 @@ def test_validate_planner_input_enforces_protocol_version_and_request_mode():
     assert "Field must be single or batch: request_mode" in errors
 
 
-def test_build_dify_workflow_inputs_serializes_one_package_for_one_dify_run():
+def test_build_stage_inputs_serializes_one_package_for_one_stage_run():
     data = sample_planner_input()
     package = build_hypothesis_evidence_packages(data)[0]
 
-    inputs = build_dify_workflow_inputs(data, package)
+    inputs = build_stage_inputs(data, package)
 
     assert inputs["task_id"] == data["task_id"]
     assert inputs["iteration"] == data["iteration"]

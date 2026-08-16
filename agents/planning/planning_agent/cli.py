@@ -10,7 +10,7 @@ from pathlib import Path
 from planning_agent.env import ensure_dotenv_loaded
 from planning_agent.sample_data import sample_planner_input, short_sample_planner_input
 from planning_agent.service import run_planning_agent
-from planning_agent.workflow_chain import PlanningWorkflowChainRunner
+from planning_agent.workflow_chain import PlanningProtocolRunner
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -30,17 +30,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--show-progress",
         action="store_true",
-        help="Print local and Dify streaming progress to stderr.",
+        help="Print local protocol-compiler progress to stderr.",
+    )
+    parser.add_argument(
+        "--print-runtime",
+        action="store_true",
+        help="Print the redacted local Bailian runtime configuration.",
     )
     parser.add_argument(
         "--print-targets",
         action="store_true",
-        help="Print all configured A/B/C Dify targets without sending requests.",
+        help="Deprecated alias for --print-runtime.",
     )
     args = parser.parse_args(argv)
 
-    if args.print_targets:
-        targets = PlanningWorkflowChainRunner.from_env().configuration_summary()
+    if args.print_runtime or args.print_targets:
+        targets = PlanningProtocolRunner.from_env().configuration_summary()
         print(json.dumps(targets, ensure_ascii=False, indent=2))
         return 0 if all(item.get("configured") for item in targets) else 1
 
@@ -55,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         parser.error("Provide --sample, --full-sample, or --input.")
 
-    progress_enabled = args.show_progress or _env_bool("DIFY_SHOW_PROGRESS", False)
+    progress_enabled = args.show_progress or _env_bool("PLANNING_SHOW_PROGRESS", False)
     response = run_planning_agent(
         data,
         progress_handler=_print_progress if progress_enabled else None,

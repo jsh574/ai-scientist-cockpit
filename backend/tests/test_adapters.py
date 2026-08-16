@@ -393,11 +393,15 @@ class AdapterContractTests(unittest.TestCase):
         self.assertIn("evidence_map", request)
         self.assertEqual(request["_feedback"], "优先降低样本量")
 
-    def test_planning_dify_output_reports_unknown_traceability_ids(self) -> None:
+    def test_planning_output_reports_unknown_traceability_ids(self) -> None:
         class FakeWorkflowChainRunner:
             def configuration_summary(self):
                 return [
-                    {"name": f"workflow_{stage.lower()}", "configured": True} for stage in "ABC"
+                    {"name": name, "configured": True}
+                    for name in (
+                        "draft", "review_methodology", "review_statistics",
+                        "review_feasibility", "synthesis", "repair",
+                    )
                 ]
 
             def run_batch(self, data, **_options):
@@ -468,16 +472,75 @@ class AdapterContractTests(unittest.TestCase):
             )
         )
 
-    def test_registry_auto_selects_configured_planning_workflow_chain(self) -> None:
+    def test_planning_review_events_use_role_scoped_node_ids(self) -> None:
+        updates = []
+
+        def run_planning_agent(data, **kwargs):
+            handler = kwargs["execution_event_handler"]
+            handler(
+                "review_statistics",
+                {
+                    "event": "stage_started",
+                    "planning_stage": "review",
+                    "hypothesis_id": "hyp_001",
+                    "review_role": "statistics",
+                    "attempt": 1,
+                },
+            )
+            handler(
+                "synthesis",
+                {
+                    "event": "stage_finished",
+                    "planning_stage": "synthesis",
+                    "hypothesis_id": "hyp_001",
+                    "total_tokens": 12,
+                },
+            )
+            return {
+                "metadata": {
+                    "task_id": data["task_id"],
+                    "agent_id": "research_planning_agent",
+                    "stage": "research_planning",
+                    "iteration": 1,
+                    "status": "success",
+                },
+                "payload": {
+                    "schema_version": "experiment_planner_output_v1",
+                    "task_id": data["task_id"],
+                    "iteration": 1,
+                    "status": "success",
+                    "plans": [],
+                },
+                "self_review": {"passed": True, "issues": [], "suggestions": []},
+            }
+
+        registry = AgentRegistry(Settings.from_env())
+        with patch(
+            "backend.app.adapters._load_package",
+            return_value=SimpleNamespace(run_planning_agent=run_planning_agent),
+        ):
+            registry._run_research_planning(
+                self.downstream_context(), None, progress_handler=updates.append
+            )
+
+        review = next(item for item in updates if item["node_id"].endswith("review:statistics"))
+        assert review["payload"]["review_role"] == "statistics"
+        aggregate = next(item for item in updates if item["node_id"] == "aggregate")
+        assert aggregate["payload"]["completed_plans"] == 1
+
+    def test_registry_auto_selects_configured_local_planning_chain(self) -> None:
         class FakeWorkflowChainRunner:
             def __init__(self) -> None:
                 self.calls = []
 
             def configuration_summary(self):
                 return [
-                    {"name": "workflow_a", "configured": True},
-                    {"name": "workflow_b", "configured": True},
-                    {"name": "workflow_c", "configured": True},
+                    {"name": "draft", "configured": True},
+                    {"name": "review_methodology", "configured": True},
+                    {"name": "review_statistics", "configured": True},
+                    {"name": "review_feasibility", "configured": True},
+                    {"name": "synthesis", "configured": True},
+                    {"name": "repair", "configured": True, "optional": True},
                 ]
 
             def run_batch(self, data, **options):
@@ -496,7 +559,7 @@ class AdapterContractTests(unittest.TestCase):
                                 "hypothesis_id": hypothesis_id,
                                 "status": "success",
                                 "error_message": "",
-                                "plan": {"problem_statement": "ABC 链路研究计划"},
+                                "plan": {"problem_statement": "协议编译研究计划"},
                             },
                             "errors": [],
                         }
@@ -518,7 +581,7 @@ class AdapterContractTests(unittest.TestCase):
         self.assertEqual(response["metadata"]["status"], "success")
         self.assertEqual(
             response["payload"]["research_plan"]["plans"][0]["plan"]["problem_statement"],
-            "ABC 链路研究计划",
+            "协议编译研究计划",
         )
         self.assertEqual(runner.calls[0][0]["_feedback"], "减少样本量并保留证据约束")
 

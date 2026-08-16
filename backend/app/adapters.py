@@ -743,7 +743,6 @@ class AgentRegistry:
         cancellation_checker: CancellationChecker | None = None,
     ) -> dict[str, Any]:
         service = _load_package(self.settings.planning_agent_root, "planning_agent.service")
-        current_node = {"id": "package_select"}
         completed_plans = {"count": 0}
 
         def emit(update: dict[str, Any]) -> None:
@@ -753,47 +752,39 @@ class AgentRegistry:
                 progress_handler(update)
 
         def service_progress(message: str) -> None:
-            hypothesis_match = re.search(r"hypothesis \d+/\d+: ([^ ]+)", message)
-            finished_match = re.search(r"hypothesis ([^:]+)", message)
-            if hypothesis_match:
-                hypothesis_id = hypothesis_match.group(1)
-                current_node["id"] = f"dify_call:{hypothesis_id}"
-                emit({
-                    "node_id": current_node["id"],
-                    "kind": "started",
-                    "message": message,
-                    "payload": {"hypothesis_id": hypothesis_id},
-                })
-                return
-            if message.startswith("Dify finished"):
-                completed_plans["count"] += 1
-                emit({
-                    "node_id": current_node["id"],
-                    "kind": "partial_output",
-                    "message": message,
-                    "payload": {"completed_plans": completed_plans["count"]},
-                    "operation": "append",
-                })
-                return
             emit({
-                "node_id": current_node["id"],
+                "node_id": "planning:orchestration",
                 "kind": "progress",
                 "message": message,
-                "payload": {"hypothesis_id": finished_match.group(1) if finished_match else None},
+                "payload": {},
             })
 
-        def dify_event(_workflow: str, event: dict[str, Any]) -> None:
-            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        def planning_event(stage: str, event: dict[str, Any]) -> None:
+            planning_stage = str(event.get("planning_stage") or stage).lower()
+            hypothesis_id = str(event.get("hypothesis_id") or "unknown")
+            review_role = str(event.get("review_role") or "")
+            node_id = f"planning:{hypothesis_id}:{planning_stage}"
+            if planning_stage == "review" and review_role:
+                node_id = f"{node_id}:{review_role}"
+            event_name = str(event.get("event") or "model_stream_progress")
+            if event_name == "stage_finished" and planning_stage in {"synthesis", "repair"}:
+                completed_plans["count"] += 1
+            kind = {
+                "stage_started": "started",
+                "stage_finished": "partial_output",
+                "stage_failed": "progress",
+            }.get(event_name, "progress")
+            safe_fields = (
+                "event", "stage", "planning_stage", "hypothesis_id", "review_role",
+                "attempt", "output_chars",
+                "total_tokens", "elapsed_time", "run_id", "error", "issue_count",
+            )
             emit({
-                "node_id": current_node["id"],
-                "kind": "progress",
-                "message": str(event.get("event") or "Dify progress"),
-                "payload": {
-                    "event": event.get("event"),
-                    "status": data.get("status"),
-                    "node_id": data.get("node_id"),
-                    "title": data.get("title"),
-                },
+                "node_id": node_id,
+                "kind": kind,
+                "message": f"Planning {planning_stage}: {event_name}",
+                "payload": {key: event[key] for key in safe_fields if key in event},
+                "operation": "append" if event_name == "stage_finished" else "replace",
             })
 
         emit({
@@ -807,7 +798,8 @@ class AgentRegistry:
             max_packages=int(os.getenv("PLANNING_MAX_HYPOTHESES", "2")),
             max_parallel_calls=int(os.getenv("PLANNING_MAX_PARALLEL_CALLS", "1")),
             progress_handler=service_progress,
-            workflow_event_handler=dify_event,
+            model_policy=task_context.get("model_policy"),
+            execution_event_handler=planning_event,
             cancellation_checker=cancellation_checker,
         )
         emit({

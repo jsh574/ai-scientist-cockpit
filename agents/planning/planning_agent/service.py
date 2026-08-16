@@ -9,24 +9,35 @@ from planning_agent.adapter import (
     select_top_packages,
     validate_planner_input,
 )
-from planning_agent.workflow_chain import PlanningWorkflowChainRunner
+from planning_agent.workflow_chain import PlanningProtocolRunner
+
+# Compatibility-only exported name for existing test/injection callers.
+PlanningWorkflowChainRunner = PlanningProtocolRunner
 
 AGENT_ID = "research_planning_agent"
 STAGE = "research_planning"
 ProgressHandler = Callable[[str], None]
-WorkflowEventHandler = Callable[[str, dict[str, Any]], None]
+ExecutionEventHandler = Callable[[str, dict[str, Any]], None]
+# Compatibility-only public type name for callers migrating to execution events.
+WorkflowEventHandler = ExecutionEventHandler
 CancellationChecker = Callable[[], None]
 
 
 def run_planning_agent(
     data: dict[str, Any],
-    workflow_runner: PlanningWorkflowChainRunner | None = None,
+    workflow_runner: PlanningProtocolRunner | None = None,
     max_packages: int | None = None,
     progress_handler: ProgressHandler | None = None,
     max_parallel_calls: int | None = None,
     workflow_event_handler: WorkflowEventHandler | None = None,
     cancellation_checker: CancellationChecker | None = None,
+    model_policy: dict[str, Any] | None = None,
+    execution_event_handler: ExecutionEventHandler | None = None,
 ) -> dict[str, Any]:
+    if workflow_event_handler is not None and execution_event_handler is not None:
+        raise ValueError(
+            "Use execution_event_handler; workflow_event_handler is only a compatibility alias."
+        )
     errors = validate_planner_input(data)
     if errors:
         return _failed_response(data, errors, score=0.0)
@@ -36,19 +47,19 @@ def run_planning_agent(
         packages,
         max_packages=max_packages or _max_hypotheses(data),
     )
-    runner = workflow_runner or PlanningWorkflowChainRunner.from_env(
+    runner = workflow_runner or PlanningProtocolRunner.from_env(
         progress_handler=progress_handler,
-        event_handler=workflow_event_handler,
+        event_handler=execution_event_handler or workflow_event_handler,
         cancellation_checker=cancellation_checker,
+        model_policy=model_policy,
     )
     if not _runner_is_configured(runner):
-        missing = ", ".join(_missing_workflows(runner)) or "workflow_a, workflow_b, workflow_c"
+        missing = ", ".join(_missing_stages(runner)) or "protocol compiler stages"
         return _failed_response(
             data,
             [
-                "Planning workflow chain is not configured. Set DIFY_API_URL and "
-                "DIFY_WORKFLOW_A_API_KEY, DIFY_WORKFLOW_B_API_KEY, and "
-                f"DIFY_WORKFLOW_C_API_KEY (missing: {missing})."
+                "Planning protocol compiler is not configured. Set DASHSCOPE_API_KEY "
+                f"and a supported Qwen model (missing: {missing})."
             ],
             score=0.0,
         )
@@ -60,26 +71,37 @@ def run_planning_agent(
     )
 
 
-def _runner_is_configured(runner: PlanningWorkflowChainRunner) -> bool:
+def _runner_is_configured(runner: PlanningProtocolRunner) -> bool:
     configured = {
         str(item.get("name")) for item in runner.configuration_summary() if item.get("configured")
     }
-    return {"workflow_a", "workflow_b", "workflow_c"} <= configured
+    return {
+        "draft",
+        "review_methodology",
+        "review_statistics",
+        "review_feasibility",
+        "synthesis",
+    } <= configured
 
 
-def _missing_workflows(runner: PlanningWorkflowChainRunner) -> list[str]:
+def _missing_stages(runner: PlanningProtocolRunner) -> list[str]:
     configured = {
         str(item.get("name")) for item in runner.configuration_summary() if item.get("configured")
     }
-    return [
-        stage for stage in ("workflow_a", "workflow_b", "workflow_c") if stage not in configured
-    ]
+    required = (
+        "draft",
+        "review_methodology",
+        "review_statistics",
+        "review_feasibility",
+        "synthesis",
+    )
+    return [stage for stage in required if stage not in configured]
 
 
 def _run_planning_chain(
     data: dict[str, Any],
     selected: list[dict[str, Any]],
-    runner: PlanningWorkflowChainRunner,
+    runner: PlanningProtocolRunner,
     max_parallel_calls: int,
 ) -> dict[str, Any]:
     selected_ids = [str(package.get("hypothesis_id") or "") for package in selected]
@@ -98,8 +120,8 @@ def _run_planning_chain(
     }
     report = runner.run_batch(
         chain_data,
-        max_revisions=max(0, _env_int("PLANNING_MAX_REVISIONS", 1)),
         max_parallel_hypotheses=max_parallel_calls,
+        max_parallel_calls=max_parallel_calls,
     )
     packages_by_id = {str(package.get("hypothesis_id") or ""): package for package in selected}
     plan_results: list[dict[str, Any]] = []
@@ -120,8 +142,7 @@ def _run_planning_chain(
             continue
         child_errors = [str(item) for item in hypothesis_run.get("errors", []) if str(item).strip()]
         reason = "; ".join(child_errors) or (
-            f"Workflow B stopped with decision="
-            f"{hypothesis_run.get('decision') or 'unknown'}; "
+            "Protocol compiler stopped before a usable final plan; "
             f"next_action={hypothesis_run.get('next_action') or 'inspect_failure'}"
         )
         plan_results.append(_failed_plan_result(chain_data, package, reason))
@@ -139,7 +160,7 @@ def _response_from_plan_results(
     payload["status"] = _payload_status(payload, issues)
     if not payload.get("plans"):
         payload["status"] = "failed"
-        issues.append("Dify workflow returned no plans.")
+        issues.append("Local planning workflow returned no plans.")
     return _response(
         data=data,
         status=payload["status"],
@@ -264,24 +285,68 @@ def _payload_status(payload: dict[str, Any], issues: list[str]) -> str:
 
 def _guardrail_issues(data: dict[str, Any], payload: dict[str, Any]) -> list[str]:
     issues: list[str] = []
-    valid_literature_ids = {item.get("literature_id") for item in data.get("literature_cards", [])}
-    valid_evidence_ids = {item.get("evidence_id") for item in data.get("evidence_cards", [])}
+    valid_literature_ids = {
+        str(item.get("literature_id"))
+        for item in data.get("literature_cards", [])
+        if isinstance(item, dict) and item.get("literature_id")
+    }
+    valid_evidence_ids = {
+        str(item.get("evidence_id"))
+        for item in data.get("evidence_cards", [])
+        if isinstance(item, dict) and item.get("evidence_id")
+    }
 
     for plan_item in payload.get("plans", []):
+        if not isinstance(plan_item, dict):
+            issues.append("Planning result item must be an object.")
+            continue
         if plan_item.get("status") == "failed":
             continue
         plan = plan_item.get("plan", {})
-        for reference in plan.get("references", []):
-            if reference.get("source_id") not in valid_literature_ids:
+        hypothesis_id = plan_item.get("hypothesis_id")
+        if not isinstance(plan, dict):
+            issues.append(f"Plan {hypothesis_id} payload must be an object.")
+            continue
+        references = plan.get("references", [])
+        if not isinstance(references, list):
+            issues.append(f"Plan {hypothesis_id} references must be an array.")
+            references = []
+        for index, reference in enumerate(references):
+            if not isinstance(reference, dict):
                 issues.append(
-                    f"Plan {plan_item.get('hypothesis_id')} references unknown source "
-                    f"{reference.get('source_id')}"
+                    f"Plan {hypothesis_id} references[{index}] must be an object."
                 )
-        for step in plan.get("rationale", {}).get("logic_chain", []):
-            for evidence_id in step.get("evidence_ids", []):
+                continue
+            source_id = str(reference.get("source_id") or "")
+            if source_id not in valid_literature_ids:
+                issues.append(
+                    f"Plan {hypothesis_id} references unknown source {source_id or '<missing>'}"
+                )
+        rationale = plan.get("rationale", {})
+        if not isinstance(rationale, dict):
+            issues.append(f"Plan {hypothesis_id} rationale must be an object.")
+            continue
+        logic_chain = rationale.get("logic_chain", [])
+        if not isinstance(logic_chain, list):
+            issues.append(f"Plan {hypothesis_id} rationale.logic_chain must be an array.")
+            continue
+        for index, step in enumerate(logic_chain):
+            if not isinstance(step, dict):
+                issues.append(
+                    f"Plan {hypothesis_id} rationale.logic_chain[{index}] must be an object."
+                )
+                continue
+            evidence_ids = step.get("evidence_ids", [])
+            if not isinstance(evidence_ids, list):
+                issues.append(
+                    f"Plan {hypothesis_id} rationale.logic_chain[{index}].evidence_ids "
+                    "must be an array."
+                )
+                continue
+            for evidence_id in evidence_ids:
                 if evidence_id not in valid_evidence_ids:
                     issues.append(
-                        f"Plan {plan_item.get('hypothesis_id')} uses unknown evidence {evidence_id}"
+                        f"Plan {hypothesis_id} uses unknown evidence {evidence_id}"
                     )
     return issues
 
@@ -315,5 +380,5 @@ def _suggestions(status: str, issues: list[str]) -> list[str]:
     if status == "success":
         return []
     if issues:
-        return ["请检查 A/B/C Dify 配置、工作流输出 JSON、证据 ID 和文献 ID 是否符合模块 5 规范。"]
-    return ["请检查 A/B/C Dify 工作流是否均已发布并返回有效的计划结果。"]
+        return ["请检查协议草案、专家审查、综合定稿的 JSON 契约及证据/文献 allowlist。"]
+    return ["请检查百炼模型配置与本地协议编译阶段是否返回有效研究计划。"]

@@ -1,5 +1,7 @@
 # Planning Agent 工作流拆分与前端流式对接说明
 
+> 已退役架构资料：本文的 Dify API/SSE 与 A/B/C 章节只作迁移审计，不是当前运行说明。当前唯一正式路径是本地协议编译器直接调用百炼；请以 `../README.md` 和总仓库 `docs/planning-agent-workflow-chain-handoff.md` 为准。
+
 ## 1. 先说结论
 
 当前项目只有 A/B/C 一条执行路径，但提供两个使用相同模块 5 输入的 CLI：

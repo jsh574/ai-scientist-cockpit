@@ -1,147 +1,96 @@
-# Research Planning Agent
+# Planning Agent：本地研究协议编译器
 
-这是模块 5“研究计划输出 Agent”的初版可运行实现。
+Planning 的正式运行路径是本地 Python 编排加阿里云百炼 Qwen。它不依赖
+Dify、Docker、WSL 或本地模型权重。
 
-该 Agent 接收 `docs/数据规范_v0.1.md` 中定义的模块 5 输入，派生内部假设证据包。本地封装层负责选择多个 hypothesis、逐个调用 Dify Workflow，并把每次返回的单个 `plan_result` 聚合为统一模块响应中的 `plans[]`：
+## 职责边界
 
-```text
-metadata + payload(plans[]) + self_review
-```
+Planning 只把前四个 Agent 的结构化结果编译成研究协议：
 
-当前版本没有本地研究计划生成兜底逻辑。如果 Dify 未配置或调用失败，封装层会直接返回 `failed` 或把失败的 hypothesis 标记为单条 failed plan。
+- 问题理解已经确定研究对象、变量、子问题和 scope；
+- 知识整合已经给出文献、证据与知识缺口；
+- 假设生成已经固定 hypothesis、预期观测和 validation idea；
+- 证据映射已经完成支持/反对/不确定分类、强度、冲突和限制分析。
 
-## 依赖与虚拟环境
+Planning 不检索文献、不生成或改写 hypothesis、不重评证据、不发明数据集，
+也不执行实验或声称出现了观测结果。
 
-运行时代码只使用 Python 标准库；开发和测试需要 `pytest`。
-
-首次进入项目后创建并安装开发依赖：
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python -m pip install -r requirements.txt
-```
-
-后续命令建议都使用 venv 中的 Python：
-
-```powershell
-.\.venv\Scripts\python -m pytest
-```
-
-## 环境变量
-
-脚本会默认读取项目根目录的 `.env`，该文件已被 `.gitignore` 忽略。A/B/C 是唯一运行方式，三个 Dify App Key 都必须配置：
-
-```env
-export DIFY_API_URL="http://115.190.208.240:31880"
-export DIFY_WORKFLOW_A_API_KEY="<candidate-generator-app-key>"
-export DIFY_WORKFLOW_B_API_KEY="<judge-selector-app-key>"
-export DIFY_WORKFLOW_C_API_KEY="<final-planner-app-key>"
-export DIFY_CHAIN_USER="research-planning-agent"
-export DIFY_CHAIN_RESPONSE_MODE="streaming"
-export DIFY_CHAIN_TIMEOUT_SECONDS="300"
-export DIFY_SHOW_PROGRESS="1"
-export PLANNING_MAX_PARALLEL_CALLS="1"
-```
-
-PowerShell 里临时设置的环境变量优先级更高，会覆盖 `.env`。测试或隔离运行时可设置：
-
-```powershell
-$env:PLANNING_AGENT_SKIP_DOTENV = "1"
-```
-
-总控启动时也会加载 `agents/planning/.env`。环境变量优先级为：进程环境变量、
-总仓库根目录 `.env`、`agents/planning/.env`、`backend/.env`；先出现的值不会
-被后续文件覆盖。Planning 专用的 A/B/C 凭据因此可以只维护在本目录 `.env` 中。
-
-## 运行测试
-
-```powershell
-.\.venv\Scripts\python -m pytest
-```
-
-如果暂时不使用 venv，也可以在已安装 pytest 的环境中运行：
-
-```powershell
-python -m pytest
-```
-
-## 仓库协作约定
-
-Planning Agent 现已内置在总控仓库 `agents/planning`，后续功能开发、测试和
-Dify DSL 维护都以总控仓库中的这份代码为准。执行前先同步总控当前功能分支，
-修改完成并通过 Planning 独立测试和总控集成测试后再提交。不要直接向 `main`
-推送，使用 `STAR/` 前缀的功能分支。
-
-提交前请确认 `.env`、`.venv/`、`.tmp/`、CLI 输出、Dify 网页调试导出、`samples/output/planning_response*.json`、`samples/test-artifacts/` 等本地文件没有被 staged。Windows/Linux 换行由 `.gitattributes` 统一处理，看到 “CRLF will be replaced by LF” 是预期行为。
-
-## 运行 CLI
-
-确认当前脚本将访问的 Dify API：
-
-```powershell
-.\.venv\Scripts\python -m planning_agent.cli --print-targets
-```
-
-运行短样例，适合日常测试，token 消耗较少：
-
-```powershell
-.\.venv\Scripts\python -m planning_agent.cli --sample --show-progress
-```
-
-保留完整规格样例用于回归测试：`--full-sample` 或 `--input samples/input/module5_input_sample.json`。短样例文件写在 `samples/input/module5_input_short.json`，方便直接传给 `--input`。默认 response 会写入 `samples/output/planning_responseMM_DD-HH_MM.json`；该输出文件被忽略，不要提交。`PLANNING_MAX_PARALLEL_CALLS=1` 默认为串行；设为 `2` 时两个 hypothesis 会并行执行完整 A/B/C 链路。缺少任一 Workflow 配置时，CLI 会输出 `failed` 响应并以非零退出码结束。
-
-测试多个上游假设分别完整通过 A/B/C：
-
-```powershell
-.\.venv\Scripts\python -m planning_agent.workflow_chain_cli `
-  --input samples\input\module5_input_rag_batch.json `
-  --all-hypotheses `
-  --max-parallel-hypotheses 3 `
-  --output samples\test-artifacts\rag-batch-abc.json `
-  --html samples\test-artifacts\rag-batch-abc.html
-```
-
-两个 CLI 都执行完整 A/B/C。`planning_agent.cli` 输出总控正式响应；`planning_agent.workflow_chain_cli` 额外保留候选、评审和终稿中间结果，并可生成独立 HTML 调试报告。
-
-## 样例与测试产物目录
-
-- `samples/input/`：可提交的测试输入，包含 short、full 和 3 假设 RAG batch 模块 5 输入。
-- `samples/output/`：CLI/API 测试 response 输出目录，默认命名为 `planning_responseMM_DD-HH_MM.json`，response 文件由 `.gitignore` 忽略。
-- `samples/test-artifacts/`：自动化测试中间文件目录，整体忽略。测试不要向 `samples/` 根目录写临时文件。
-
-## 关于 Streaming
-
-`DIFY_RESPONSE_MODE=streaming` 表示本地客户端用 Dify Workflow 的 SSE 流式接口接收事件。它可以让终端看到 `workflow_started`、`node_started`、`workflow_finished` 等事件，并降低长时间 blocking 请求超时的概率。
-
-但它不保证 LLM 结构化输出会逐 token 打到终端。当前 Workflow 的 End 节点仍然要等 LLM 节点完成后才有最终 `plan_result`，所以如果模型节点内部生成很久，终端可能仍会在两条事件之间等待较长时间。`DIFY_SHOW_PROGRESS=1` 或 `--show-progress` 至少会显示本地封装层正在处理第几个 hypothesis，以及 Dify 发来的节点事件。
-
-`text_chunk` 事件默认只显示 chunk 序号、字符数、累计字符数和阶段，避免把 `<think>...</think>` 推理内容泄露到终端或未来前端。调试时可以设置 `DIFY_SHOW_TEXT_CHUNKS=1`，只展示非 thinking 内容的短预览。前端建议展示结构化事件：当前 hypothesis、节点 started/finished、LLM 输出字符累计、阶段 `thinking/json/answer`，不要直接把原始 text chunk 当作用户可见内容。
-
-## 运行 HTTP API
-
-```powershell
-.\.venv\Scripts\python -m planning_agent.server --host 127.0.0.1 --port 8088
-```
-
-接口地址：
+## 运行流程
 
 ```text
-POST /planning-agent/run
+上游结构化输入
+  -> Python 编译 planning_brief，并验证 hypothesis/证据可用性
+  -> Qwen 生成一份 protocol draft
+  -> 三个并行窄审查：methodology / statistics / feasibility
+  -> Python 按 severity 稳定去重、合并 required changes
+  -> Qwen synthesis 一次性定稿
+  -> Python 校验 identity、JSON Schema、内容完整性、引用 allowlist 和数据集 URL
+  -> 仅在可修复的终稿契约错误时追加一次 repair
+  -> 按原 hypothesis 顺序聚合为 plans[]
 ```
 
-## Dify Workflow 资产
+正常每个 hypothesis 是 5 次模型调用：1 次草案、3 次并行审查、1 次定稿。
+不存在模型选择器。单个审查失败会被隔离并令计划标为 `partial_success`；没有
+上游证据、未知引用或发明数据集 URL 属于不可修复错误，不会用模型兜底。
 
-当前主工作流文件是 `dify/Research Planning Agent.yml`。
+这一结构借鉴了 [GPT Researcher](https://github.com/assafelovic/gpt-researcher)
+的角色分离与聚合、[STORM](https://github.com/stanford-oval/storm) 的多视角审查、
+[Open Deep Research](https://github.com/langchain-ai/open_deep_research) 的并行研究者
+与最终综合，以及 [DeerFlow](https://github.com/bytedance/deer-flow) 的 Python 状态控制。
+没有复制这些系统的检索、问题生成或工具执行阶段，因为它们已由上游 Agent 负责。
 
-重要边界：Dify Workflow 一次只处理一个 `hypothesis_evidence_package`，输出一个 `plan_result`；本地封装层负责多 hypothesis 循环调用和 `plans[]` 聚合。更多说明见 `dify/README.md`。
+## 配置
 
-在 A/B 已经完成设计发散和评审选择后，Workflow C 使用快速终稿流水线：
-
-```text
-Start -> Normalize Evidence Context -> Generate Final Plan Fast -> Normalize Final Plan Contract -> End
+```dotenv
+DASHSCOPE_API_KEY=
+DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+PLANNING_MODEL=qwen3.7-max
+PLANNING_MAX_RETRIES=1
+PLANNING_MAX_REPAIR_ATTEMPTS=1
+PLANNING_SYNTHESIS_CONTEXT_MAX_CHARS=16000
+PLANNING_MAX_HYPOTHESES=2
+PLANNING_MAX_PARALLEL_CALLS=1
+PLANNING_SHOW_PROGRESS=1
 ```
 
-`Normalize Evidence Context` 解析证据和约束，并强制要求 B 放入 `planning_constraints.selected_design` 的选中设计；唯一的 LLM 节点将该设计扩展成完整计划；`Normalize Final Plan Contract` 确定性覆盖身份字段并检查最终契约。缺少 `selected_design` 会作为上游契约错误失败。
+兼容读取 `QWEN_API_KEY` / `LLM_API_KEY`、`QWEN_MODEL` / `LLM_MODEL`。
+`PLANNING_MAX_PARALLEL_CALLS` 是跨 hypothesis 和三个审查的全局模型调用上限。
+旧 `PLANNING_SELECTOR_MAX_FORMAT_RETRIES` 与 `PLANNING_FINAL_CONTEXT_MAX_CHARS`
+只保留一个迁移版本的读取兼容；正式示例不再使用。
 
-会议汇报先看 `docs/Planning Agent产品理念与ABC工作流讲解.md`；工程拆分见 `docs/Planning Agent工作流拆分与前端流式对接说明.md`；系统流式接入见 `docs/Planning Agent系统更新与流式输出对接.md`。
-Dify DSL 语法和协作护栏写在 `AGENTS.md`：后续修改 `dify/*.yml` 时必须保持节点 `id`、`data.type`、edge `sourceType/targetType`、`value_selector/variable_selector` 和 End 输出变量一致。不要在主 DSL 中使用手写 YAML anchor/alias；优先使用 Dify 官方导出的完整展开风格。
+## 运行与测试
+
+在仓库根目录重建虚拟环境并安装统一依赖后：
+
+```powershell
+cd agents/planning
+..\..\.venv\Scripts\python.exe -m planning_agent.cli --print-runtime
+..\..\.venv\Scripts\python.exe -m pytest tests -q
+..\..\.venv\Scripts\python.exe -m planning_agent.workflow_chain_cli --sample --hypothesis-id hyp_short_001
+..\..\.venv\Scripts\python.exe -m planning_agent.workflow_chain_cli --sample --all-hypotheses --max-parallel-hypotheses 2 --max-parallel-calls 3
+```
+
+正式调用入口仍为：
+
+```python
+from planning_agent import run_planning_agent
+
+response = run_planning_agent(module5_input)
+```
+
+对外仍返回 `metadata + payload + self_review`，最终计划位于
+`payload.plans[]`；经后端接入后位于 `payload.research_plan.plans[]`。
+
+正式计划字段遵循 [数据规范 v0.1](docs/数据规范_v0.1.md#93-输出) 的
+`experiment_planner_plan_result_v1` 嵌套契约。模型产生的数组/别名形状会在
+`local_nodes.py` 归一化后再写出；前端只在读取历史任务时兼容旧形状。
+
+## 代码结构
+
+- `adapter.py`：构建单 hypothesis 证据包，保留 Evidence Mapping 的 detailed review；
+- `local_nodes.py`：brief、审查合并、身份/引用/终稿契约等确定性函数；
+- `stage_clients.py`：草案、三个审查、定稿和可选修复的本地百炼调用；
+- `workflow_chain.py`：并发、全局调用上限、失败隔离、顺序聚合和取消；
+- `runtime.py`：百炼流式 JSON 客户端、token 与脱敏事件；
+- `schemas.py` / `prompts.py`：本地结构化契约与阶段提示；
+- `dify/*.yml`：只读迁移审计材料，生产代码不会加载。

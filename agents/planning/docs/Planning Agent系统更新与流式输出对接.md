@@ -1,4 +1,11 @@
-# Planning Agent 系统更新与流式输出对接
+# Planning Agent 系统更新与流式输出对接（历史 Dify 方案）
+
+> 本文的 A/B/C、Dify Workflow 和 Dify SSE 内容仅用于迁移审计，不是当前
+> 生产架构。当前运行链路与事件见
+> `docs/planning-agent-workflow-chain-handoff.md`；正式前后端字段契约见
+> `agents/planning/docs/数据规范_v0.1.md` 9.3 节。
+
+> 已退役架构资料：本文记录旧 A/B/C 与去 Dify 迁移过程，不代表当前实现。当前正式流程是 protocol draft、methodology/statistics/feasibility 并行 review、synthesis 和可选 repair；请以 `../README.md` 为准。
 
 ## 1. 文档目的
 

@@ -40,8 +40,13 @@ export interface HealthStatus {
   };
   model_policy?: {
     supported_fields: string[];
-    dify_supported_fields: string[];
-    dify_unsupported_fields: string[];
+  };
+  planning_runtime?: {
+    mode: "local_protocol_compiler";
+    model: string;
+    stages: string[];
+    thinking_enabled_for: string[];
+    synthesis_thinking: false;
   };
   mcp: { server: string; transport: string };
 }

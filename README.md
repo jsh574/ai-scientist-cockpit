@@ -41,7 +41,7 @@ Copy-Item backend\.env.example backend\.env
 npm install
 ```
 
-在 `backend/.env` 中配置模型与 Dify 凭据。问题理解、知识整合和假设生成使用 OpenAI 兼容接口；研究计划 Agent 使用其原生 Dify Workflow 后端。密钥文件不会被 Git 跟踪。
+在 `backend/.env` 中配置百炼模型凭据。研究计划 Agent 由本地 Python 执行“协议草案 → 方法/统计/可行性并行审查 → 综合定稿 → 可选契约修复”，各模型阶段直接调用百炼 OpenAI 兼容接口；不需要 Dify、Docker、WSL 或本地模型权重。密钥文件不会被 Git 跟踪。
 
 一键启动：
 
@@ -73,7 +73,7 @@ npm run typecheck
 npm run build
 ```
 
-容器启动：
+可选的项目容器启动（不是 Planning Agent 的依赖）：
 
 ```powershell
 docker compose up --build

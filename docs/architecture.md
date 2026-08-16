@@ -91,4 +91,6 @@ artifacts/tasks/{task_id}/
 
 JSON 文件使用同目录临时文件和原子替换写入。所有任务 ID 和相对路径都经过白名单与目录边界校验。
 
-附件仅允许 UTF-8 文本格式。文件元数据写入 `user_input.attachments`，文本摘要合并到 `user_input.question_description`。OpenAI 兼容 Agent 的 `ProjectLLMClient` 会把该背景注入用户消息，已有相同内容时不重复注入；Planning Agent 使用 Dify Workflow，依赖上游结构化上下文和模块 5 输入传递背景。
+附件仅允许 UTF-8 文本格式。文件元数据写入 `user_input.attachments`，文本摘要合并到 `user_input.question_description`。OpenAI 兼容 Agent 的 `ProjectLLMClient` 会把该背景注入用户消息，已有相同内容时不重复注入；Planning Agent 只从模块 5 的上游结构化上下文读取研究边界和证据，由本地协议编译器直接调用百炼。
+
+Planning 的正式运行模式为 `local_protocol_compiler`：先生成一份协议草案，再并行执行 methodology、statistics、feasibility 三类窄审查，Python 稳定合并问题，最后由关闭 thinking 的 synthesis 定稿。只有可修复的终稿契约错误允许一次 repair。身份、并发、顺序、证据/文献 allowlist、数据集 URL 和失败隔离均由 Python 控制。
